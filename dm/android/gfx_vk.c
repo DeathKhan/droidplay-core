@@ -295,8 +295,8 @@ static void cb_barrier(void) {
 // by the CPU only in its own chunk_done (fwd_find forwards arena write-backs only, never staging), so a block is free once its chunk's fence has signalled and chunk_done ran.
 // Blocks never outlive their use in another chunk's commands, and the render thread (taking) and the completion thread (giving back) meet only at the free list (g_sp_mu).
 // At most SP_NBLK blocks exist (SP_KEEP); a request over SP_MAXREQ, or one made while every block is taken and the cap is reached, gets a buffer of its own as before, freed
-// in chunk_done. Blocks the free list held through a whole window of SP_TRIM chunk completions (it never fell below that many) were not needed: they are freed, so a loading
-// burst's blocks do not stay (about 4 s of Breath of the Wild at 56 chunks a frame and 20 fps).
+// in chunk_done. Blocks the free list held through a whole window of SP_TRIM chunk completions (it never fell below that many) were not needed: they are freed, one a
+// completion after its fence (sp_trim), so a loading burst's blocks do not stay (a window is about 4 s of Breath of the Wild at 56 chunks a frame and 20 fps).
 // A slice is handed out by value (buffer, offset, mapped pointer, the write-back's name for its buffer). stg_take returned a pointer into C->stg, which realloc moves:
 // vt_upload_, copy_b2t, copy_t2b and mtl_read_texels called cb() after it, and cb() -> rp_end -> lin_writeback -> stg_take grows C->stg when a pass was open (stage_textures'
 // uploads end a pass begun before), so they wrote through and copied from a freed stg_t, and copy_t2b and mtl_read_texels took its index (s - C->stg) after cb(). A slice taken
@@ -355,18 +355,26 @@ static stg_sl stg_take(VkDeviceSize n, int texel) {
     s.b = C->stg[C->nstg].b; s.p = C->stg[C->nstg].p; s.st = C->nstg++;
     return s;
 }
-// the completion thread, in chunk_done after the chunk's write-backs: its blocks back to the free list; every SP_TRIM completions, the blocks the free list held all along go
+// the completion thread, in chunk_done after the chunk's write-backs: its blocks back to the free list
 static void sp_done(chunk *c) {
-    if (g_sp_on <= 0) return;   // set before the completion thread started (chunks_init)
-    if (c->nsb) { pthread_mutex_lock(&g_sp_mu); for (int i = 0; i < c->nsb; i++) g_sp_free[g_sp_nfree++] = c->sb[i]; pthread_mutex_unlock(&g_sp_mu); c->nsb = 0; }   // every block is in one chunk or the free list: at most SP_NBLK
-    static unsigned win; if (++win < SP_TRIM) return;
-    win = 0; stg_t f[SP_NBLK]; int nf = 0;
-    pthread_mutex_lock(&g_sp_mu);
-    while (nf < g_sp_low && g_sp_nfree) { f[nf++] = g_sp_free[--g_sp_nfree]; g_sp_nblk--; }   // the free list never held fewer than g_sp_low: that many were idle the whole window
-    g_sp_low = g_sp_nfree;
-    pthread_mutex_unlock(&g_sp_mu);
-    for (int i = 0; i < nf; i++) stg_free(&f[i]);
-    if (nf) atomic_fetch_add(&g_sp_trimmed, (uint64_t)nf);
+    if (g_sp_on <= 0 || !c->nsb) return;   // g_sp_on: set before the completion thread started (chunks_init)
+    pthread_mutex_lock(&g_sp_mu); for (int i = 0; i < c->nsb; i++) g_sp_free[g_sp_nfree++] = c->sb[i]; pthread_mutex_unlock(&g_sp_mu); c->nsb = 0;   // every block is in one chunk, the free list or sp_trim's list: at most SP_NBLK
+}
+// the completion thread, in chunk_thread once the chunk's NVN fence, write-backs (g_inflight_wb), g_seq_done and busy are published: every SP_TRIM completions, the blocks
+// the free list held all along leave it, and one of them is freed a completion. Freed in chunk_done, a trim's vkDestroyBuffer + vkFreeMemory of up to SP_NBLK blocks
+// (kgsl_sharedmem_free and an munmap of 2,048 pages each) ran before the chunk's fence and write-backs counted as done, so every sync on them waited for all of those frees
+// at once; here the game's fence wait, submit_wait / seq_wait and cur() are released first, and one block's free delays at most the next chunk's completion
+static void sp_trim(void) {
+    static stg_t gone[SP_NBLK]; static int ngone; static unsigned win;   // completion thread only: blocks taken off the free list, not freed yet (still in g_sp_nblk, so at most SP_NBLK exist)
+    if (g_sp_on <= 0) return;
+    if (++win >= SP_TRIM) { win = 0;
+        pthread_mutex_lock(&g_sp_mu);
+        for (int k = g_sp_low; k > 0 && g_sp_nfree && ngone < SP_NBLK; k--) gone[ngone++] = g_sp_free[--g_sp_nfree];   // the free list never held fewer than g_sp_low: that many were idle the whole window
+        g_sp_low = g_sp_nfree;
+        pthread_mutex_unlock(&g_sp_mu); }
+    if (!ngone) return;
+    stg_free(&gone[--ngone]); atomic_fetch_add(&g_sp_trimmed, 1);
+    pthread_mutex_lock(&g_sp_mu); g_sp_nblk--; pthread_mutex_unlock(&g_sp_mu);   // only now may sp_block make another in its place
 }
 static wb_t *wb_add(void) {
     if (!cur()) return NULL;
@@ -532,6 +540,7 @@ static void *chunk_thread(void *arg) {
         for (int i = 0; i < NCHUNK; i++) if (g_ch[i].held && g_ch[i].hold <= g_seq_done) { g_ch[i].held = 0; g_ch[i].hold = 0; g_ch[i].busy = 0; }
         pthread_cond_broadcast(&g_ccv);
         pthread_mutex_unlock(&g_cmu);
+        sp_trim();   // after the fence and g_seq_done: no sync waits for a trim's frees
     }
     return NULL;
 }
@@ -967,6 +976,12 @@ static int tex_level_layer(const vtex *v, const view_t *vw, int has, unsigned *l
     *level = has && vw->set_levels ? vw->base_level : 0; *layer0 = has && vw->set_layers ? vw->min_layer : 0;
     return *level < v->levels;
 }
+// A readback of a combined depth-stencil image copies its depth aspect alone: 4 bytes a texel, tightly packed (D32_SFLOAT_S8_UINT: the float; D24_UNORM_S8_UINT, the fallback:
+// D24 in the low 24 bits, the top 8 undefined), into a slice sized by the guest's texel: 8 bytes for DEPTH32F_STENCIL8 (0x36), so the copy leaves the second half of each
+// layer's region unwritten, and a D24 copy may leave every fourth byte. wb_apply writes the whole region to guest memory: a buffer of its own read as zeros there (fresh
+// pages), a pool slice holds an earlier slice's bytes (another texture's upload or readback), so it is zeroed first (before the chunk is submitted, coherent memory: the
+// copy's writes land over it) and the guest gets what a buffer of its own gave. NVN's 8-byte layout itself (depth, stencil, padding) is still not rebuilt: open, as before
+static void stg_zero_ds(stg_sl s, VkDeviceSize n, const vtex *v) { if (s.p && s.st >= SP_ST && v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) memset(s.p, 0, n); }
 static void copy_b2t(const p_copy_b2t *c) {
     vtex *v = vt_get(c->tex); if (!v) return;
     unsigned level, layer0; if (!tex_level_layer(v, &c->view, c->has_view, &level, &layer0)) return;
@@ -998,7 +1013,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     size_t row = S.row ? (size_t)S.row : rb, img = S.img ? (size_t)S.img : row * rows;
     int is3d = v->type == VK_IMAGE_TYPE_3D, nz = c->r.depth ? c->r.depth : 1;
     if (!mtl_addr(c->src, img * (nz - 1) + row * (rows - 1) + rb, NULL, NULL)) { RED_ONCE(43, "texture→buffer copy destination is in no memory pool"); return; }
-    stg_sl s = stg_take(rb * rows * nz, bpb); VkCommandBuffer cbuf = cb(); if (!s.p || !cbuf) return;
+    stg_sl s = stg_take(rb * rows * nz, bpb); stg_zero_ds(s, rb * rows * nz, v); VkCommandBuffer cbuf = cb(); if (!s.p || !cbuf) return;
     if (vk_debug()) LOG("[vk] t2b ser=%llu pkg %d level %u layer %u region %d,%d %dx%dx%d row %zu img %zu -> %#llx", (unsigned long long)v->serial, v->pkg, level, layer0, c->r.xoffset, c->r.yoffset, c->r.width, c->r.height, nz, row, img, (unsigned long long)c->src);
     for (int z = 0; z < nz; z++) {
         VkBufferImageCopy r = {.bufferOffset = s.off + (size_t)z * rb * rows, .imageSubresource = {v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : v->aspect, level, is3d ? 0 : layer0 + c->r.zoffset + z, 1},
@@ -1064,7 +1079,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     }
     vtex *v = vt_get(t);
     if (!v || v->conv) { pthread_mutex_unlock(&g_bk); for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memset(dst + (size_t)z * img + y * row, 0, wb); return; }
-    stg_sl s = stg_take(wb * hb * nz, bpb); VkCommandBuffer cbuf = cb();
+    stg_sl s = stg_take(wb * hb * nz, bpb); stg_zero_ds(s, wb * hb * nz, v); VkCommandBuffer cbuf = cb();
     if (s.p && cbuf) {
         for (int z = 0; z < nz; z++) {
             VkBufferImageCopy rc = {.bufferOffset = s.off + (size_t)z * wb * hb, .imageSubresource = {v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : v->aspect, level, is3d ? 0 : layer0 + (unsigned)r->zoffset + (unsigned)z, 1},
