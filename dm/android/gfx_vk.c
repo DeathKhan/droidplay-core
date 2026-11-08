@@ -151,7 +151,7 @@ typedef struct chunk {
     VkQueryPool pq; int npq;   // render pass timestamps of a profiled frame (prof_* in gfx_vk_draw.inc)
     VkQueryPool tq; int ntq; uint64_t t_end;   // timestamps of the game's counter reports (kind 4 posts); the GPU time the chunk ended (g_tsq)   // hold: a later chunk reads this one's arena on the GPU (gfx_vk_draw.inc fwd_find): kept busy (held) until that one completes   // ndraw: draws and dispatches recorded (early submission: mtl_exec)   // ts: GPU timestamps written at its start and end (g_tsq)
     uint64_t gf; int gtag;   // gtag: its GPU time counts toward frame gf's (g_fgpu, mtl_gpu_ms)
-    stg_t *stg; int nstg, capstg; wb_t *wb; int nwb, capwb; post_op *post; int npost, cappost; dead_t *dead; int ndead, capdead; cop_t *cop; int ncop, capcop;
+    stg_t *stg; int nstg, capstg; wb_t *wb; int nwb, capwb, nfwd; post_op *post; int npost, cappost; dead_t *dead; int ndead, capdead; cop_t *cop; int ncop, capcop;
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
     VkDescriptorPool *dp; int ndp, cdp, dp_cur; VkBufferView *bv; int nbv, cbv;
 } chunk;
@@ -159,7 +159,7 @@ enum { NCHUNK = 4 };
 static chunk g_ch[NCHUNK], *C;   // C: the chunk being recorded (NULL: none yet)
 static chunk *g_fifo[NCHUNK]; static int g_fifo_n;   // submitted, oldest first
 static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
-static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
+static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop, g_inflight_fwd; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
 static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c); static void bf_reset(void);   // gfx_vk_draw.inc
 static void *chunk_thread(void *arg);
 // ---------------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------------
@@ -312,6 +312,7 @@ static uint64_t chunk_submit(uint64_t nvn_fence) {
     pthread_mutex_lock(&g_cmu);
     if (c->nwb) atomic_fetch_add(&g_inflight_wb, 1);
     if (c->ncop) atomic_fetch_add(&g_inflight_cop, 1);
+    if (c->nfwd) atomic_fetch_add(&g_inflight_fwd, 1);   // chunks in flight with a forwardable write-back (nfwd: gfx_vk_draw.inc stream_fwd)
     if (c->ts && g_fgpu_on > 0) { c->gf = atomic_load(&g_cur_frame); c->gtag = 1; fgpu_begin(c->gf); }
     g_fifo[g_fifo_n++] = c; uint64_t seq = c->seq;
     pthread_cond_broadcast(&g_ccv);
@@ -434,14 +435,15 @@ static void *chunk_thread(void *arg) {
                 { atomic_fetch_add(&g_gpu_ns, (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod)); atomic_fetch_add(&g_gpu_chunks, 1); c->t_end = t[1];
                   uint64_t s = t[1] > last && t[0] < last ? last : t[0];   // from the previous chunk's end when it started before it; an end at or before that one (the counter started again) counts the whole span
                   busy = (uint64_t)((double)(t[1] - s) * g_vk.props.limits.timestampPeriod); last = t[1]; } }
-        int had_wb = c->nwb != 0, had_cop = c->ncop != 0;
-        chunk_done(c); c->nwb = c->ncop = 0;
+        int had_wb = c->nwb != 0, had_cop = c->ncop != 0, had_fwd = c->nfwd != 0;
+        chunk_done(c); c->nwb = c->ncop = c->nfwd = 0;
         if (c->nvn_fence) { pthread_mutex_lock(&g_fmu); if (atomic_load(&g_done) < c->nvn_fence) atomic_store(&g_done, c->nvn_fence); pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu); }
         qr_done(c, fr == VK_SUCCESS, ts, nq, ntq, npq);   // after every read of them, after the NVN fence (the game waits on it), before busy = 0
         pthread_mutex_lock(&g_cmu);
         memmove(g_fifo, g_fifo + 1, --g_fifo_n * sizeof *g_fifo);
         if (had_wb) atomic_fetch_sub(&g_inflight_wb, 1);
         if (had_cop) atomic_fetch_sub(&g_inflight_cop, 1);
+        if (had_fwd) atomic_fetch_sub(&g_inflight_fwd, 1);   // after its write-backs landed (chunk_done), as g_inflight_wb
         g_seq_done = c->seq;
         if (c->gtag) { fgpu_done(c->gf, busy); c->gtag = 0; }
         if (c->hold > c->seq) c->held = 1; else { c->busy = 0; c->hold = 0; }
@@ -1445,6 +1447,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     if (memo_log()) LOG("[vk] memo binds left out / recorded: pipeline %llu / %llu, dynamic state %llu / %llu, vertex buffers %llu / %llu, index buffer %llu / %llu (cumulative; gfx_vk_draw.inc bf_*, DM_VK_BIND_FILTER %d)",
         (unsigned long long)g_bf_skip[0], (unsigned long long)g_bf_made[0], (unsigned long long)g_bf_skip[1], (unsigned long long)g_bf_made[1], (unsigned long long)g_bf_skip[2], (unsigned long long)g_bf_made[2],
         (unsigned long long)g_bf_skip[3], (unsigned long long)g_bf_made[3], bind_filter());
+    if (memo_log()) LOG("[vk] memo forwarding: %llu vertex streams answered with no forwardable write-back pending, %llu looked up (cumulative; gfx_vk_draw.inc stream_fwd, DM_VK_FWD_EARLY %d)",
+        (unsigned long long)g_fwd_early, (unsigned long long)g_fwd_look, fwd_early());
     LOG("[vk] geometry kept on the GPU: %llu index / vertex bindings from kept copies, %llu copies kept (%llu MB now), %llu copied per draw (cumulative; gfx_vk_draw.inc gc_get)",
         (unsigned long long)g_gc_hit, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy);
     { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);

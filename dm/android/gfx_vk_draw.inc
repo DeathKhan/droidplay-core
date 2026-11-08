@@ -1590,7 +1590,7 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
         else if (u && u->addr) { uint8_t *d = ar_alloc((n + 15) & ~(size_t)15, &b, &ao); if (!d) return 0; memcpy(d, (const void *)(uintptr_t)u->addr, n);
             if (sb->flags & 1) {   // written by the shader: what it changed is copied back when the chunk completes
                 wb_t *w = wb_add(); uint8_t *snap = malloc(n); if (snap) memcpy(snap, (const void *)(uintptr_t)u->addr, n);   // from guest memory, as d was: the arena is write-combined
-                if (w) { *w = (wb_t){-1 - C->ar_last, (size_t)ao, n, 1, n, n, (uint8_t *)(uintptr_t)u->addr, snap}; w->fwd = s->stage == SH_CS; } } }
+                if (w) { *w = (wb_t){-1 - C->ar_last, (size_t)ao, n, 1, n, n, (uint8_t *)(uintptr_t)u->addr, snap}; w->fwd = s->stage == SH_CS; if (w->fwd) C->nfwd++; } } }
         else if (!ucopy(NULL, 16, 16, &b, &ao)) return 0;
         bi[nbi] = (VkDescriptorBufferInfo){b, ao, (n + 15) & ~(size_t)15}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)sb->binding, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[nbi++], NULL};
     }
@@ -1704,10 +1704,19 @@ static int stream_direct(const vshader *vs, int s) {   // every attribute of str
     for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &D.attr[i], 4); if (a.fmt && a.stream == s && !vfmt_direct(a.fmt, vs ? vs->vin[i] : 'f')) return 0; }
     return 1;
 }
+// Forwarding finds a stream only in a forwardable write-back (fwd: stage_set gives it to a compute shader's storage buffer, nothing else does): with none in the chunk being
+// recorded (C->nfwd) and no chunk in flight holding one (g_inflight_fwd: counted at submission, taken off once its write-backs landed, in the g_cmu section that takes it off
+// g_fifo), fwd_find cannot answer 1, and stream_fwd answers 0 before stream_direct's 16-attribute vfmt_direct loop and fwd_find's scans. draw_view asks once per stream,
+// not once per attribute. Breath of the Wild on the Odin 2: stream_fwd and vfmt_direct about 1.5% of the replay thread (about 15,500 stream_direct calls a frame for 3,750
+// draws), with about 16 forwarded streams a frame from its GPU particle dispatches. DM_VK_FWD_EARLY=0 (env.txt): every stream looked up, once per attribute, as before
+static int fwd_early(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_FWD_EARLY"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_FWD_EARLY=0: every vertex stream is looked up among the forwardable write-backs"); } return v; }
+static uint64_t g_fwd_early, g_fwd_look;   // streams answered without a lookup (none pending) / looked up
 static int stream_fwd(const vshader *vs, int s, VkBuffer *b, VkDeviceSize *o) {
     if (vk_safe()) return 0;
-    const NVNbufferRange *r = &D.vbuf[s]; if (!r->address || !r->size || !stream_direct(vs, s)) return 0;
-    return fwd_find((uintptr_t)r->address, (uintptr_t)(r->address + r->size), b, o);
+    const NVNbufferRange *r = &D.vbuf[s]; if (!r->address || !r->size) return 0;
+    if (fwd_early() && (!C || (!C->nfwd && !atomic_load(&g_inflight_fwd)))) { g_fwd_early++; return 0; }
+    if (!stream_direct(vs, s)) return 0;
+    g_fwd_look++; return fwd_find((uintptr_t)r->address, (uintptr_t)(r->address + r->size), b, o);
 }
 // ---- Binds the command buffer already holds ----
 // Every draw recorded its pipeline, the seven dynamic states (ten calls), the index buffer and each vertex binding, changed or not, and the Adreno driver marks state
@@ -1864,8 +1873,9 @@ static void draw_view(vshader *const sh[4], const p_draw_idx *di, int vtx) {   /
     rd_rng r[16 + 1 + 4 * 32 + 4 * 32]; char kd[16 + 1 + 4 * 32 + 4 * 32]; char K = 'v'; int n = 0;
     #define RNG(a, s) do { uintptr_t a_ = (uintptr_t)(a); uint64_t s_ = (s); if (a_ && s_ && n < (int)(sizeof r / sizeof *r)) { kd[n] = K; r[n++] = (rd_rng){a_, a_ + (uintptr_t)s_}; } } while (0)
     g_fwd_nwb = C ? C->nwb : 0;
-    if (vtx) for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &D.attr[i], 4); VkBuffer fb; VkDeviceSize fo;
-        if (a.fmt && !stream_fwd(sh[0], a.stream, &fb, &fo)) RNG(D.vbuf[a.stream].address, D.vbuf[a.stream].size); }
+    if (vtx) { uint32_t seen = 0; for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &D.attr[i], 4); VkBuffer fb; VkDeviceSize fo;
+        if (a.fmt && fwd_early()) { if (seen >> a.stream & 1) continue; seen |= 1u << a.stream; }   // each stream once (stream_fwd)
+        if (a.fmt && !stream_fwd(sh[0], a.stream, &fb, &fo)) RNG(D.vbuf[a.stream].address, D.vbuf[a.stream].size); } }
     K = 'i'; if (di && di->ibuf) RNG(di->ibuf, (uint64_t)(di->count > 0 ? di->count : 0) * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4) + 4);
     for (int k = 0; k < 4; k++) { const vshader *s = sh[k]; if (!s) continue; int nst = nvn_stage_of(s->stage);
         for (int i = 0; i < s->ntx; i++) if ((s->tx[i].type & 0xff) == 2) { g_vs = 5; cpu_view(); return; }
