@@ -246,5 +246,6 @@ int prog_key(const prog_t *p, unsigned stage, uint8_t key[8]);
 int prog_c1(const prog_t *p, unsigned stage, uint32_t *start, uint32_t *end);
 void mtl_reg_samp(int id, const samp_par *p);
 void mtl_prog_release(prog_t *p);
+void mtl_prog_keys_changed(const prog_t *p);   // after Finalize dropped or SetShaders filled the program's key record (hle_nvn.c: a weak no-op; the Android replay's memo generation)
 // New serial (> 0, globally increasing)
 uint64_t nvn_new_serial(void);

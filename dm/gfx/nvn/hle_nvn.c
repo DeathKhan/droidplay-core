@@ -583,7 +583,11 @@ NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
 static void pk_drop(const void *p);
-NVN(nvnProgramFinalize, void, NVNprogram *p) { mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; pk_drop(p); }
+// Called once a program's key record (pk_get) is dropped (Finalize) or reset and filled (SetShaders), as mtl_prog_release is before: the Android replay's program-to-shader
+// memo (dm/android/gfx_vk.c) moves its generation on both sides, since these run on the game's threads while a replay draw may read the record half changed. The Metal
+// replay (nvn_mtl.m) does not define it: this weak one does nothing
+__attribute__((weak)) void mtl_prog_keys_changed(const prog_t *p) { (void)p; }
+NVN(nvnProgramFinalize, void, NVNprogram *p) { mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; pk_drop(p); mtl_prog_keys_changed((prog_t *)p); }
 // a program's per-stage keys (side table: guest NVNprogram address → host object; bit i of ok = stage i computed)
 // c1: each stage's c1 constant segment in its code area (control +0x700 start, +0x704 end), copied with the keys: the control section is gone after SetShaders
 typedef struct { uint8_t key[6][8]; uint8_t ok; uint32_t c1[6][2]; } prog_keys_t;
@@ -655,6 +659,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
         // DM_NVN_SHDUMP (debugging): keep a copy of the control section so the replay layer can save shaders missing from the map (never freed)
         if (dump && sd[i].control) { void *c = malloc(0x880); memcpy(c, sd[i].control, 0x880); o->sd[i].control = c; }
     }
+    mtl_prog_keys_changed(o);   // the record is complete: what a replay draw resolved from it since mtl_prog_release above (the new serial, old or reset keys and c1 ranges) is let go
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }

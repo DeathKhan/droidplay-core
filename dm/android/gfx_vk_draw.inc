@@ -1763,8 +1763,10 @@ static int ucopy(const void *src, size_t n, size_t al, VkBuffer *b, VkDeviceSize
 // again) cost Breath of the Wild on the Odin 2 about 3.2% of the replay thread (prog_key 1.15%, sh_get 1.1%, prog_c1 0.36%, the loop 0.5%: about 1.2 ms a frame), where
 // 90% of the draws bind the programs of the draw before. An entry is keyed on all five (program address, serial) pairs, as nvn_mtl.m bind_stages keys its ring: SetShaders
 // gives a program a new serial (nvn_new_serial), a by-value copy of an NVNprogram has another address (and its own key record, found by address), and a program of
-// serial 0 (initialized and never set: a struct the game wrote itself) is never memoized. Any Finalize or SetShaders (gfx_vk.c mtl_prog_release, which both call before they
-// drop or reset a key record) empties the memo (g_prog_gen), so an entry repeats what the key records held when it was made. Only a complete resolution is kept: a missing
+// serial 0 (initialized and never set: a struct the game wrote itself) is never memoized. Any Finalize or SetShaders empties the memo (g_prog_gen), moved before they drop
+// or reset a key record (gfx_vk.c mtl_prog_release) and again once it is dropped or filled (mtl_prog_keys_changed): they run on the game's threads while the replay draws, and
+// an entry made from a record in between (SetShaders gives the new serial before the keys and c1 ranges) holds a generation read before the second move and no longer hits
+// once that lands, so a change races the draws made during it alone, as resolving every draw does. Only a complete resolution is kept: a missing
 // shader, a tessellation stage or no vertex shader takes the full path every time, with its counters and logs. An entry holds the shaders, their stage index in the program
 // and each stage's c1 range (prog_c1), never a program pointer (pprog[slot] is D.bst[slot]) nor c1's bytes (stage_set copies them from the program's code every draw).
 // The replay alone uses it (mtl_exec, under g_bk). DM_VK_PROG_MEMO=0 (env.txt): resolved for every draw, as before

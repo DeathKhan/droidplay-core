@@ -1197,10 +1197,14 @@ int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_bk); vtex *v = nv
 static void reg_tex(int id, const tex_t *t, const view_t *v); static void reg_samp(int id, const samp_par *p);   // gfx_vk_draw.inc
 void mtl_reg_tex(int id, const tex_t *t, const view_t *vw) { reg_tex(id, t, vw); }
 void mtl_reg_samp(int id, const samp_par *p) { reg_samp(id, p); }
-// hle_nvn.c calls it at a program's Finalize and SetShaders, before the program's key record (pk_get) is dropped or reset: the replay's program-to-shader memo
-// (gfx_vk_draw.inc prog_memo) holds what the key records said, so any of them changing empties it (the game's threads; read by the replay)
+// hle_nvn.c calls mtl_prog_release at a program's Finalize and SetShaders, before the program's key record (pk_get) is dropped or reset, and mtl_prog_keys_changed once
+// it is dropped or filled: the replay's program-to-shader memo (gfx_vk_draw.inc prog_memo) holds what the key records said, so any of them changing empties it. Both move
+// the generation, on the game's threads with no lock the replay takes: a draw in between can read the new serial with the old or reset keys and c1 ranges (SetShaders
+// gives the serial first), and its entry carries a generation read before the second move, so it is stale once that lands; a draw that reads the second move's value
+// (acquire) sees the complete record (release)
 static _Atomic uint64_t g_prog_gen = 1;
 void mtl_prog_release(prog_t *p) { (void)p; atomic_fetch_add_explicit(&g_prog_gen, 1, memory_order_release); }
+void mtl_prog_keys_changed(const prog_t *p) { (void)p; atomic_fetch_add_explicit(&g_prog_gen, 1, memory_order_release); }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 
 // ---------------- Copies ----------------
@@ -1790,7 +1794,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         f0 = frame; h0 = h; r0 = r; m0 = m; k0 = k; }
     if (c2_check()) LOG("[vk] c2 check: %llu handle words compared with c2_word, %llu differed (cumulative; gfx_vk_draw.inc bank_word)", (unsigned long long)g_c2_checked, (unsigned long long)g_c2_bad);
     if (memo_log()) LOG("[vk] memo programs: %llu draws found their shaders, %llu resolved and kept, %llu with a program of serial 0 resolved; program changes %llu (cumulative; gfx_vk_draw.inc prog_memo, DM_VK_PROG_MEMO %d)",
-        (unsigned long long)g_pmemo_hit, (unsigned long long)g_pmemo_miss, (unsigned long long)g_pmemo_ser0, (unsigned long long)(atomic_load(&g_prog_gen) - 1), prog_memo_on());
+        (unsigned long long)g_pmemo_hit, (unsigned long long)g_pmemo_miss, (unsigned long long)g_pmemo_ser0, (unsigned long long)((atomic_load(&g_prog_gen) - 1) / 2), prog_memo_on());   // two moves per Finalize or SetShaders
     if (memo_log()) LOG("[vk] memo pipelines: %llu draws had the draw before's, %llu built their key; state changes %llu; checked %llu, differed %llu (cumulative; gfx_vk_draw.inc pso_memo, DM_VK_PSO_MEMO %d, DM_VK_PSO_CHECK %d)",
         (unsigned long long)g_pso_hit, (unsigned long long)g_pso_miss, (unsigned long long)(g_pso_gen - 1), (unsigned long long)g_pso_checked, (unsigned long long)g_pso_bad, pso_memo_on(), pso_check());
     if (memo_log()) LOG("[vk] memo binds left out / recorded: pipeline %llu / %llu, dynamic state %llu / %llu, vertex buffers %llu / %llu, index buffer %llu / %llu (cumulative; gfx_vk_draw.inc bf_*, DM_VK_BIND_FILTER %d)",
