@@ -160,7 +160,7 @@ static chunk g_ch[NCHUNK], *C;   // C: the chunk being recorded (NULL: none yet)
 static chunk *g_fifo[NCHUNK]; static int g_fifo_n;   // submitted, oldest first
 static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
-static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c);   // gfx_vk_draw.inc
+static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c); static void bf_reset(void);   // gfx_vk_draw.inc
 static void *chunk_thread(void *arg);
 // ---------------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------------
 // NVN's samples passed is a counter on the queue: ResetCounter zeroes it, every draw after adds its samples, ReportCounter writes the sum at that point when the GPU gets
@@ -268,7 +268,7 @@ static VkCommandBuffer cb(void) {
         if (C->qp && C->qd) { vkCmdResetQueryPool(C->cb, C->qp, 0, (uint32_t)C->qd); g_qr_cmd += (uint64_t)C->qd; }   // the queries the last recording used (Query resets above)
         if (C->tq && C->td) { vkCmdResetQueryPool(C->cb, C->tq, 0, (uint32_t)C->td); g_qr_cmd += (uint64_t)C->td; }
         if (C->pq && C->pd) { vkCmdResetQueryPool(C->cb, C->pq, 0, (uint32_t)C->pd); g_qr_cmd += (uint64_t)C->pd; }
-        C->qd = C->td = C->pd = 0; C->nq = C->ntq = C->npq = 0; }
+        C->qd = C->td = C->pd = 0; C->nq = C->ntq = C->npq = 0; bf_reset(); }   // a new recording holds no bound state (gfx_vk_draw.inc bf_*)
     rp_end();   // transfers and clears run outside a draw's render pass (only the draw path records inside one, through C->cb)
     return C->cb;
 }
@@ -1442,6 +1442,9 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         (unsigned long long)g_pmemo_hit, (unsigned long long)g_pmemo_miss, (unsigned long long)g_pmemo_ser0, (unsigned long long)(atomic_load(&g_prog_gen) - 1), prog_memo_on());
     if (memo_log()) LOG("[vk] memo pipelines: %llu draws had the draw before's, %llu built their key; state changes %llu; checked %llu, differed %llu (cumulative; gfx_vk_draw.inc pso_memo, DM_VK_PSO_MEMO %d, DM_VK_PSO_CHECK %d)",
         (unsigned long long)g_pso_hit, (unsigned long long)g_pso_miss, (unsigned long long)(g_pso_gen - 1), (unsigned long long)g_pso_checked, (unsigned long long)g_pso_bad, pso_memo_on(), pso_check());
+    if (memo_log()) LOG("[vk] memo binds left out / recorded: pipeline %llu / %llu, dynamic state %llu / %llu, vertex buffers %llu / %llu, index buffer %llu / %llu (cumulative; gfx_vk_draw.inc bf_*, DM_VK_BIND_FILTER %d)",
+        (unsigned long long)g_bf_skip[0], (unsigned long long)g_bf_made[0], (unsigned long long)g_bf_skip[1], (unsigned long long)g_bf_made[1], (unsigned long long)g_bf_skip[2], (unsigned long long)g_bf_made[2],
+        (unsigned long long)g_bf_skip[3], (unsigned long long)g_bf_made[3], bind_filter());
     LOG("[vk] geometry kept on the GPU: %llu index / vertex bindings from kept copies, %llu copies kept (%llu MB now), %llu copied per draw (cumulative; gfx_vk_draw.inc gc_get)",
         (unsigned long long)g_gc_hit, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy);
     { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);

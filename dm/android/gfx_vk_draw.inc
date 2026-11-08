@@ -954,7 +954,7 @@ static int rp_start(void) {
     VkCommandBuffer c = cb(); if (!c) return 0;
     VkRenderPassBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = P.rp, .framebuffer = P.fb, .renderArea = {{0, 0}, {P.w, P.h}}};
     if (prof_on()) prof_pass_begin();
-    vkCmdBeginRenderPass(c, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(c, &bi, VK_SUBPASS_CONTENTS_INLINE); bf_reset();
     P.active = 1; g_passes++;
     return 1;
 }
@@ -1709,6 +1709,41 @@ static int stream_fwd(const vshader *vs, int s, VkBuffer *b, VkDeviceSize *o) {
     const NVNbufferRange *r = &D.vbuf[s]; if (!r->address || !r->size || !stream_direct(vs, s)) return 0;
     return fwd_find((uintptr_t)r->address, (uintptr_t)(r->address + r->size), b, o);
 }
+// ---- Binds the command buffer already holds ----
+// Every draw recorded its pipeline, the seven dynamic states (ten calls), the index buffer and each vertex binding, changed or not, and the Adreno driver marks state
+// dirty for each call (only vkCmdBindPipeline compares with what is bound): on Breath of the Wild on the Odin 2 those calls cost about 1.3 ms a frame (pipeline 0.41,
+// vertex buffers 0.41, index buffer 0.1, dynamic state about 0.2), and their dirty bits re-emit state in vkCmdDrawIndexed (the viewport's block about 0.18 ms), while 87% of a
+// pass's draws keep the draw before's pipeline and 95% its viewport and scissor. A shadow of what the command buffer being recorded holds lets a draw record only what
+// differs (values compared bitwise). It is emptied wherever state is set behind it or may be lost: a command buffer's begin (cb), a render pass's begin (rp_start, and
+// tf_capture's own pass: Vulkan keeps the state across passes, the shadow does not rely on it), tf_capture (its own pipeline, viewport and scissor), and the clears drawn in
+// a pass (clear_color_pass, clear_ds_pass: their pipeline makes only viewport, scissor and stencil reference dynamic, so binding it leaves blend constants, stencil masks and
+// depth bias undefined for the next draw). Compute binds have a bind point of their own. Descriptor sets are bound for every draw still (each draw allocates its own).
+// Vertex bindings repeat only when the draw before bound the same buffer at the same offset (bindings start at each draw's first vertex: bind_vbufs).
+// DM_VK_BIND_FILTER=0 (env.txt): every draw records every bind, as before
+static int bind_filter(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_BIND_FILTER"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_BIND_FILTER=0: every draw records every bind"); } return v; }
+enum { BF_PIPE = 1, BF_VP = 2, BF_SC = 4, BF_BC = 8, BF_CM0 = 16, BF_CM1 = 32, BF_WM0 = 64, BF_WM1 = 128, BF_REF0 = 256, BF_REF1 = 512, BF_DB = 1024, BF_IB = 2048 };
+static struct { VkCommandBuffer cb; uint32_t ok, vbok; VkPipeline pipe; VkViewport vp; VkRect2D sc; float bc[4], db[3]; uint32_t cm[2], wm[2], ref[2];
+                VkBuffer ib; VkDeviceSize io; VkIndexType it; VkBuffer vb[32]; VkDeviceSize vo[32]; } g_bf;   // ok / vbok: what is known (BF_*; vertex binding i)
+static uint64_t g_bf_skip[4], g_bf_made[4];   // binds left out / recorded: 0 pipeline, 1 dynamic state, 2 vertex buffers, 3 index buffer
+static void bf_reset(void) { g_bf.ok = g_bf.vbok = 0; }
+static int bf_cb(VkCommandBuffer c) { if (!bind_filter()) return 0; if (g_bf.cb != c) { g_bf.cb = c; bf_reset(); } return 1; }   // the filter on, the shadow c's
+static void bf_pipeline(VkCommandBuffer c, VkPipeline p) {
+    if (bf_cb(c) && (g_bf.ok & BF_PIPE) && g_bf.pipe == p) { g_bf_skip[0]++; return; }
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, p); g_bf.pipe = p; g_bf.ok |= BF_PIPE; g_bf_made[0]++;
+}
+static int bf_same(VkCommandBuffer c, uint32_t bit, void *sh, const void *v, size_t n) {   // 1: dynamic state bit already holds v (the call is left out); else it is noted
+    if (!bf_cb(c)) return 0;
+    if ((g_bf.ok & bit) && !memcmp(sh, v, n)) { g_bf_skip[1]++; return 1; }
+    memcpy(sh, v, n); g_bf.ok |= bit; g_bf_made[1]++; return 0;
+}
+static void bf_ibuf(VkCommandBuffer c, VkBuffer b, VkDeviceSize o, VkIndexType t) {
+    if (bf_cb(c) && (g_bf.ok & BF_IB) && g_bf.ib == b && g_bf.io == o && g_bf.it == t) { g_bf_skip[3]++; return; }
+    vkCmdBindIndexBuffer(c, b, o, t); g_bf.ib = b; g_bf.io = o; g_bf.it = t; g_bf.ok |= BF_IB; g_bf_made[3]++;
+}
+static void bf_vbuf(VkCommandBuffer c, uint32_t i, VkBuffer b, VkDeviceSize o) {   // i < 32: streams 0..15, converted attributes 16 + attribute
+    if (bf_cb(c) && (g_bf.vbok >> i & 1) && g_bf.vb[i] == b && g_bf.vo[i] == o) { g_bf_skip[2]++; return; }
+    vkCmdBindVertexBuffers(c, i, 1, &b, &o); g_bf.vb[i] = b; g_bf.vo[i] = o; g_bf.vbok |= 1u << i; g_bf_made[2]++;
+}
 // ---------------- The draw ----------------
 // vertex data: each stream's bytes from vertex lo to the last vertex (or instance) the draw reads; the bindings start at vertex lo, so the draw numbers its vertices
 // from lo (firstVertex / vertexOffset less lo). Copying from vertex 0 instead made a draw late in a large vertex buffer copy (and convert) all of it before its
@@ -1727,16 +1762,16 @@ static int bind_vbufs(VkCommandBuffer c, const vshader *vs, int64_t lo, int64_t 
         if (stride) { uint32_t dv = D.stream[s].divisor; int64_t last = dv ? (int64_t)base_inst + (dv > 1 && g_divisor ? (inst + dv - 1) / dv : inst) : vhi; uint64_t want = (uint64_t)(last > 0 ? last : 0) * stride + 64; if (want < need) need = want; }
         uint64_t from = D.stream[s].divisor ? 0 : (uint64_t)lo * stride; if (from > need) from = need;   // instanced streams count from base_inst, not lo
         VkBuffer vb; VkDeviceSize vo;
-        if (stream_fwd(vs, s, &vb, &vo)) { g_fwd++; vo += from; vkCmdBindVertexBuffers(c, (uint32_t)s, 1, &vb, &vo); continue; }   // on the GPU: fwd_find
+        if (stream_fwd(vs, s, &vb, &vo)) { g_fwd++; vo += from; bf_vbuf(c, (uint32_t)s, vb, vo); continue; }   // on the GPU: fwd_find
         uint8_t *fill = NULL; gc_ent *ge = r->address ? gc_get((uintptr_t)r->address, r->size, 0, r->size, &fill) : NULL;   // the whole buffer kept, bound at the draw's first vertex
         if (ge) {
             if (fill) memcpy(fill, (const void *)(uintptr_t)r->address, r->size);
-            vb = gc_buf(ge); vo = ge->off + from; vkCmdBindVertexBuffers(c, (uint32_t)s, 1, &vb, &vo); continue;
+            vb = gc_buf(ge); vo = ge->off + from; bf_vbuf(c, (uint32_t)s, vb, vo); continue;
         }
         g_gc_copy++;
         uint64_t n = need - from; uint8_t *d = ar_alloc(n ? n : 16, &vb, &vo); if (!d) return 0;
         if (r->address && n) memcpy(d, (const void *)(uintptr_t)(r->address + from), n); else memset(d, 0, 16);
-        vkCmdBindVertexBuffers(c, (uint32_t)s, 1, &vb, &vo);
+        bf_vbuf(c, (uint32_t)s, vb, vo);
     }
     for (int i = 0; i < 16; i++) {   // attributes as register bits (vfmt_desc): each vertex (or instance) of the range, from its stream
         va_st a; memcpy(&a, &D.attr[i], 4); int kind, bits, cn = a.fmt ? vfmt_desc(a.fmt, &kind, &bits) : 0;
@@ -1753,7 +1788,7 @@ static int bind_vbufs(VkCommandBuffer c, const vshader *vs, int64_t lo, int64_t 
             uint8_t *fill = NULL; gc_ent *ge = gc_get((uintptr_t)r->address, r->size, 1ull << 63 | (uint64_t)a.fmt | (uint64_t)a.offset << 16 | (uint64_t)stride << 32, nall * 16, &fill);
             if (ge) {
                 if (fill) for (uint64_t v = 0; v < nall; v++) vfmt_regs(kind, bits, cn, (const uint8_t *)(uintptr_t)(r->address + v * stride + a.offset), (uint32_t *)fill + v * 4);
-                vb = gc_buf(ge); vo = ge->off + (VkDeviceSize)v0 * 16; vkCmdBindVertexBuffers(c, 16u + (uint32_t)i, 1, &vb, &vo); continue;
+                vb = gc_buf(ge); vo = ge->off + (VkDeviceSize)v0 * 16; bf_vbuf(c, 16u + (uint32_t)i, vb, vo); continue;
             }
         }
         uint32_t *d = (uint32_t *)ar_alloc((VkDeviceSize)(last - v0) * 16, &vb, &vo); if (!d) return 0;
@@ -1762,7 +1797,7 @@ static int bind_vbufs(VkCommandBuffer c, const vshader *vs, int64_t lo, int64_t 
             if (r->address && at + (uint64_t)bytes <= r->size) vfmt_regs(kind, bits, cn, (const uint8_t *)(uintptr_t)(r->address + at), o);
             else memset(o, 0, 16);
         }
-        vkCmdBindVertexBuffers(c, 16u + (uint32_t)i, 1, &vb, &vo);
+        bf_vbuf(c, 16u + (uint32_t)i, vb, vo);
     }
     return 1;
 }
@@ -1802,13 +1837,13 @@ static int tf_capture(vshader *vs, const prog_t *pr, int pst, const p_draw *dw, 
     vkUpdateDescriptorSets(g_vk.dev, nw, wr, 0, NULL);
     VkCommandBuffer c = cb(); if (!c) return 0;   // ends the targets' pass
     VkRenderPassBeginInfo rb = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g_null_rp, .framebuffer = g_null_fb, .renderArea = {{0, 0}, {1, 1}}};
-    vkCmdBeginRenderPass(c, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(c, &rb, VK_SUBPASS_CONTENTS_INLINE); bf_reset();   // its pipeline, viewport and scissor are set behind the bind filter (bf_*): unknown to it
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->p);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, 0, 1, &set, 0, NULL);
     VkViewport v = {0, 0, 1, 1, 0, 1}; VkRect2D sc = {{0, 0}, {1, 1}}; vkCmdSetViewport(c, 0, 1, &v); vkCmdSetScissor(c, 0, 1, &sc);
     int ok = bind_vbufs(c, vs, dw->first, (int64_t)dw->first + dw->count, (uint32_t)dw->base_instance, 1);
     if (ok) vkCmdDraw(c, (uint32_t)dw->count, 1, 0, (uint32_t)dw->base_instance);   // gl_VertexIndex counts from 0: the vertex buffers start at the first vertex
-    vkCmdEndRenderPass(c); cb_barrier();
+    vkCmdEndRenderPass(c); cb_barrier(); bf_reset();
     g_drawing = 0;
     { static int once; if (!once) { once = 1; LOG("[vk] transform feedback: first capture (vertex %s, %d vertices)", vs->key, dw->count); } }
     g_captures++;
@@ -1982,23 +2017,26 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!rp_start()) { g_drop[5]++; return 0; }   // after the textures: their uploads end a pass begun before (it is begun again on the same targets)
     VkCommandBuffer c = C->cb;
     occl_begin();
-    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->p);
+    bf_pipeline(c, pp->p);   // binds the command buffer already holds are left out (bf_*)
     for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], 0, NULL);
     // dynamic state: the viewport (see the file header for the origin), the scissor, stencil, blend constants, depth bias
     float vx = 0, vy = 0, vw = (float)P.w, vh = (float)P.h; if (D.has_vp) { vx = D.vp[0][0]; vy = D.vp[0][1]; vw = D.vp[0][2]; vh = D.vp[0][3]; }
     float n = D.dr[0] < 0 ? 0 : D.dr[0] > 1 ? 1 : D.dr[0], f = D.dr[1] < 0 ? 0 : D.dr[1] > 1 ? 1 : D.dr[1];
     VkViewport v = g_origin_ll ? (VkViewport){vx, vy, vw, vh, n, f} : (VkViewport){vx, vy + vh, vw, -vh, n, f};
-    vkCmdSetViewport(c, 0, 1, &v);
+    if (!bf_same(c, BF_VP, &g_bf.vp, &v, sizeof v)) vkCmdSetViewport(c, 0, 1, &v);
     VkRect2D sc = {{0, 0}, {P.w, P.h}};
     if (R.has_sc) { int x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y; int64_t x1 = (int64_t)R.sc.x + R.sc.w, y1 = (int64_t)R.sc.y + R.sc.h;
         if (x1 > (int64_t)P.w) x1 = P.w; if (y1 > (int64_t)P.h) y1 = P.h;
         sc = (VkRect2D){{x0, y0}, {(uint32_t)(x1 > x0 ? x1 - x0 : 0), (uint32_t)(y1 > y0 ? y1 - y0 : 0)}}; }
-    vkCmdSetScissor(c, 0, 1, &sc);
-    vkCmdSetBlendConstants(c, D.blend_color);
-    vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, D.st_vmask[0]); vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, D.st_vmask[1]);
-    vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, D.st_wmask[0]); vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, D.st_wmask[1]);
-    vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, D.st_ref[0]); vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, D.st_ref[1]);
-    vkCmdSetDepthBias(c, D.po.units, g_vk_feat.depthBiasClamp ? D.po.clamp : 0, D.po.factor);
+    if (!bf_same(c, BF_SC, &g_bf.sc, &sc, sizeof sc)) vkCmdSetScissor(c, 0, 1, &sc);
+    if (!bf_same(c, BF_BC, g_bf.bc, D.blend_color, sizeof g_bf.bc)) vkCmdSetBlendConstants(c, D.blend_color);
+    if (!bf_same(c, BF_CM0, &g_bf.cm[0], &D.st_vmask[0], 4)) vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, D.st_vmask[0]);
+    if (!bf_same(c, BF_CM1, &g_bf.cm[1], &D.st_vmask[1], 4)) vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, D.st_vmask[1]);
+    if (!bf_same(c, BF_WM0, &g_bf.wm[0], &D.st_wmask[0], 4)) vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, D.st_wmask[0]);
+    if (!bf_same(c, BF_WM1, &g_bf.wm[1], &D.st_wmask[1], 4)) vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, D.st_wmask[1]);
+    if (!bf_same(c, BF_REF0, &g_bf.ref[0], &D.st_ref[0], 4)) vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, D.st_ref[0]);
+    if (!bf_same(c, BF_REF1, &g_bf.ref[1], &D.st_ref[1], 4)) vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, D.st_ref[1]);
+    { float db[3] = {D.po.units, g_vk_feat.depthBiasClamp ? D.po.clamp : 0, D.po.factor}; if (!bf_same(c, BF_DB, g_bf.db, db, sizeof db)) vkCmdSetDepthBias(c, db[0], db[1], db[2]); }
     // indices: copied, quads made triangles; vertex range for the vertex data copy
     int64_t vlo = 0, vhi = 0; uint32_t count = dw ? (uint32_t)dw->count : (uint32_t)di->count, inst = (uint32_t)(dw ? dw->instances : di->instances); if (!inst) inst = 1;
     int quads = prim == 7, qstrip = prim == 8; VkBuffer ib = VK_NULL_HANDLE; VkDeviceSize ioff = 0; uint32_t icount = count; int i32 = 0;
@@ -2055,7 +2093,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (prim == 2 || prim == 9) RED_ONCE(99, "line loop / polygon drawn as a strip / fan");
     int64_t lo = k.sh[0]->vid || vlo < 0 ? 0 : vlo;   // the bindings start at vertex lo, and the draw counts from there; a shader reading gl_VertexIndex sees its own numbers
     if (!bind_vbufs(c, k.sh[0], lo, vhi, base_inst, inst)) { g_drop[6]++; return 0; }
-    if (ib) { vkCmdBindIndexBuffer(c, ib, ioff, i32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16); vkCmdDrawIndexed(c, icount, inst, 0, (int32_t)((di ? di->base_vertex : 0) - lo), base_inst); }
+    if (ib) { bf_ibuf(c, ib, ioff, i32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16); vkCmdDrawIndexed(c, icount, inst, 0, (int32_t)((di ? di->base_vertex : 0) - lo), base_inst); }
     else vkCmdDraw(c, count, inst, (uint32_t)(dw->first - lo), base_inst);
     g_draws++; C->ndraw++;
     if (g_prof_cur >= 0) { prof_rec *pr = &g_prof[g_prof_cur]; uint64_t nv = (uint64_t)(ib ? icount : count) * inst; pr->draws++; pr->verts += nv;
@@ -2176,6 +2214,7 @@ static int clear_in_pass(const vtex *v, unsigned level, int depth) {
 }
 // A colour clear of target idx limited by the scissor and / or a channel mask (gfx_vk.c clear_color takes the full ones)
 static void clear_color_pass(const p_clear_color *cc) {
+    bf_reset();   // its pipeline and dynamic state are set behind the bind filter (bf_*)
     if (!rp_prepare() || !rp_start()) return;
     VkRect2D r = clear_rect(); if (!r.extent.width || !r.extent.height) return;
     VkFormat f = P.key.color[cc->index];
@@ -2193,6 +2232,7 @@ static void clear_color_pass(const p_clear_color *cc) {
 }
 // A depth-stencil clear limited by the scissor and / or a partial stencil mask
 static void clear_ds_pass(const p_clear_ds *cd, VkImageAspectFlags a) {
+    bf_reset();   // as clear_color_pass
     if (!rp_prepare() || !rp_start() || !P.key.depth) return;
     VkRect2D r = clear_rect(); if (!r.extent.width || !r.extent.height) return;
     uint32_t sm = (uint32_t)cd->stencil_mask & 0xff;
