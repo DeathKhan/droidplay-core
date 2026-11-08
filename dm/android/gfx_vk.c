@@ -150,6 +150,8 @@ typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize n, used;
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; uint64_t q0, q1; } post_op;   // kind 1 event, 2 counter, 3 samples passed (occlusion queries q0..q1)
 typedef struct { int kind; uint64_t h; } dead_t;
 typedef struct { uint64_t src, dst, n; uint32_t value; int fill; } cop_t;   // a large buffer copy or fill, done by the completion thread in its place in the queue   // kind 1 image view, 2 framebuffer, 3 image, 4 device memory
+// One chunk's descriptor sets of one set layout (a shader's dsl or dsl_tf; gfx_vk_draw.inc ds_get): s[0, used) handed out while the chunk records, s[used, n) free again
+typedef struct ds_list { VkDescriptorSet *s; int n, used, cap; } ds_list;
 typedef struct chunk {
     VkCommandPool pool; VkCommandBuffer cb; VkFence fence; int open, busy, ts, ndraw, held; uint64_t seq, nvn_fence, hold;
     int qd, td, pd, sd;   // queries of qp / tq / pq written since their last reset, [0, n): reset in the command buffer when the chunk next begins; sd: its two g_tsq slots (Query resets below)
@@ -161,13 +163,14 @@ typedef struct chunk {
     stg_t *sb; int nsb, csb;   // the staging pool blocks it took while recorded, the last one being cut (stg_take); back to the free list in chunk_done
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
     VkDescriptorPool *dp; int ndp, cdp, dp_cur; VkBufferView *bv; int nbv, cbv;
+    ds_list **dl; int ndl, cdl; ds_list **dt; int ndt, cdt; int nds;   // recycled descriptor sets (gfx_vk_draw.inc ds_get): the lists holding sets, those handed out from in this recording, the sets held
 } chunk;
 enum { NCHUNK = 4 };
 static chunk g_ch[NCHUNK], *C;   // C: the chunk being recorded (NULL: none yet)
 static chunk *g_fifo[NCHUNK]; static int g_fifo_n;   // submitted, oldest first
 static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop, g_inflight_fwd; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
-static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c); static void bf_reset(void);   // gfx_vk_draw.inc
+static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c); static void bf_reset(void); static int ds_recycle(void);   // gfx_vk_draw.inc
 static void *chunk_thread(void *arg); static int stg_pool_on(void);
 // ---------------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------------
 // NVN's samples passed is a counter on the queue: ResetCounter zeroes it, every draw after adds its samples, ReportCounter writes the sum at that point when the GPU gets
@@ -223,7 +226,7 @@ static int lsnap_on(void), wb_revert_on(void), wb_absorb_on(void), up_range_on(v
 static int chunks_init(void) {
     static int ok = -1; if (ok >= 0) return ok;
     ok = 0; if (!vkb()) return 0;
-    fgpu_on(); stg_pool_on(); lsnap_on(); wb_revert_on(); wb_absorb_on(); up_range_on();   // read before the completion thread starts (sp_done reads g_sp_on)
+    fgpu_on(); stg_pool_on(); lsnap_on(); wb_revert_on(); wb_absorb_on(); up_range_on(); ds_recycle();   // read before the completion thread starts (sp_done reads g_sp_on, draw_chunk_reset the recycling switch)
     if (g_vk.props.limits.timestampComputeAndGraphics) { VkQueryPoolCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * NCHUNK};
         if (vkCreateQueryPool(g_vk.dev, &qc, NULL, &g_tsq) != VK_SUCCESS) g_tsq = VK_NULL_HANDLE; else if (g_qreset) g_qreset(g_vk.dev, g_tsq, 0, 2 * NCHUNK); }
     for (int i = 0; i < NCHUNK; i++) if (!chunk_make(&g_ch[i])) { LOG("[RED] [vk] command buffers could not be made"); return 0; }
@@ -1733,6 +1736,13 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         ext_check() ? "; DM_VK_EXT_CHECK on" : "");
     if (ext_check()) LOG("[vk] DM_VK_EXT_CHECK: %llu constant buffer bindings copied whole with NaN past their extents (cumulative)", (unsigned long long)g_ext_checked);
     LOG("[vk] support buffer: %llu stages wrote it, %llu left it unwritten (no module reads binding 0) (cumulative; gfx_vk_draw.inc stage_set)", (unsigned long long)g_sup_written, (unsigned long long)g_sup_skipped);
+    if (g_ds_stats) { static unsigned long long f0; static uint64_t h0, r0, m0, k0; uint64_t h = g_ds_got, r = g_ds_reused, m = g_ds_made, k = g_ds_calls;   // DM_VK_SET_STATS=1
+        if (frame > f0) { double nf = (double)(frame - f0);
+            LOG("[vk] descriptor sets a frame over the last %llu frames: %.0f handed out, %.0f of them recycled; %.0f made in %.0f vkAllocateDescriptorSets calls; held by the chunks %d %d %d %d in %d %d %d %d pools, "
+                "%llu full pool resets, %llu of %llu stage_set calls did not write each descriptor of their layout (cumulative; DM_VK_SET_RECYCLE=%d, gfx_vk_draw.inc ds_get)", frame - f0,
+                (double)(h - h0) / nf, (double)(r - r0) / nf, (double)(m - m0) / nf, (double)(k - k0) / nf, g_ch[0].nds, g_ch[1].nds, g_ch[2].nds, g_ch[3].nds, g_ch[0].ndp, g_ch[1].ndp, g_ch[2].ndp, g_ch[3].ndp,
+                (unsigned long long)atomic_load(&g_ds_resets), (unsigned long long)g_ds_short, (unsigned long long)g_ds_checked, g_ds_on > 0); }
+        f0 = frame; h0 = h; r0 = r; m0 = m; k0 = k; }
     if (c2_check()) LOG("[vk] c2 check: %llu handle words compared with c2_word, %llu differed (cumulative; gfx_vk_draw.inc bank_word)", (unsigned long long)g_c2_checked, (unsigned long long)g_c2_bad);
     if (memo_log()) LOG("[vk] memo programs: %llu draws found their shaders, %llu resolved and kept, %llu with a program of serial 0 resolved; program changes %llu (cumulative; gfx_vk_draw.inc prog_memo, DM_VK_PROG_MEMO %d)",
         (unsigned long long)g_pmemo_hit, (unsigned long long)g_pmemo_miss, (unsigned long long)g_pmemo_ser0, (unsigned long long)(atomic_load(&g_prog_gen) - 1), prog_memo_on());
