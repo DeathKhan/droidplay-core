@@ -1728,10 +1728,12 @@ static int fstep_hold(void) {
 // Cost = max(CPU: the time between the frames' starts without the pacing waits, GPU: the latest finished frame's GPU time), in vsyncs. The pacing waits are the acquire's and the
 // part of the last present's own sleep (mtl_present_slept_ns) between the two starts and before the acquire's wait: on Android the present sleeps to its vsync grid and the acquire
 // then finds its texture free (two swapchain textures, avail = the previous slot + period), so counted as work it made the cost the hold whatever the work. Breath of the Wild on an
-// Ayn Odin 2 held 3 vsyncs for good after the load into the world ("held 1 / 2 / 3 vsyncs 0 / 0 / 1800", 0 down) with about 43 ms of work (p50) and 7 ms asleep in each present
+// Ayn Odin 2 held 3 vsyncs for good after the load into the world ("held 1 / 2 / 3 vsyncs 0 / 0 / 1800", 0 down) with about 43 ms of work (p50) and 7 ms asleep in each present.
+// With the sleep taken out the GPU term matters there too: the Android replay's mtl_gpu_ms gives it (gfx_vk.c g_fgpu; it returned -1, which left the cost the CPU's alone)
 static void fstep_tick(const win_t *o, int c) {
     static uint64_t prev, t0, v0, fixed_sum, held[FSTEP_MAX + 1]; static int nlog;
-    static uint32_t chist[161]; static uint64_t cn, cpw, cps;   // this summary window's frame costs (0.05-vsync bins, the last one 8 or more) and the pacing taken out of them
+    static uint32_t chist[161], ghist[161]; static uint64_t cn, cpw, cps, cgb, cg0;   // this summary window's frame costs and GPU parts (0.05-vsync bins, the last one 8 or more), the pacing
+                                                                                      // taken out, frames whose GPU part was the larger, frames with no GPU time finished
     const double v = 1e9 / 60;
     uint64_t st = g_fs_start ? g_fs_start : now_ns(), pw = g_fs_wait; g_fs_start = g_fs_wait = 0;
     uint64_t pe = 0, ps = mtl_present_slept_ns(&pe);
@@ -1739,7 +1741,7 @@ static void fstep_tick(const win_t *o, int c) {
     double shown = prev ? (st - prev) / v : 0, gpu = 0; prev = st;
     for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; break; } }
     double cpu = shown - (pw + ps) / v, cost = cpu > gpu ? cpu : gpu;
-    if (shown > 0) { int b = (int)(cost * 20 + 0.5); chist[b < 0 ? 0 : b > 160 ? 160 : b]++; cn++; cpw += pw; cps += ps; }
+    if (shown > 0) { int b = (int)(cost * 20 + 0.5), bg = (int)(gpu * 20 + 0.5); chist[b < 0 ? 0 : b > 160 ? 160 : b]++; ghist[bg > 160 ? 160 : bg]++; cn++; cpw += pw; cps += ps; cgb += gpu > cpu; cg0 += gpu <= 0; }
     int kmin = 60 / c, kmax = !fstep_hold() ? kmin : kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k, kmin0 = g_fs.kmin, probe0 = g_fs.probe;
     int fixed = (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED);
     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed;
@@ -1781,13 +1783,15 @@ static void fstep_tick(const win_t *o, int c) {
         LOG("[nvn] frame step: the run at hold %d after the probe lasted under %.0f s, counted as a failed probe (CPU %d%% on performance cores)%s", kmin, FSTEP_HOLD_MAX / 60, g_fs_pshare, ++nlog == 40 ? "; further changes only counted below" : "");
     if (o->presents % 1800 == 0) {   // game time against real time (1.000 = normal speed; lower when a device cannot hold 20 fps or after long stalls)
         uint64_t vs = __atomic_load_n((uint64_t *)(dm_fps_state + 0x30), __ATOMIC_RELAXED) + fixed_sum, t = now_ns(), acc = 0;
-        double q[2] = {0, 0}; for (int b = 0, i = 0; b <= 160 && i < 2; b++) { acc += chist[b]; while (i < 2 && cn && acc * 100 >= cn * (i ? 95 : 50)) q[i++] = b / 20.0; }   // the window's cost p50 / p95
+        double q[4] = {0, 0, 0, 0};   // the window's cost p50 / p95 and GPU part p50 / p95
+        for (int h = 0; h < 2; h++) { const uint32_t *hb = h ? ghist : chist; acc = 0;
+            for (int b = 0, i = 0; b <= 160 && i < 2; b++) { acc += hb[b]; while (i < 2 && cn && acc * 100 >= cn * (i ? 95 : 50)) q[2 * h + i++] = b / 20.0; } }
         if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials); "
-                    "cost p50 %.2f / p95 %.2f vsyncs, pacing taken out %.2f ms a frame at the acquire and %.2f in the present",
+                    "cost p50 %.2f / p95 %.2f vsyncs (GPU part p50 %.2f / p95 %.2f, the larger in %llu frames, none finished in %llu), pacing taken out %.2f ms a frame at the acquire and %.2f in the present",
                     (vs - v0) / 60.0, (t - t0) / 1e9, (vs - v0) / 60.0 / ((t - t0) / 1e9), (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3],
                     (unsigned long long)g_fs.late, (unsigned long long)g_fs.paid, g_fs.dropped, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed,
-                    q[0], q[1], cn ? cpw / 1e6 / cn : 0, cn ? cps / 1e6 / cn : 0);
-        t0 = t; v0 = vs; memset(held, 0, sizeof held); memset(chist, 0, sizeof chist); cn = cpw = cps = 0;
+                    q[0], q[1], q[2], q[3], (unsigned long long)cgb, (unsigned long long)cg0, cn ? cpw / 1e6 / cn : 0, cn ? cps / 1e6 / cn : 0);
+        t0 = t; v0 = vs; memset(held, 0, sizeof held); memset(chist, 0, sizeof chist); memset(ghist, 0, sizeof ghist); cn = cpw = cps = cgb = cg0 = 0;
     }
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
