@@ -124,7 +124,7 @@ def main():
             rp = out / f'{key}.res.json'   # translated by an earlier run of this chain version (the key covers the shader's bytes)
             if (out / f'{key}.spv').exists() and rp.exists():
                 ch = json.loads(rp.read_text(encoding='utf-8')).get('android')
-                if ch == sa.EXT_FROM: sa.upgrade(out, key); ch = sa.ANDROID_CHAIN; upg += 1   # (its .spv files are this chain's: only res.json's extents were missing)
+                if ch == sa.EXT_FROM and sa.ANDROID_CHAIN == sa.EXT_FROM + 1: sa.upgrade(out, key); ch = sa.EXT_FROM + 1; upg += 1   # (its .spv files are chain EXT_FROM + 1's: only res.json's extents were missing; after a later bump of ANDROID_CHAIN, translated again)
                 if ch == sa.ANDROID_CHAIN: have += 1; continue
             j, why = job(key, stage, code, ctl, w, facts)
             if not j: skipped[key] = why; continue

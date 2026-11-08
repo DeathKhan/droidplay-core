@@ -16,7 +16,8 @@ import itertools, json, struct, sys
 from pathlib import Path
 
 ANDROID_CHAIN = 4   # res.json 'android': bumped when this post-pass or spv_build.py's translation changes what they make (spv_build.py translates older outputs again)
-EXT_FROM = 3   # 4 added res.json cbufs[].ext (cb_extents) and nothing else: spv_build.py brings an output of chain 3 up to date from its .spv (add_ext), without the translator
+EXT_FROM = 3   # 4 added res.json cbufs[].ext (cb_extents) and nothing else: spv_build.py brings an output of chain 3 up to date from its .spv (add_ext), without the translator,
+               # only while ANDROID_CHAIN is EXT_FROM + 1 (upgrade stamps that chain, so a later bump for a change to the .spv translates chain 3's outputs again)
 SET_OF = {'vs': 0, 'ps': 1, 'gs': 2, 'tc': 3, 'te': 3, 'cs': 0}
 OP_CAP, OP_EXT, OP_EXECMODE, OP_ENTRY, OP_DECORATE, OP_MEMBERDECORATE = 17, 10, 16, 15, 71, 72
 OP_FUNCTION, OP_FUNCTIONEND, OP_RETURN, OP_VARIABLE, OP_TYPEPOINTER, OP_TYPEINT, OP_TYPEFLOAT, OP_TYPEVECTOR, OP_CONSTANT = 54, 56, 253, 59, 32, 21, 22, 23, 43
@@ -652,8 +653,8 @@ def _cb_run(funcs, chains, consts, reg, init, glsl, sc32):
             elif t[0] == 251:
                 c = val(t[1])
                 if c is None: nxt = [w for w in t[2:] if w in at]   # every word that names a block: the cases' labels and perhaps a literal, more successors only
-                else:   # known, so a 32-bit selector: one word per case literal
-                    case = {t[j]: t[j + 1] for j in range(len(t) - 3, 2, -2)}   # (the first of equal literals wins)
+                else:   # known, so a 32-bit selector: one word per case literal, t = [251, selector, default, literal 1, label 1, literal 2, label 2, ...]
+                    case = {t[j]: t[j + 1] for j in range(len(t) - 2, 2, -2)}   # the pairs from the last down, so the first of equal literals wins
                     nxt = sorted({case.get(v, t[2]) for v in c})
             else: nxt = []
             for lab in nxt:
@@ -678,7 +679,7 @@ def add_ext(res, ins):
 def upgrade(out, key):
     """An output of chain EXT_FROM made this chain's: its res.json gets the extents of its .spv (spv_build.py)"""
     rp = out / f'{key}.res.json'; res = json.loads(rp.read_text(encoding='utf-8'))
-    add_ext(res, parse((out / f'{key}.spv').read_bytes())[1]); res['android'] = ANDROID_CHAIN
+    add_ext(res, parse((out / f'{key}.spv').read_bytes())[1]); res['android'] = EXT_FROM + 1   # the chain this makes, not ANDROID_CHAIN: after a later bump, retranslated
     rp.write_text(json.dumps(res), encoding='utf-8')
 
 def main():

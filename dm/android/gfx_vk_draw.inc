@@ -1539,7 +1539,9 @@ static int desc_scratch(void) { static int v = -1; if (v < 0) { const char *e = 
 static uint64_t g_ext_checked;   // bindings copied so (stage_set)
 static int ext_check(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_EXT_CHECK"); v = e && *e && *e != '0'; if (v) LOG("[vk] DM_VK_EXT_CHECK: constant buffers read NaN past their extents"); } return v; }
 static uint64_t g_sup_written, g_sup_skipped;   // stages that wrote the support buffer / left it unwritten (stage_set)
-static ucopy_t g_ucopy[1024]; static uint64_t g_ucopy_hit, g_ucopy_miss, g_ucopy_bytes;   // g_ucopy_bytes: copied by the misses
+// g_ucopy_bytes / g_ucopy_shadow: what the misses copied to the arena and again to the shadows, two memcpy of the same n bytes, both saved by a smaller extent (cb_ext_pick);
+// DM_VK_EXT_CHECK's whole copies are in neither, so with it on they do not compare with a run without
+static ucopy_t g_ucopy[1024]; static uint64_t g_ucopy_hit, g_ucopy_miss, g_ucopy_bytes, g_ucopy_shadow;
 static int ucopy(const void *src, size_t n, size_t al, VkBuffer *b, VkDeviceSize *off) {   // src NULL: al zero bytes (not cached)
     if (!src) { uint8_t *d = ar_alloc(al, b, off); if (!d) return 0; memset(d, 0, al); return 1; }
     uintptr_t h = ((uintptr_t)src >> 4) ^ ((uintptr_t)src >> 14) ^ n * 0x9e37u; ucopy_t *e = &g_ucopy[h & 1023];
@@ -1549,7 +1551,7 @@ static int ucopy(const void *src, size_t n, size_t al, VkBuffer *b, VkDeviceSize
     g_ucopy_miss++; g_ucopy_bytes += n;
     if (!C) return 1;
     if (e->cap < n) { free(e->shadow); e->shadow = malloc(n); e->cap = e->shadow ? n : 0; }
-    if (e->shadow) { memcpy(e->shadow, src, n); e->src = src; e->n = n; e->seq = C->seq; e->b = *b; e->off = *off; } else e->src = NULL;
+    if (e->shadow) { memcpy(e->shadow, src, n); g_ucopy_shadow += n; e->src = src; e->n = n; e->seq = C->seq; e->b = *b; e->off = *off; } else e->src = NULL;
     return 1;
 }
 static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog_stage, uint32_t base_inst) {

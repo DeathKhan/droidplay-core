@@ -193,6 +193,43 @@ class CbExtents(unittest.TestCase):
         self.assertEqual(why[1], 'used other than by an access chain from member 0')
         self.assertEqual(self.host(data, True)[1], 0)
 
+    def test_switch_on_a_known_selector_takes_its_case(self):
+        # OpSwitch's words are [selector, default, literal, label, literal, label, ...]: a known selector goes to the label after its literal. One path stores t = 5 and
+        # k = 19, the other leaves t unknown and k = 2; case 5 reads c[k]: the known 5 must reach it (element 19), else only the unknown path's k = 2 is seen there
+        def switch(t_a, t_b, cases, case3):
+            return '''OpStore %k %c2
+OpSelectionMerge %m0 None
+OpBranchConditional %cmp %a %b
+%a = OpLabel
+OpStore %k %c19
+OpStore %t T_A
+OpBranch %m0
+%b = OpLabel
+OpStore %t T_B
+OpBranch %m0
+%m0 = OpLabel
+%s = OpLoad %i32 %t
+OpSelectionMerge %m None
+OpSwitch %s %def CASES
+%case5 = OpLabel
+%kk = OpLoad %i32 %k
+'''.replace('T_A', t_a).replace('T_B', t_b).replace('CASES', cases) + READ.format(n='r', idx='kk') + '''OpBranch %m
+''' + ('''%case3 = OpLabel
+''' + case3 + '''OpBranch %m
+''' if '%case3' in cases else '') + '''%def = OpLabel
+OpBranch %m
+%m = OpLabel'''
+        for cases in ('5 %case5', '5 %case5 3 %case3', '3 %case3 5 %case5'):
+            self.assertEqual(self.ext(self.asm(switch('%c5', '%fu', cases, '')))[1], 16 * 20, cases)
+        # both known, each to its own case: 5 with k = 19 reads element 19, 3 with k = 2 reads k + 1 = 3 (were 5 sent to case 3 too, element 20)
+        c3 = '%k3 = OpLoad %i32 %k\n%k3x = OpIAdd %i32 %k3 %c1\n' + READ.format(n='q', idx='k3x')
+        for cases in ('5 %case5 3 %case3', '3 %case3 5 %case5'):
+            self.assertEqual(self.ext(self.asm(switch('%c5', '%c3', cases, c3)))[1], 16 * 20, cases)
+        # a known selector with no case takes the default: the cases' access chains never reached keep the buffer whole
+        why = {}
+        self.assertEqual(self.ext(self.asm(switch('%c9', '%c9', '5 %case5 3 %case3', c3)), why)[1], 0)
+        self.assertEqual(why[1], 'index in a block the run never reached')
+
     def test_a_register_handed_to_a_function_is_unknown(self):
         # %t's pointer goes to a function that may store through it: its value after the call is not the 1 stored before
         body = '''OpStore %t %c1
