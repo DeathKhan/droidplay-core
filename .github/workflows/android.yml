@@ -53,4 +53,8 @@ jobs:
           "$CM/ninja" -C build dmhost_app dmhost_cli nxloader
       - name: Packing and RomFS image tests
         working-directory: dm/tools/tests
-        run: python -m unittest -v test_android_cli test_romfs_image
+        # test_romfs_image compiles its C with `cc`, Apple's clang where nxnative runs it; Ubuntu's cc is gcc, whose -Wmisleading-indentation (an error under the
+        # test's -Werror) rejects the one-line C the test writes, so cc is clang here as well
+        run: |
+          mkdir -p "$RUNNER_TEMP/cc" && ln -sf "$(command -v clang)" "$RUNNER_TEMP/cc/cc"
+          PATH="$RUNNER_TEMP/cc:$PATH" python -m unittest -v test_android_cli test_romfs_image
