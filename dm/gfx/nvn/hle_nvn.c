@@ -746,7 +746,7 @@ NVN(nvnProgramFinalize, void, NVNprogram *p) {
 // but not the address; looked up by address, a copy had no record, so its stages were keyed at the first draw from the control section, which the game had freed by then:
 // random keys, "not in the shader map", draws skipped and a picture of noise. A record stays as long as the process (64 bytes and a table entry a SetShaders): a copy can
 // outlive the program it was made from, and the host cannot see when the last copy goes. The Metal side finds a program's translation by its serial too (prog_get)
-// c1: each NVN stage's c1 constant segment in its code area (control +0x700 start, +0x704 end), copied with the keys for the Android replay (prog_c1)
+// c1: each stage's c1 constant segment in its code area (NVN: control +0x700 start, +0x704 end; NVN2: +0x40, +0x44), copied with the keys for the Android replay (prog_c1)
 typedef struct { uint8_t key[6][8]; uint8_t ok; uint32_t c1[6][2]; } prog_keys_t;
 static pthread_mutex_t g_pk_mu = PTHREAD_MUTEX_INITIALIZER; static CFMutableDictionaryRef g_pk;   // serial → record
 static prog_keys_t *pk_get(uint64_t serial) {
@@ -817,7 +817,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     prog_keys_t *k = pk_get(o->serial);   // a new serial: a new record
     for (int i = 0; i < n; i++) {
         if (keys_hash(&sd[i], 1, k->key[i])) k->ok |= (uint8_t)(1u << i);
-        if (sd[i].control && !nvn2_ctl(sd[i].control)) memcpy(k->c1[i], (const uint8_t *)sd[i].control + 0x700, 8); else k->c1[i][0] = k->c1[i][1] = 0;   // NVN2's section has no +0x700
+        if (sd[i].control) memcpy(k->c1[i], (const uint8_t *)sd[i].control + (nvn2_ctl(sd[i].control) ? 0x40 : 0x700), 8); else k->c1[i][0] = k->c1[i][1] = 0;   // NVN2: +0x40 / +0x44 (dmsh_ampere.py c1_segment)
         // A stage keyed later (its code area is in no memory pool yet) is keyed from the host's copy of its control section's key bytes, as NVN lets the game free its own
         // once this call returns; DM_NVN_SHDUMP keeps a copy of every stage, for the replay layer to save shaders missing from the map (it writes the same bytes). The program
         // and its copies point at it, so it stays as long as the process, as the record does. nvn_ctl_lens reads it again: NVN's key bytes hold +0x20 and +0x704, NVN2's +0x44

@@ -4,6 +4,9 @@
 # compute area's instructions from +0x100, c1 from control +0x700..+0x704, the profile's translation facts), with softfloat64 (phones' GPUs have no FP64). The
 # translator's output goes through spv_android.py: <out dir>/<key>.spv, <key>.z.spv (vertex) and <key>.res.json, which the app finds in game/spv (DM_SPV_DIR).
 # The key is the host's (hle_nvn.c keys_hash): sha256 of the control section (its own length when +0x20 gives one under 0x880) and the code area, 16 hex digits.
+# NVN2 (Switch 2) records are Ampere code, as dmsh_build.py job_for takes them (dm/gfx/tools/dmsh_ampere.py): the first 0x48 control bytes with +0x30 as zero in the key,
+# the instructions (the 0x80-byte SPH included) as the job's code, c1 between control +0x40 and +0x44, job arch sm86, and compute's c0 layout (nvn2_cs). Task and mesh
+# shaders are skipped: the Vulkan replay has no mesh stage (gfx_vk.c skips their draws).
 # Vertex shaders in two parts (VertexA + VertexB, Catherine: Full Body's GLSLC) are merged into one program first, as dmsh_build.py vertex_ab does.
 # Usage: spv_build.py <package dir> <out dir> --xlate <dmsh_xlate.dll or executable> [--facts <shader_facts.tsv>] [-j N]
 import spv_android as sa   # beside this file
@@ -11,6 +14,7 @@ import argparse, concurrent.futures as cf, hashlib, json, os, re, shutil, struct
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1] / 'gfx/tools')); import dmsh_ampere   # noqa: E402  NVN2 control sections, as dmsh_build.py reads them
 GFX_MAGIC, CS_MAGIC, CTL_MAGIC = bytes.fromhex('78563412'), bytes.fromhex('79563412'), bytes.fromhex('34127698')
 
 def records(d):
@@ -22,6 +26,7 @@ def split(rec):   # → (code area, control section)
     return rec[0x38:0x38 + ncode], rec[0x38 + ncode:0x38 + ncode + nctl]
 
 def key_of(ctl, code):
+    if dmsh_ampere.is_nvn2(ctl): return hashlib.sha256(ctl[:0x30] + bytes(4) + ctl[0x34:0x48] + code).hexdigest()[:16]   # shader_split.py key_ctl, the host's keys_hash
     own = struct.unpack_from('<I', ctl, 0x20)[0] if len(ctl) >= 0x24 else 0
     n = own if 0x760 <= own < 0x880 else 0x880
     return hashlib.sha256(ctl[:n] + code).hexdigest()[:16]
@@ -80,19 +85,24 @@ def vertex_ab(key, code, ctl):
 
 
 def job(key, stage, code, ctl, w, facts):
-    c1o, c1t = struct.unpack_from('<2I', ctl, 0x700)
-    c1 = code[c1o:c1t] if c1o <= c1t <= len(code) else b''
-    if stage == 'vs':
-        try: ab = vertex_ab(key, code, ctl)
-        except ValueError as e: return None, str(e)
-        if ab: code, c1 = ab
-    if stage != 'cs': body = code[0x30:]
-    elif code[:4] == CS_MAGIC:
-        if any(code[0x30:0x100]): return None, 'compute code area +0x30..+0x100 is not all zero'
-        body = code[0x100:]
-    else: body = code
+    extra = {}
+    if dmsh_ampere.is_nvn2(ctl):   # dmsh_build.py job_for's NVN2 branch: the Ampere instructions as they are (a graphics stage's 0x80-byte SPH included)
+        c1 = dmsh_ampere.c1_segment(ctl, code); body = code[:dmsh_ampere.inst_len(ctl)]; extra['arch'] = 'sm86'
+        if stage == 'cs': extra['nvn2_cs'] = [ctl[0xb1], ctl[0xb2], ctl[0xb3], struct.unpack_from('<H', ctl, 0xba)[0], ctl[0xa9] * 4, ctl[0xb4], ctl[0xb5]]   # compute's c0 layout
+    else:
+        c1o, c1t = struct.unpack_from('<2I', ctl, 0x700)
+        c1 = code[c1o:c1t] if c1o <= c1t <= len(code) else b''
+        if stage == 'vs':
+            try: ab = vertex_ab(key, code, ctl)
+            except ValueError as e: return None, str(e)
+            if ab: code, c1 = ab
+        if stage != 'cs': body = code[0x30:]
+        elif code[:4] == CS_MAGIC:
+            if any(code[0x30:0x100]): return None, 'compute code area +0x30..+0x100 is not all zero'
+            body = code[0x100:]
+        else: body = code
     p = Path(w) / f'{key}.bin'; p.write_bytes(body)
-    j = {'key': key, 'stage': stage, 'code': str(p), 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'softfloat64': True,
+    j = {'key': key, 'stage': stage, 'code': str(p), 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'softfloat64': True, **extra,
          'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}   # dmsh_build.py's options and defaults: the chain is tested with them
     if key in facts: j.update(facts[key])
     else: j['no_facts'] = True
@@ -115,6 +125,7 @@ def main():
     jobs, skipped, have, tfs, upg = {}, {}, 0, {}, 0
     for f in sorted(Path(a.package).glob('*.bin')):
         stage = f.name[:2]
+        if stage in ('ts', 'ms'): skipped[f'{f.name} ({len(records(f.read_bytes()))})'] = 'task / mesh shaders: the Vulkan replay has no mesh stage'; continue
         if stage not in ('vs', 'ps', 'gs', 'tc', 'te', 'cs'): continue
         for rec in records(f.read_bytes()):
             code, ctl = split(rec)
@@ -129,7 +140,7 @@ def main():
             j, why = job(key, stage, code, ctl, w, facts)
             if not j: skipped[key] = why; continue
             jobs[key] = j
-            if stage == 'vs' and (tf := tf_layout(key, ctl)): tfs[key] = tf
+            if stage == 'vs' and not dmsh_ampere.is_nvn2(ctl) and (tf := tf_layout(key, ctl)): tfs[key] = tf
     keys = sorted(jobs); chunks = [keys[i::a.j] for i in range(a.j)]
     xl = [a.xlate] if not a.xlate.endswith('.dll') else ['dotnet', a.xlate]
     tout = Path(w) / 'out'; tout.mkdir()

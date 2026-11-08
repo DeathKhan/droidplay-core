@@ -1514,6 +1514,7 @@ static void mid_poll(uint64_t presents) {
     fclose(f);
 }
 static uint64_t g_op_warned;   // ops this replay does not handle, logged once each
+static uint64_t g_mesh_skipped;   // task / mesh draws skipped (OP_DRAW with DM_PRIM_MESH_TASKS)
 void mtl_exec(const uint8_t *p) {
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
@@ -1566,7 +1567,10 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_TEX: clear_tex((const p_clear_tex *)a); break;
             case OP_DRAW: if (rc_skips()) break;
                 if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
-                { p_draw t; if (!vk_draw(draw_rec(a, h.size, &t), NULL)) g_draws_dropped++; break; }   // short records: draw_rec (nvn_obj.h)
+                { p_draw t; const p_draw *dw = draw_rec(a, h.size, &t);   // short records: draw_rec (nvn_obj.h)
+                  if (dw->prim == DM_PRIM_MESH_TASKS) {   // NVN2's DrawMeshTasks: the Adreno 740's driver (Vulkan 1.3.128) has no VK_EXT_mesh_shader, and no lowering is ported (nvn_mtl.m runs them as Metal mesh draws)
+                      RED_ONCE(131, "task / mesh shader draws (NVN2 DrawMeshTasks) are skipped: no mesh shaders on this replay (Mario Kart World's roadside bushes and grass tufts)"); g_mesh_skipped++; break; }
+                  if (!vk_draw(dw, NULL)) g_draws_dropped++; break; }
             case OP_DRAW_IDX: if (rc_skips()) break;
                 if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
                 { p_draw_idx t; if (!vk_draw(NULL, draw_idx_rec(a, h.size, &t))) g_draws_dropped++; break; }
@@ -1868,7 +1872,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     LOG("[vk] occlusion queries %llu, samples-passed reports %llu, timestamp reports %llu, queries reset on the host %llu / in command buffers %llu, graphics pipelines made %llu (%.0f ms), compute pipelines %llu (%.0f ms), shader modules %llu (%.0f ms) (cumulative)",
         (unsigned long long)g_q_queries, (unsigned long long)g_q_reports, (unsigned long long)g_ts_reports, (unsigned long long)atomic_load(&g_qr_host), (unsigned long long)g_qr_cmd,
         (unsigned long long)atomic_load(&g_pso_made), atomic_load(&g_pso_ns) / 1e6, (unsigned long long)atomic_load(&g_cpso_made), atomic_load(&g_cpso_ns) / 1e6, (unsigned long long)atomic_load(&g_mod_made), atomic_load(&g_mod_ns) / 1e6);
-    LOG("[vk] draws not made: shader missing %llu, targets %llu, pipeline %llu, descriptors %llu, invalid binding %llu, pass %llu, vertex buffers %llu; dropped in all %llu (cumulative)", (unsigned long long)g_drop[0], (unsigned long long)g_drop[1], (unsigned long long)g_drop[2], (unsigned long long)g_drop[3], (unsigned long long)g_drop[4], (unsigned long long)g_drop[5], (unsigned long long)g_drop[6], (unsigned long long)g_draws_dropped);
+    LOG("[vk] draws not made: shader missing %llu, targets %llu, pipeline %llu, descriptors %llu, invalid binding %llu, pass %llu, vertex buffers %llu; dropped in all %llu, task / mesh draws skipped %llu (cumulative)", (unsigned long long)g_drop[0], (unsigned long long)g_drop[1], (unsigned long long)g_drop[2], (unsigned long long)g_drop[3], (unsigned long long)g_drop[4], (unsigned long long)g_drop[5], (unsigned long long)g_drop[6], (unsigned long long)g_draws_dropped, (unsigned long long)g_mesh_skipped);
     LOG("[vk] vertex streams read on the GPU from a dispatch's storage buffer: %llu (cumulative)", (unsigned long long)g_fwd);
     if (stg_stat()) { static unsigned long long f0; static uint64_t a0, r0, s0; uint64_t a = atomic_load(&g_stg_allocs), r = atomic_load(&g_stg_frees), sl = g_sp_slices; double nf = frame > f0 ? (double)(frame - f0) : 1;
       pthread_mutex_lock(&g_sp_mu); int nb = g_sp_nblk, fr = g_sp_nfree; pthread_mutex_unlock(&g_sp_mu);

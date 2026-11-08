@@ -561,6 +561,7 @@ static struct {
     int tex_base, samp_base; uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][6]; int has_vp; float dr[2]; int depth_clamp; float blend_color[4]; p_prim_restart restart;
     p_tf_bind tf[4]; uint64_t tf_off[4]; int tf_on, rast_discard;
+    uint8_t push[2][DMSH_PUSH_SIZE]; float alpha_ref;   // NVN2 push constants, graphics and compute blocks (read as c[DMSH_PUSH_BANK]); the alpha test's reference (no alpha test here yet)
 } D;
 static int g_d_init;
 // The pipeline key's state (vk_draw_) as the key takes it from D: the fields a blend or depth / stencil object sets, over zeroed bits (the bits they leave over are whatever
@@ -611,7 +612,7 @@ static int draw_state_is(uint32_t op) {
         case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL:
         case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_STENCIL:
         case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_BLEND_COLOR: case OP_PRIM_RESTART:
-        case OP_TF_BIND: case OP_TF_STATE: case OP_RAST_DISCARD: return 1;
+        case OP_TF_BIND: case OP_TF_STATE: case OP_RAST_DISCARD: case OP_PUSH_CONST: case OP_ALPHA_REF: return 1;
         default: return 0;
     }
 }
@@ -666,6 +667,11 @@ static int draw_state_op(uint32_t op, const void *a) {
         case OP_TF_STATE: { const p_tf_state *b = a;   // Begin writes from the start of each buffer; Pause / Resume keep the offsets (nvn_mtl.m: the game's control buffer is not used)
             if (b->what == 0) { D.tf_on = 1; memset(D.tf_off, 0, sizeof D.tf_off); } else D.tf_on = b->what == 3; return 1; }
         case OP_RAST_DISCARD: D.rast_discard = ((const p_rast_discard *)a)->on; return 1;
+        case OP_PUSH_CONST: { const p_push_const *b = a;   // the bytes at offset in one block, as nvn_mtl.m state_op; stage_set reads the block as c[DMSH_PUSH_BANK]
+            if (b->offset < DMSH_PUSH_SIZE && b->size <= DMSH_PUSH_SIZE - b->offset) memcpy(D.push[b->compute ? 1 : 0] + b->offset, b->data, b->size);
+            else RED_ONCE(132, "push constants at %u, %u bytes, past the %u-byte block: dropped", b->offset, b->size, (unsigned)DMSH_PUSH_SIZE);
+            return 1; }
+        case OP_ALPHA_REF: D.alpha_ref = ((const p_alpha_ref *)a)->ref; return 1;   // kept for an alpha test the replay does not do yet (the key's alpha_func is dropped too)
         default: return 0;
     }
 }
@@ -1823,7 +1829,8 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
     for (int i = 0; i < s->ncb; i++) {
         int slot = s->cb[i].slot; size_t n = 16; const void *src = NULL; uint8_t bank[0xA00];
         if (slot == 0) { bank_c0(nst, bank, base_inst); src = bank; n = 0x800; }
-        else if (slot == 2) { if (!c2) bank_c2(nst, bank); src = c2 ? c2 : bank; n = C2_SIZE; }   // c2 read as a constant buffer: 81 of Breath of the Wild's 19,592 shaders, none of a measured frame's
+        else if (slot == 2) { if (!c2) bank_c2(nst, bank); src = c2 ? c2 : bank; n = C2_SIZE; }
+        else if (slot == DMSH_PUSH_BANK) { src = D.push[nst == 5]; n = DMSH_PUSH_SIZE; }   // NVN2 push constants: compute's block or the graphics stages' (OP_PUSH_CONST)   // c2 read as a constant buffer: 81 of Breath of the Wild's 19,592 shaders, none of a measured frame's
         else if (slot == 1) {   // the shader's own constant segment, in its code memory: its bounds were read from the control section at SetShaders (gone by now: Danganronpa V3's movie shader read zeros)
             const NVNshaderData *sd = pr && prog_stage >= 0 ? &pr->sd[prog_stage] : NULL; uint32_t o = 0, e = 0; int c1m;
             if (sd && sd->data && ((c1m = c1_memo(pr, prog_stage, &o, &e)) >= 0 ? c1m : prog_c1(pr, (unsigned)prog_stage, &o, &e)) && e > o && e - o <= 0x10000) { src = (const void *)(uintptr_t)(sd->data + o); n = e - o; }
