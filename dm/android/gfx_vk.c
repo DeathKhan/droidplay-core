@@ -608,8 +608,12 @@ static VkImageAspectFlags aspect_of(VkFormat f) {
 static int is_linear(const tex_t *t) { return (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0; }
 static int is_packaged(const tex_t *t) { return t->mem && (t->has_layout || is_linear(t) || nvn_hm_get(&g_cpuw, &t->serial)); }
 void vkb_frame_forget(uint64_t serial);
+// g_vt_gen: bumped (under g_bk) whenever a vtex is freed or a serial stops resolving to the vtex it did (vt_destroy, the g_tex deletions): a draw's textures resolved in
+// stage_textures are used again in stage_set only while it has not moved (gfx_vk_draw.inc tex_once)
+static uint64_t g_vt_gen = 1;
 static void vt_destroy(vtex *v) {   // with the replay's lock held; the front end may be drawing the image: it is taken off the presented frame first (vkb_frame_forget waits for that)
     if (!v) return;
+    g_vt_gen++;
     vkb_frame_forget(v->serial);
     if (v->img) views_drop(v->img);   // the image, its views and framebuffers go when the current chunk completes: recorded and submitted commands may use them
     dead_add(3, (uint64_t)v->img); dead_add(4, (uint64_t)v->mem);
@@ -812,15 +816,19 @@ static void share_take_over(const share_key *nk) {
         i = (uint32_t)-1;   // the table moved entries on delete: scan again
     }
 }
+// vkb()'s answer, once it was yes: a flag instead of pthread_once on every lookup (0.17% of Breath of the Wild's replay thread on the Odin 2); DM_VK_TEX_ONCE=0 asks vkb() each time
+static int tex_once(void);   // gfx_vk_draw.inc
+static _Atomic int g_vkb_up;
+static int vkb_up(void) { if (atomic_load_explicit(&g_vkb_up, memory_order_acquire)) return 1; if (!vkb()) return 0; if (tex_once()) atomic_store_explicit(&g_vkb_up, 1, memory_order_release); return 1; }
 // The image of a texture: made at first use; a texture whose content lives in guest memory is uploaded, and uploaded again when its pages were written
 static vtex *vt_get(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
-    if (!t || !t->serial || !vkb()) return NULL;
+    if (!t || !t->serial || !vkb_up()) return NULL;
     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(30, "texture object no longer valid (magic %#x)", t->magic); return NULL; }
     vtex *v = nvn_hm_get(&g_tex, &t->serial);
     if (v && (v->store != t->mem || memcmp(&v->desc, &t->d, sizeof v->desc))) {
         static int n; if (n++ < 8) LOG("[vk] texture ser=%llu met again with %s: made anew (storage %p, now %p)", (unsigned long long)t->serial, v->store != t->mem ? "other storage" : "another description", (const void *)v->store, (const void *)t->mem);
-        nvn_hm_del(&g_tex, &t->serial); vt_unref(v); v = NULL; }
+        nvn_hm_del(&g_tex, &t->serial); g_vt_gen++; vt_unref(v); v = NULL; }
     int pkg = is_packaged(t);
     if (v && v->pkg) {
         uint64_t now = nvn_dirty_now();
@@ -831,7 +839,7 @@ static vtex *vt_get(const tex_t *ct) {
         return v;
     }
     if (v && !pkg) { v->used = atomic_load(&g_fence); return v; }
-    if (v) { nvn_hm_del(&g_tex, &t->serial); vt_unref(v); }   // written by the CPU since it was made as a GPU texture: made again from guest memory, its own
+    if (v) { nvn_hm_del(&g_tex, &t->serial); g_vt_gen++; vt_unref(v); }   // written by the CPU since it was made as a GPU texture: made again from guest memory, its own
     share_key k = share_of(t);
     if (!pkg && t->pool) {   // another object over the same storage, the same description: the same texture
         vtex *s = nvn_hm_get(&g_share, &k);
@@ -851,7 +859,7 @@ void vt_drop_pool(const void *pool) {
     for (uint32_t i = 0; i < g_tex.cap; i++) {   // the objects' references, then the sharing table's entries
         vtex *v = g_tex.vals[i];
         if (!v || v->pool != pool) continue;
-        uint64_t k; memcpy(&k, g_tex.keys + (size_t)i * g_tex.klen, 8); nvn_hm_del(&g_tex, &k); vt_unref(v);
+        uint64_t k; memcpy(&k, g_tex.keys + (size_t)i * g_tex.klen, 8); nvn_hm_del(&g_tex, &k); g_vt_gen++; vt_unref(v);
         i = (uint32_t)-1;   // the table may have moved entries on delete: scan again
     }
     for (uint32_t i = 0; i < g_share.cap; i++) {
@@ -868,7 +876,7 @@ void mtl_tex_release(tex_t *t) {
     void vkb_frame_forget(uint64_t serial);
     pthread_mutex_lock(&g_bk);
     vtex *v = nvn_hm_del(&g_tex, &t->serial); nvn_hm_del(&g_cpuw, &t->serial);
-    if (v) vt_unref(v);   // a shared image stays for the next object over its storage
+    if (v) { g_vt_gen++; vt_unref(v); }   // a shared image stays for the next object over its storage
     pthread_mutex_unlock(&g_bk);
 }
 void mtl_tex_cpu_written(const tex_t *t) { pthread_mutex_lock(&g_bk); if (!nvn_hm_get(&g_cpuw, &t->serial)) nvn_hm_put(&g_cpuw, &t->serial, (void *)1); pthread_mutex_unlock(&g_bk); }
@@ -1449,6 +1457,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         (unsigned long long)g_bf_skip[3], (unsigned long long)g_bf_made[3], bind_filter());
     if (memo_log()) LOG("[vk] memo forwarding: %llu vertex streams answered with no forwardable write-back pending, %llu looked up (cumulative; gfx_vk_draw.inc stream_fwd, DM_VK_FWD_EARLY %d)",
         (unsigned long long)g_fwd_early, (unsigned long long)g_fwd_look, fwd_early());
+    if (memo_log()) LOG("[vk] memo textures: %llu elements taken as stage_textures resolved them, %llu resolved again; samplers %llu found per ID, %llu made or looked up; image generation %llu (cumulative; gfx_vk_draw.inc tex_once, DM_VK_TEX_ONCE %d)",
+        (unsigned long long)g_tc_hit, (unsigned long long)g_tc_again, (unsigned long long)g_sc_hit, (unsigned long long)g_sc_made, (unsigned long long)g_vt_gen, tex_once());
     LOG("[vk] geometry kept on the GPU: %llu index / vertex bindings from kept copies, %llu copies kept (%llu MB now), %llu copied per draw (cumulative; gfx_vk_draw.inc gc_get)",
         (unsigned long long)g_gc_hit, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy);
     { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);

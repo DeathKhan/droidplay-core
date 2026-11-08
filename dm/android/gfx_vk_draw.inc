@@ -511,6 +511,7 @@ int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c
 // The texture and sampler pools' entries, as the game registers them (IDs include each pool's base in the host table)
 typedef struct { tex_t t; view_t v; int has_v, ok; } treg_t;
 static treg_t *g_treg; static int g_ntreg; static samp_par *g_sreg; static uint8_t *g_sreg_ok; static int g_nsreg;
+static VkSampler (*g_scache)[2];   // each sampler ID's VkSampler (no shadow / shadow) once made for its registration, emptied when it is registered again (stage_set, DM_VK_TEX_ONCE)
 static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;
 static void reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0) return;
@@ -523,8 +524,10 @@ static void reg_tex(int id, const tex_t *t, const view_t *v) {
 static void reg_samp(int id, const samp_par *p) {
     if (id < 0) return;
     pthread_mutex_lock(&g_reg_mu);
-    if (id >= g_nsreg) { int n = id + 1024; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, n); memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg); g_nsreg = n; }
+    if (id >= g_nsreg) { int n = id + 1024; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, n); memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg);
+        g_scache = realloc(g_scache, n * sizeof *g_scache); if (g_scache) memset(g_scache + g_nsreg, 0, (n - g_nsreg) * sizeof *g_scache); g_nsreg = n; }
     if (p) { g_sreg[id] = *p; g_sreg_ok[id] = 1; } else g_sreg_ok[id] = 0;
+    if (g_scache) g_scache[id][0] = g_scache[id][1] = VK_NULL_HANDLE;
     pthread_mutex_unlock(&g_reg_mu);
 }
 
@@ -1469,10 +1472,55 @@ static VkImageView dummy_ms(int depth) {
     }
     return view_get(g_dummy_ms[depth], VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, g_dummy_ms[depth]->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, NULL);
 }
+// ---- Each texture of a draw resolved once ----
+// stage_textures resolved every texture element of a stage (its handle, the registry entry under g_reg_mu, vt_get) so that uploads come before any descriptor write, and
+// stage_set resolved each again: Breath of the Wild on the Odin 2, the second vt_get 1.27% of the replay thread (0.51 ms a frame, 13,600 bindings), the registry lock taken
+// per element 0.73%, samp_get's hash and compare 0.99%. stage_textures now copies the stage's registry entries under one lock, makes their images current outside it and
+// keeps {ID, entry, image} per element for the stage's slot (g_tc); stage_set takes them instead of the registry and vt_get while two tokens read when stage_textures
+// began are unchanged, each checked at every element:
+//   - g_vt_gen (gfx_vk.c), the generation guard for the images themselves: a vtex is freed (vt_destroy) or a serial stops resolving to it (the g_tex deletions) only with it
+//     bumped, so an image kept is alive and is what vt_get would answer (another stage's vt_get or rp_prepare's may make a serial anew: a texture registered as an image too)
+//   - nvn_dirty_now(), the landing token for their contents: a packaged texture vt_get found clean (or uploaded) stays clean while no protected page was written, by the
+//     game or by a write-back or copy the completion thread landed (dm_guest_write_prepare stamps the pages it unprotects), which is what vt_get would check again
+// A GPU texture's v->used is g_fence, which moves only at a submission's end. A packaged texture outside every tracked range (no span) was uploaded at both lookups; it is
+// uploaded once. The element's ID is compared with the one kept (the handles cannot change between: they are bound state). A sampler ID's VkSampler is kept per
+// registration (g_scache, emptied by reg_samp under g_reg_mu; VkSamplers are never destroyed). The kept entries go with the draw or dispatch (tc_clear).
+// DM_VK_TEX_ONCE=0 (env.txt): every lookup again in stage_set, the lock per element, samp_get and vkb() for every texture, as before
+static int tex_once(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_TEX_ONCE"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_TEX_ONCE=0: stage_set resolves every texture again"); } return v; }
+typedef struct { int tid; treg_t r; vtex *v; } tc_ent;   // r: the registry entry when stage_textures read it (r.ok 0: none), v its image (vt_get)
+typedef struct { const vshader *s; uint64_t gen, tok; int n, cap; tc_ent *e; } tc_stage;   // gen, tok: g_vt_gen and nvn_dirty_now() when stage_textures began
+static tc_stage g_tc[5];   // by stage slot (tc_slot); s NULL: nothing kept
+static uint64_t g_tc_hit, g_tc_again, g_sc_hit, g_sc_made;   // elements stage_set took from stage_textures / resolved again; samplers found per ID / made or looked up
+static int tc_slot(int stage) { return stage == SH_VS ? 0 : stage == SH_PS ? 1 : stage == SH_GS ? 2 : stage == SH_CS ? 4 : 3; }
+static void tc_clear(void) { for (int i = 0; i < 5; i++) g_tc[i].s = NULL; }
+static const tc_ent *tc_el(const tc_stage *c, int ci, int tid) {   // stage_set's element ci (the stage's texture then image elements, buffer textures left out) as kept, or NULL
+    if (!c || ci >= c->n || c->e[ci].tid != tid || (c->e[ci].r.ok && !c->e[ci].v) || c->gen != g_vt_gen || c->tok != nvn_dirty_now()) { g_tc_again++; return NULL; }   // no image made: asked again
+    g_tc_hit++; return &c->e[ci];
+}
 // A stage's textures and images made current before any descriptor of the draw is written: their uploads read guest memory, so pending write-backs land
 // first (cpu_view), and that must not close the chunk after this draw has added write-backs of its own
 static void stage_textures(vshader *s) {
     int nst = nvn_stage_of(s->stage);
+    if (tex_once()) {   // the entries copied under one lock, then made current outside it (an upload may wait for the GPU); kept for stage_set (tex_once)
+        tc_stage *c = &g_tc[tc_slot(s->stage)]; c->s = NULL; c->n = 0;
+        uint64_t gen = g_vt_gen, tok = nvn_dirty_now(); int nel = 0;
+        for (int pass = 0; pass < 2; pass++) for (int i = 0; i < (pass ? s->nim : s->ntx); i++) { const rb_tex *t = pass ? &s->im[i] : &s->tx[i];
+            if ((t->type & 0xff) != 2) nel += t->array > 1 ? (t->array > 1024 ? 1024 : t->array) : 1; }
+        if (nel > c->cap) { int nc = nel > 16 ? nel : 16; tc_ent *ne = realloc(c->e, (size_t)nc * sizeof *ne); if (!ne) goto each; c->e = ne; c->cap = nc; }
+        uint8_t c2buf[C2_SIZE]; const uint8_t *c2p = c2_bank(nst, c2buf); int n = 0;
+        pthread_mutex_lock(&g_reg_mu);
+        for (int pass = 0; pass < 2; pass++) for (int i = 0; i < (pass ? s->nim : s->ntx); i++) {
+            const rb_tex *t = pass ? &s->im[i] : &s->tx[i]; if ((t->type & 0xff) == 2) continue;
+            int cnt = t->array > 1 ? (t->array > 1024 ? 1024 : t->array) : 1; uint32_t w0 = (uint32_t)t->handle & 0x3fff;
+            for (int e = 0; e < cnt; e++, n++) { int tid = (int)(bank_word(nst, c2p, t->cbuf_slot, (w0 + 2u * e) * 4) & 0xfffff); if (tid && t->cbuf_slot >= 3) tid += D.tex_base;
+                tc_ent *x = &c->e[n]; x->tid = tid; if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) x->r = g_treg[tid]; else x->r.ok = 0; }
+        }
+        pthread_mutex_unlock(&g_reg_mu);
+        for (int j = 0; j < n; j++) c->e[j].v = c->e[j].r.ok ? vt_get(&c->e[j].r.t) : NULL;
+        c->n = n; c->gen = gen; c->tok = tok; c->s = s;
+        return;
+    }
+    each:
     {
         uint8_t c2buf[C2_SIZE]; const uint8_t *c2p = c2_bank(nst, c2buf);
         for (int pass = 0; pass < 2; pass++) for (int i = 0; i < (pass ? s->nim : s->ntx); i++) {
@@ -1606,6 +1654,8 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
     else { if (nel + 1 > g_icap) { size_t c = nel + 1 > 64 ? nel + 1 : 64; VkDescriptorImageInfo *ni = realloc(g_ii, c * sizeof *ni); if (!ni) return 0; g_ii = ni;
                VkBufferView *nb = realloc(g_bvs, c * sizeof *nb); if (!nb) return 0; g_bvs = nb; g_icap = c; }
            ii = g_ii; bvs = g_bvs; }   // (no early return past here)
+    const tc_stage *tc = NULL; int ci = 0;   // the elements stage_textures resolved (tex_once), taken once
+    if (tex_once()) { tc_stage *c = &g_tc[tc_slot(s->stage)]; if (c->s == s) tc = c; c->s = NULL; }
     pthread_mutex_lock(&g_reg_mu);
     for (int i = 0; i < s->ntx; i++) {
         const rb_tex *t = &s->tx[i]; int cnt = t->array > 1 ? (t->array > 1024 ? 1024 : t->array) : 1;
@@ -1629,8 +1679,10 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
             int sid = ty == 2 ? (int)w1 : (int)(sw >> 20); if (sid && subo && ty != 2) sid += D.samp_base;
             VkImageView iv = VK_NULL_HANDLE;
             int ms = (t->type & 0x200) != 0;
-            if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
-                treg_t *rg = &g_treg[tid]; vtex *v = vt_get(&rg->t);
+            const tc_ent *ce = tex_once() ? tc_el(tc, ci++, tid) : NULL;   // as stage_textures resolved it, or from the registry again
+            const treg_t *rg = ce ? (ce->r.ok ? &ce->r : NULL) : tid > 0 && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid] : NULL;
+            if (rg) {
+                vtex *v = ce ? ce->v : vt_get(&rg->t);
                 if (v && (v->samples > 1) != ms) { RED_ONCE(112, "a %s texture in a %s slot (shader %s): reads 0", v->samples > 1 ? "multisample" : "single-sample", ms ? "multisample" : "single-sample", s->key); v = NULL; }
                 if (v) { const view_t *vv = rg->has_v ? &rg->v : NULL;
                     uint8_t swz[4]; int has_swz = rg->t.set_swz || (vv && vv->set_swizzle);
@@ -1646,7 +1698,11 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
             if (dump_on() && e < 4) { const vtex *dv = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? nvn_hm_get(&g_tex, &g_treg[tid].t.serial) : NULL; if (dv) dump_note_tex(dv->serial);
                 LOG("[dump]   %s binding %d[%d] type %#x tid %d sid %d -> %s s%llu %ux%ux%u layers %u levels %u vk%d pkg %d image %#llx", s->key, t->binding, e, t->type, tid, sid, dv ? "tex" : "none",
                     dv ? (unsigned long long)dv->serial : 0ull, dv ? dv->w : 0, dv ? dv->h : 0, dv ? dv->d : 0, dv ? dv->layers : 0, dv ? dv->levels : 0, dv ? dv->fmt : 0, dv ? dv->pkg : 0, dv ? (unsigned long long)(uint64_t)dv->img : 0ull); }
-            ii[nii + e] = (VkDescriptorImageInfo){samp_get(sp, (t->type & 0x400) != 0), iv, VK_IMAGE_LAYOUT_GENERAL};
+            int shd = (t->type & 0x400) != 0; VkSampler smp;
+            if (tex_once() && sp && g_scache) { VkSampler *sc = &g_scache[sid][shd]; if (*sc) g_sc_hit++; else { *sc = samp_get(sp, shd); g_sc_made++; } smp = *sc; }   // per ID (g_scache)
+            else if (tex_once() && !sp) { static VkSampler none[2]; if (!none[shd]) none[shd] = samp_get(NULL, shd); smp = none[shd]; }
+            else smp = samp_get(sp, shd);
+            ii[nii + e] = (VkDescriptorImageInfo){smp, iv, VK_IMAGE_LAYOUT_GENERAL};
         }
         wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)t->binding, 0, (uint32_t)cnt, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii[nii], NULL, NULL};
         nii += cnt;
@@ -1658,8 +1714,9 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
             uint32_t hw = bank_word(nst, c2, t->cbuf_slot, (w0 + 2u * e) * 4); int tid = (int)(hw & 0xfffff); if (tid && t->cbuf_slot >= 3) tid += D.tex_base;
             treg_t *rg = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid] : NULL;
             if (tbuf) { VkBufferView v = rg ? tbuf_view(&rg->t, 1) : VK_NULL_HANDLE; bvs[nbv + e] = v ? v : dummy_tbuf(); continue; }
-            VkImageView iv = VK_NULL_HANDLE; vtex *v = rg ? vt_get(&rg->t) : NULL;
-            if (v) { iv = storage_view(v, rg->has_v ? &rg->v : NULL, vt, t->fmt); if (!iv) g_bind_bad = 1; }
+            const tc_ent *ce = tex_once() ? tc_el(tc, ci++, tid) : NULL; const treg_t *ri = ce ? (ce->r.ok ? &ce->r : NULL) : rg;   // as the textures above
+            VkImageView iv = VK_NULL_HANDLE; vtex *v = !ri ? NULL : ce ? ce->v : vt_get(&ri->t);
+            if (v) { iv = storage_view(v, ri->has_v ? &ri->v : NULL, vt, t->fmt); if (!iv) g_bind_bad = 1; }
             if (!iv) iv = dummy_storage(vt, t->fmt);
             if (!iv) g_bind_bad = 1;
             ii[nii + e] = (VkDescriptorImageInfo){VK_NULL_HANDLE, iv, VK_IMAGE_LAYOUT_GENERAL};
@@ -1864,7 +1921,7 @@ static int ind_read(uint64_t addr, void *out, size_t n) {   // indirect argument
     if (!addr || !mtl_addr(addr, n, NULL, NULL)) { RED_ONCE(105, "indirect arguments at %#llx are in no memory pool: the draw is skipped", (unsigned long long)addr); return 0; }
     memcpy(out, (const void *)(uintptr_t)addr, n); return 1;
 }
-static int vk_draw__(const p_draw *dw, const p_draw_idx *di) { int r = vk_draw_(dw, di); g_drawing = 0; g_fwd_nwb = -1; g_c1d_on = 0; return r; }
+static int vk_draw__(const p_draw *dw, const p_draw_idx *di) { int r = vk_draw_(dw, di); g_drawing = 0; g_fwd_nwb = -1; g_c1d_on = 0; tc_clear(); return r; }
 // What a draw copies from guest memory lands first when an earlier draw, dispatch or copy wrote it and that write is still pending (gfx_vk.c ranges_view):
 // the vertex streams, the index buffer, each stage's uniform slots and storage buffers. A buffer texture or image reads memory found only in the texture
 // pool, so a shader with one syncs on anything pending (cpu_view). Called before anything of the draw is recorded
@@ -2138,7 +2195,7 @@ static cpipe_t *cpipe_get(vshader *s) {
 }
 static int vk_dispatch(const p_dispatch *dp) {
     if (!g_d_init) draw_state_reset();
-    rp_end();
+    rp_end(); tc_clear();
     const prog_t *pr = D.cprog; if (!pr) { RED_ONCE(106, "dispatch with no compute program bound"); return 0; }
     vshader *s = NULL; int pst = -1;
     for (unsigned i = 0; i < pr->nstage && i < 6 && !s; i++) { uint8_t key[8]; char hx[17]; if (!prog_key(pr, i, key)) continue; key_hex(key, hx); vshader *x = sh_get(hx); if (x && x->stage == SH_CS) { s = x; pst = (int)i; } }
