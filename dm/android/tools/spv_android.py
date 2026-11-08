@@ -9,12 +9,15 @@
 #     outputs stored as their bits into storage buffers (set 0, binding 100 + feedback buffer), vertex v at v × stride (nvn_mtl.m's main0_tf; the Adreno has no
 #     VK_EXT_transform_feedback): the host draws it as points with rasterization off, the vertex buffers shifted so v counts from the draw's first vertex;
 #   for a vertex shader, also <key>.z.spv: before every return of the entry point, position z becomes (z + w) / 2, the -1..1 depth of NVN's default depth mode
-#     mapped to Vulkan's 0..1 (nvn_mtl.m adds the same as its main0_z entry point; Vulkan without VK_EXT_depth_clip_control has no other way).
+#     mapped to Vulkan's 0..1 (nvn_mtl.m adds the same as its main0_z entry point; Vulkan without VK_EXT_depth_clip_control has no other way);
+#   res.json cbufs[].ext: how many bytes of each constant buffer the shader can read (cb_extents, on the final module; the .z / .tf variants add no constant buffer read).
 # Usage: spv_android.py <dmsh_xlate output dir> <out dir> [key ...]   (all keys of the input dir by default); prints one line per shader and a summary
-import json, struct, sys
+import itertools, json, struct, sys
 from pathlib import Path
 
-ANDROID_CHAIN = 3   # res.json 'android': bumped when this post-pass or spv_build.py's translation changes what they make (spv_build.py translates older outputs again)
+ANDROID_CHAIN = 4   # res.json 'android': bumped when this post-pass or spv_build.py's translation changes what they make (spv_build.py translates older outputs again)
+EXT_FROM = 3   # 4 added res.json cbufs[].ext (cb_extents) and nothing else: spv_build.py brings an output of chain 3 up to date from its .spv (add_ext), without the translator,
+               # only while ANDROID_CHAIN is EXT_FROM + 1 (upgrade stamps that chain, so a later bump for a change to the .spv translates chain 3's outputs again)
 SET_OF = {'vs': 0, 'ps': 1, 'gs': 2, 'tc': 3, 'te': 3, 'cs': 0}
 OP_CAP, OP_EXT, OP_EXECMODE, OP_ENTRY, OP_DECORATE, OP_MEMBERDECORATE = 17, 10, 16, 15, 71, 72
 OP_FUNCTION, OP_FUNCTIONEND, OP_RETURN, OP_VARIABLE, OP_TYPEPOINTER, OP_TYPEINT, OP_TYPEFLOAT, OP_TYPEVECTOR, OP_CONSTANT = 54, 56, 253, 59, 32, 21, 22, 23, 43
@@ -308,10 +311,381 @@ def int_inputs(ins):
         if not bad and nint: out[str(loc[x[2]])] = 'uint'
     return out
 
+# ---- How much of each constant buffer the shader reads (res.json cbufs[].ext; gfx_vk_draw.inc sh_get prefers it to its own scan) ----
+# The translator declares every constant buffer as 4096 vec4 (64 KB) and the replay copies, for every draw, as many bytes of the bound buffer as the shader can read. The host's
+# SPIR-V scan (spv_cb_ext2) takes the largest constant element index; an index computed at run time keeps the whole buffer. Here such an index is evaluated: the integer slice of
+# each function (32-bit scalars in SSA values and in Function / Private variables only loaded and stored, the translator's debug-mode registers) is run along every path with
+# each value a small set (up to CB_SET values, one along a path that only met known values), a branch on a known value taking its side and one on an unknown value (a float
+# compare, a uniform) both; each block keeps the distinct states it was entered with (only the values live there), so a loop with a known trip count is unrolled, its exit
+# predicate tested wherever the code tests it. Breath of the Wild's vertex shader 5ee9a682fff60855 counts %116 from 2 down in a do-while whose exit test, %122 <= 1, is a bool
+# local set in the body and branched on in the latch (%584): an interval analysis widening at the header leaves the counter unbounded below, (i << 4) + 352 able to wrap
+# anywhere; run so the counter is 2 or 1 and c3 reads elements 0-24, 400 bytes instead of 64 KB (222 draws a frame on the Odin 2, 29 MB of copies with ucopy's shadow).
+# A value stays unknown where it comes from a float, a vector, a call or an op not modelled, or a variable read before any store; an unknown operand still bounds x & m, x % c,
+# x >> s, a bit field and a select (_cb_eval); a block entered with more than CB_STATES states joins them (each value the union, unknown past CB_SET), so a loop bounded by a
+# uniform ends. Sound by construction: an unknown index (the whole declared array), an index outside the array, an access chain in a block the run never reached, any use of
+# the variable other than an access chain from member 0, a layout other than vec4 at stride 16, or a run past CB_STEPS keeps the whole buffer (ext 0, as the host reads a missing
+# one). Breath of the Wild's 19,592 shaders: of 63,480 constant buffer bindings the old word-match scan bounded 41,837, spv_cb_ext2 59,263 and this 59,965, never below either
+# (and, on the 17,734 keys the Mac's cb_extent.tsv shares, never below its extent, 631 bounded where it has none); its dumped frame reads 26.2 MB of constant buffers with the old
+# extents, 21.0 MB with spv_cb_ext2's, 6.6 MB with these
+CB_STATES, CB_STEPS, CB_SET, CB_BITS = 64, 3_000_000, 16, 4
+M32 = 0xffffffff
+TERMINATORS = {249, 250, 251, 252, 253, 254, 255, 4416, 4448, 4449, 5294}
+NO_RESULT = {0, 8, 56, 62, 63, 64, 99, 218, 219, 220, 221, 224, 225, 228, 246, 247, 248, 256, 257, 317, 5364, 5365, 5380} | TERMINATORS
+
+def spv_lit(op, q):
+    """Word q of an instruction with opcode op in a function body is a literal, never an id (gfx_vk_draw.inc spv_lit, the same table): an unknown opcode has every
+    word taken for an id, which can only make a use seen where there is none"""
+    if op in (8, 317): return True
+    if op == 12: return q == 4
+    if op in (54, 59): return q == 3
+    if op == 61: return q >= 4
+    if op in (62, 63): return q >= 3
+    if op == 64: return q >= 4
+    if op in (79, 82): return q >= 5
+    if op == 81: return q >= 4
+    if op == 246: return q >= 3
+    if op in (247, 256, 257): return q == 2
+    if op == 250: return q >= 4
+    if op == 251: return q >= 3
+    if op in (87, 88, 91, 92, 95, 98, 305, 306, 309, 310, 313, 320): return q == 5
+    if op in (89, 90, 93, 94, 96, 97, 307, 308, 311, 312, 314, 315): return q == 6
+    if op == 99: return q == 4
+    if op == 342: return q == 4
+    return 349 <= op <= 364 and q == 4
+
+def _s32(v): return v - (1 << 32) if v & 0x80000000 else v
+
+def _bin(op, a, b):
+    """A 32-bit binary op on known operands (raw bits), None if undefined or not modelled"""
+    if op == 128: return (a + b) & M32
+    if op == 130: return (a - b) & M32
+    if op == 132: return (a * b) & M32
+    if op == 134: return a // b if b else None
+    if op == 137: return a % b if b else None
+    if op in (135, 138, 139):
+        sa, sb = _s32(a), _s32(b)
+        if not sb or (sa == -0x80000000 and sb == -1): return None
+        q = abs(sa) // abs(sb) * (1 if (sa < 0) == (sb < 0) else -1)
+        if op == 135: return q & M32
+        r = sa - q * sb   # OpSRem: the dividend's sign
+        if op == 139 and r and (r < 0) != (sb < 0): r += sb   # OpSMod: the divisor's sign
+        return r & M32
+    if op in (194, 195, 196):   # shifts: a shift by the width or more is undefined
+        if b >= 32: return None
+        return a >> b if op == 194 else (_s32(a) >> b) & M32 if op == 195 else (a << b) & M32
+    if op == 197: return a | b
+    if op == 198: return a ^ b
+    if op == 199: return a & b
+    if op == 164: return int(a == b)
+    if op == 165: return int(a != b)
+    if op == 166: return int(bool(a or b))
+    if op == 167: return int(bool(a and b))
+    if op == 170: return int(a == b)
+    if op == 171: return int(a != b)
+    if op == 172: return int(a > b)
+    if op == 173: return int(_s32(a) > _s32(b))
+    if op == 174: return int(a >= b)
+    if op == 175: return int(_s32(a) >= _s32(b))
+    if op == 176: return int(a < b)
+    if op == 177: return int(_s32(a) < _s32(b))
+    if op == 178: return int(a <= b)
+    if op == 179: return int(_s32(a) <= _s32(b))
+    return None
+BIN_OPS = {128, 130, 132, 134, 135, 137, 138, 139, 164, 165, 166, 167, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 194, 195, 196, 197, 198, 199}
+
+def cb_extents(ins, bindings, why=None):
+    """{binding: bytes the shader can read of that constant buffer, a multiple of 16; 0 = all of it} for the bindings listed (res.json cbufs); why, a dict, gets the reason
+    for each binding left whole"""
+    want = set(bindings); full = {b: '' for b in want}; high = {b: -1 for b in want}
+    def whole(b, r): full[b] = full[b] or r
+    if any(x[0] in (73, 74, 75, 67, 70) for x in ins):   # decoration groups, pointer arithmetic: not followed
+        if why is not None: why.update({b: 'decoration groups or pointer arithmetic' for b in want})
+        return {b: 0 for b in want}
+    bind, stride, off_nz, types, consts, glsl = {}, {}, set(), {}, {}, set()
+    for x in ins:
+        op = x[0]
+        if op == 71 and len(x) >= 4 and x[2] == 33: bind[x[1]] = x[3]
+        elif op == 71 and len(x) >= 4 and x[2] == 6: stride[x[1]] = x[3]
+        elif op == 72 and len(x) >= 5 and x[2] == 0 and x[3] == 35 and x[4]: off_nz.add(x[1])
+        elif 19 <= op <= 39: types[x[1]] = x
+        elif op == 43 and len(x) == 4: consts[x[2]] = x[3]
+        elif op == 41: consts[x[2]] = 1
+        elif op == 42 or op == 46: consts[x[2]] = 0   # OpConstantNull: kept only for the scalar types below
+        elif op == 11 and ext_name([0, *x[2:]]) == 'GLSL.std.450': glsl.add(x[1])
+    def sc32(t):   # a 32-bit scalar (bool as 0 / 1)
+        d = types.get(t)
+        return d is not None and (d[0] == 20 or (d[0] in (21, 22) and d[2] == 32))
+    for x in ins:   # only 32-bit scalars' constants are held (an 8- or 16-bit one is one word too)
+        if x[0] in (41, 42, 43, 46) and not sc32(x[1]): consts.pop(x[2], None)
+    # the buffers' variables: Uniform, member 0 an array of 4-component 32-bit vectors at stride 16
+    cbvar, arrlen = {}, {}
+    for x in ins:
+        if x[0] != 59 or bind.get(x[2]) not in want: continue
+        b = bind[x[2]]; cbvar[x[2]] = b
+        p = types.get(x[1]); s = types.get(p[3]) if p and p[0] == 32 else None
+        a = types.get(s[2]) if s and s[0] == 30 and len(s) > 2 and s[1] not in off_nz else None
+        e = types.get(a[2]) if a and a[0] == 28 and stride.get(a[1]) == 16 and a[3] in consts else None
+        if x[3] != 2 or not e or e[0] != 23 or e[3] != 4 or not sc32(e[2]) or types[e[2]][0] == 20: whole(b, 'layout')
+        else: arrlen[x[2]] = consts[a[3]]
+    if not cbvar: return {b: 16 for b in want}   # declared, never read: the descriptor wants a range, the shader reads none of it
+    # the integer registers: Function / Private variables of a 32-bit scalar, used only as the pointer of OpLoad and OpStore
+    reg = {x[2]: x[3] for x in ins if x[0] == 59 and x[3] in (6, 7) and types.get(x[1], [0])[0] == 32 and sc32(types[x[1]][3])}
+    init = {x[2]: consts[x[4]] for x in ins if x[0] == 59 and x[2] in reg and len(x) >= 5 and x[4] in consts}
+    chains = []   # (function index, block index, instruction index, variable, element id) of the access chains whose element is not a constant
+    funcs, fn, blk = [], None, None
+    entry = {x[2] for x in ins if x[0] == 15} - {x[3] for x in ins if x[0] == 57}   # entry points no call reaches: the Private registers start from their initializers there
+    for x in ins:
+        op = x[0]
+        if op == 54: fn = {'blocks': [], 'entry': x[2] in entry}; funcs.append(fn); continue
+        if fn is None:
+            if op == 59 and len(x) >= 5 and x[4] in cbvar: whole(cbvar[x[4]], 'initializer')   # a global variable initialized with it
+            continue
+        if op == 56: fn = blk = None; continue
+        if op == 248: blk = [x[1], []]; fn['blocks'].append(blk); continue
+        if op == 55: continue   # a parameter: unknown
+        for q in range(1, len(x)):
+            w = x[q]
+            if spv_lit(op, q) or (op == 59 and q == 2): continue   # (a Function variable's own declaration)
+            if w in reg and not ((op == 61 and q == 3) or (op == 62 and q == 1)): del reg[w]
+            if w in cbvar:
+                b = cbvar[w]
+                if op in (65, 66) and q == 3 and len(x) >= 6 and consts.get(x[4], 1) == 0 and w in arrlen:
+                    if x[5] in consts:
+                        if consts[x[5]] >= arrlen[w]: whole(b, 'constant index past the array')
+                        else: high[b] = max(high[b], consts[x[5]])
+                    elif blk is not None: chains.append((len(funcs) - 1, len(fn['blocks']) - 1, len(blk[1]), w, x[5]))
+                    else: whole(b, 'access chain outside a block')
+                else: whole(b, 'used other than by an access chain from member 0')
+        if blk is not None: blk[1].append(x)
+    chains = [c for c in chains if not full[cbvar[c[3]]]]
+    if chains:
+        seen = _cb_run(funcs, chains, consts, reg, init, glsl, sc32)
+        for c in chains:
+            b = cbvar[c[3]]
+            if seen is None: whole(b, 'run past CB_STEPS'); continue
+            v = seen.get(c, 'unreached')
+            if v == 'unreached': whole(b, 'index in a block the run never reached')
+            elif v is None:   # any element of the declared array
+                if 16 * arrlen[c[3]] >= 0x10000: whole(b, 'index unknown')
+                else: high[b] = max(high[b], arrlen[c[3]] - 1)
+            elif v >= arrlen[c[3]]: whole(b, 'index past the array')
+            else: high[b] = max(high[b], v)
+    for b in want:
+        if not full[b] and 16 * (high[b] + 1) >= 0x10000: whole(b, 'reads the last element')
+    if why is not None: why.update({b: r for b, r in full.items() if r})
+    return {b: 0 if full[b] else 16 * max(high[b] + 1, 1) for b in want}
+
+def _cb_join(a, b):
+    out = {}
+    for k, v in a.items():
+        w = b.get(k)
+        if w is not None and len(v | w) <= CB_SET: out[k] = v | w
+    return out
+
+def _submasks(m):
+    out, s = [], m
+    while True:
+        out.append(s)
+        if not s: return out
+        s = (s - 1) & m
+
+def _cb_one(x, a, glsl):
+    """Instruction x's 32-bit result for known operand values a (x[3:], an OpExtInst's x[5:]); None if undefined or not modelled"""
+    op = x[0]
+    if op in BIN_OPS: return _bin(op, a[0], a[1]) if len(a) == 2 else None
+    if op in (124, 83): return a[0] if len(a) == 1 else None   # a known value is a 32-bit scalar's (nothing else is held), so its bits are the result's
+    if op == 126: return -a[0] & M32
+    if op == 200: return ~a[0] & M32
+    if op == 168: return 1 - a[0]
+    if op == 205: return bin(a[0]).count('1')
+    if op == 169 and len(a) == 3: return a[1] if a[0] else a[2]
+    if op in (202, 203) and len(a) == 3:
+        v, o, n = a
+        if o + n > 32: return None
+        r = (v >> o) & ((1 << n) - 1) if n else 0
+        return (r - (1 << n)) & M32 if op == 202 and n and r >> (n - 1) & 1 else r
+    if op == 201 and len(a) == 4:
+        v, ins_, o, n = a
+        if o + n > 32: return None
+        m = ((1 << n) - 1) << o; return (v & ~m | ins_ << o & m) & M32
+    if op == 12 and x[3] in glsl:
+        e = x[4]
+        if e == 5 and len(a) == 1: return abs(_s32(a[0])) & M32   # SAbs
+        if e in (38, 41) and len(a) == 2: return (min if e == 38 else max)(a)   # UMin, UMax
+        if e in (39, 42) and len(a) == 2: return (min if e == 39 else max)(a, key=_s32)   # SMin, SMax
+        if e == 44 and len(a) == 3 and a[1] <= a[2]: return min(max(a[0], a[1]), a[2])   # UClamp (undefined for min > max)
+        if e == 45 and len(a) == 3 and _s32(a[1]) <= _s32(a[2]): return min(max(a[0], a[1], key=_s32), a[2], key=_s32)   # SClamp
+    return None
+
+def _cb_eval(x, val, glsl):
+    """The set of values instruction x (a 32-bit scalar result) can take, None if unknown: each combination of its operands' known values, or what an operand left
+    unknown still allows (x & m: the submasks of m; x % c and x >> s: the values below c and 2^(32 - s); a field of n bits: the values below 2^n; a select of known
+    values: either; a product or an AND with 0, an AND with false, an OR with true)"""
+    op = x[0]
+    if not (op in BIN_OPS or op in (124, 83, 126, 200, 168, 205, 169, 201, 202, 203) or (op == 12 and x[3] in glsl)): return None
+    args = [val(w) for w in (x[5:] if op == 12 else x[3:])]
+    if None not in args:
+        n = 1
+        for v in args: n *= len(v)
+        if n > CB_SET * CB_SET: return None
+        out = set()
+        for a in itertools.product(*args):
+            r = _cb_one(x, a, glsl)
+            if r is None: return None
+            out.add(r)
+        return frozenset(out) if len(out) <= CB_SET else None
+    one = lambda k: next(iter(args[k])) if args[k] is not None and len(args[k]) == 1 else None
+    if len(args) == 2 and op in (132, 199, 167) and frozenset((0,)) in args: return frozenset((0,))
+    if len(args) == 2 and op == 166 and frozenset((1,)) in args: return frozenset((1,))
+    if len(args) == 2 and op == 199:
+        m = one(0) if args[0] is not None else one(1)
+        if m is not None and bin(m).count('1') <= CB_BITS: return frozenset(_submasks(m))
+    if len(args) == 2 and op == 137 and args[0] is None and one(1) is not None and 0 < one(1) <= CB_SET: return frozenset(range(one(1)))
+    if len(args) == 2 and op == 194 and args[0] is None and one(1) is not None and 32 - CB_BITS <= one(1) < 32: return frozenset(range(1 << (32 - one(1))))
+    if len(args) == 3 and op == 203 and args[0] is None and one(1) is not None and one(2) is not None and one(2) <= CB_BITS and one(1) + one(2) <= 32: return frozenset(range(1 << one(2)))
+    if len(args) == 3 and op == 169 and args[1] is not None and args[2] is not None and len(args[1] | args[2]) <= CB_SET: return args[1] | args[2]
+    return None
+
+def _cb_run(funcs, chains, consts, reg, init, glsl, sc32):
+    """{chain: the largest element index it takes (unsigned), None if unknown} for the chains whose block the run reached; None after CB_STEPS instructions"""
+    want = {}
+    for c in chains: want.setdefault((c[0], c[1], c[2]), []).append(c)
+    out, steps = {}, 0
+    rtype = {}
+    for f in funcs:
+        for _, body in f['blocks']:
+            for x in body:
+                if x[0] not in NO_RESULT and len(x) > 2: rtype[x[2]] = x[1]
+    private = [v for v, cls in reg.items() if cls == 6]
+    names = set(reg) | {r for r, t in rtype.items() if sc32(t)}   # what a state holds: registers, 32-bit scalar SSA values
+    for fi, f in enumerate(funcs):
+        blocks = f['blocks']
+        if not blocks: continue
+        at = {lab: i for i, (lab, _) in enumerate(blocks)}
+        # liveness of those names: a state entering a block keeps only the live ones, so paths that differ in dead temporaries meet again; a value dropped is only
+        # unknown, so this decides precision, never soundness
+        gen, kill, succ = [], [], []
+        for lab, body in blocks:
+            g, k = set(), set()
+            for x in body:
+                op = x[0]
+                if op == 62:
+                    if x[2] in names and x[2] not in k: g.add(x[2])
+                    if x[1] in reg: k.add(x[1])
+                    continue
+                first = 1 if op in NO_RESULT else 3
+                for w in x[first:]:
+                    if w in names and w not in k: g.add(w)
+                if op not in NO_RESULT and len(x) > 2 and x[2] in names: k.add(x[2])
+                if op == 245:   # an OpPhi's operands are read on the edges into its block, not in it
+                    for w in x[3:]: g.discard(w)
+            t = body[-1] if body else [253]
+            s = [at[w] for w in (t[2:4] if t[0] == 250 else t[1:2] if t[0] == 249 else t[2:] if t[0] == 251 else []) if w in at]
+            gen.append(g); kill.append(k); succ.append(s)
+        phis = [[x for x in body if x[0] == 245] for _, body in blocks]
+        for i, ps in enumerate(phis):   # the phi operands are live out of their predecessors
+            for x in ps:
+                for j in range(3, len(x) - 1, 2):
+                    if x[j + 1] in at and x[j] in names: gen[at[x[j + 1]]].add(x[j])
+        live = [set() for _ in blocks]
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(blocks) - 1, -1, -1):
+                lo = set()
+                for s in succ[i]: lo |= live[s]
+                li = gen[i] | (lo - kill[i])
+                if li != live[i]: live[i] = li; changed = True
+        st0 = {v: init[v] for v in private if v in init} if f['entry'] else {}
+        seen = [set() for _ in blocks]; wide = [None] * len(blocks)
+        work = [(0, st0)]
+        def enter(i, st):
+            st = {k: v for k, v in st.items() if k in live[i]}
+            if wide[i] is not None:
+                j = _cb_join(wide[i], st)
+                if j != wide[i]: wide[i] = j; work.append((i, j))
+                return
+            key = frozenset(st.items())
+            if key in seen[i]: return
+            seen[i].add(key)
+            if len(seen[i]) > CB_STATES:   # joined: each value the union of the states' (unknown past CB_SET values or where one state has none)
+                j = None
+                for k2 in seen[i]: j = dict(k2) if j is None else _cb_join(j, dict(k2))
+                wide[i] = j; work.append((i, j))
+            else: work.append((i, st))
+        while work:
+            i, st = work.pop()
+            d = dict(st); body = blocks[i][1]
+            steps += len(body)
+            if steps > CB_STEPS: return None
+            def val(w): return frozenset((consts[w],)) if w in consts else d.get(w)
+            for n, x in enumerate(body):
+                op = x[0]
+                if (fi, i, n) in want:
+                    for c in want[(fi, i, n)]:
+                        v = val(c[4]); o = out.get(c, -1)
+                        out[c] = None if v is None or o is None else max(o, max(v))
+                if op == 61:
+                    if x[3] in reg and x[3] in d: d[x[2]] = d[x[3]]
+                    else: d.pop(x[2], None)
+                    continue
+                if op == 62:
+                    if x[1] in reg:
+                        v = val(x[2])
+                        if v is None: d.pop(x[1], None)
+                        else: d[x[1]] = v
+                    continue
+                if op == 59:
+                    if x[2] in reg and len(x) >= 5 and x[4] in consts: d[x[2]] = frozenset((consts[x[4]],))
+                    else: d.pop(x[2], None)
+                    continue
+                if op == 57:   # a call: its result unknown, and what it may have stored in the Private registers
+                    for v in private: d.pop(v, None)
+                    d.pop(x[2], None); continue
+                if op in NO_RESULT or op == 245 or len(x) < 3: continue
+                r = _cb_eval(x, val, glsl) if sc32(x[1]) else None
+                if r is None: d.pop(x[2], None)
+                else: d[x[2]] = r
+            t = body[-1] if body else [253]
+            if t[0] == 249: nxt = [t[1]]
+            elif t[0] == 250:
+                c = val(t[1]); nxt = [t[2], t[3]] if c is None else [t[2]] * (1 in c) + [t[3]] * (0 in c)
+            elif t[0] == 251:
+                c = val(t[1])
+                if c is None: nxt = [w for w in t[2:] if w in at]   # every word that names a block: the cases' labels and perhaps a literal, more successors only
+                else:   # known, so a 32-bit selector: one word per case literal, t = [251, selector, default, literal 1, label 1, literal 2, label 2, ...]
+                    case = {t[j]: t[j + 1] for j in range(len(t) - 2, 2, -2)}   # the pairs from the last down, so the first of equal literals wins
+                    nxt = sorted({case.get(v, t[2]) for v in c})
+            else: nxt = []
+            for lab in nxt:
+                if lab not in at: continue
+                j = at[lab]; s2 = dict(d)
+                for x in phis[j]:
+                    v = None
+                    for k in range(3, len(x) - 1, 2):
+                        if x[k + 1] == blocks[i][0]: v = val(x[k]) if sc32(x[1]) else None
+                    if v is None: s2.pop(x[2], None)
+                    else: s2[x[2]] = v
+                enter(j, s2)
+    return out
+
+def add_ext(res, ins):
+    """res.json's cbufs get their ext (cb_extents); → (bounded, whole) counts"""
+    cb = res.get('cbufs') or []
+    ext = cb_extents(ins, [c['binding'] for c in cb])
+    for c in cb: c['ext'] = ext[c['binding']]
+    return sum(1 for c in cb if c['ext']), sum(1 for c in cb if not c['ext'])
+
+def upgrade(out, key):
+    """An output of chain EXT_FROM made this chain's: its res.json gets the extents of its .spv (spv_build.py)"""
+    rp = out / f'{key}.res.json'; res = json.loads(rp.read_text(encoding='utf-8'))
+    add_ext(res, parse((out / f'{key}.spv').read_bytes())[1]); res['android'] = EXT_FROM + 1   # the chain this makes, not ANDROID_CHAIN: after a later bump, retranslated
+    rp.write_text(json.dumps(res), encoding='utf-8')
+
 def main():
     src, dst = Path(sys.argv[1]), Path(sys.argv[2]); dst.mkdir(parents=True, exist_ok=True)
     keys = sys.argv[3:] or sorted(p.stem for p in src.glob('*.spv') if not p.name.endswith('.reader.spv'))
-    n = nz = bad = 0
+    n = nz = bad = eb = ew = 0
     for k in keys:
         res = json.loads((src / f'{k}.res.json').read_text(encoding='utf-8'))
         stage = res.get('stage', 'vs')
@@ -319,6 +693,7 @@ def main():
         (dst / f'{k}.spv').write_bytes(emit(hdr, ins)); n += 1
         if interlock: res.setdefault('notes', []).append('android: fragment shader interlock removed (no ordering of overlapping fragments)')
         res['set'] = SET_OF.get(stage, 0); res['android'] = ANDROID_CHAIN
+        b, w = add_ext(res, ins); eb += b; ew += w
         if stage == 'vs': res['vin'] = vin_types(ins)
         (dst / f'{k}.res.json').write_text(json.dumps(res), encoding='utf-8')
         if stage == 'vs' and res.get('tf'):
@@ -327,7 +702,7 @@ def main():
             z = z_variant(hdr, ins)
             if z: (dst / f'{k}.z.spv').write_bytes(z); nz += 1
             else: bad += 1; print(f'[RED] {k}: no position output found, no depth -1..1 variant')
-    print(f'spv_android: {n} shaders, {nz} depth variants, {bad} without one')
+    print(f'spv_android: {n} shaders, {nz} depth variants, {bad} without one; constant buffers: {eb} with a known extent, {ew} read whole')
 
 if __name__ == '__main__':
     main()

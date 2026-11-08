@@ -112,7 +112,7 @@ def main():
         for ln in open(a.facts, encoding='utf-8'):
             if ln.strip() and not ln.startswith('#'): k, v = ln.rstrip('\n').split('\t', 1); facts[k] = json.loads(v)
     w = tempfile.mkdtemp(prefix='spv_')
-    jobs, skipped, have, tfs = {}, {}, 0, {}
+    jobs, skipped, have, tfs, upg = {}, {}, 0, {}, 0
     for f in sorted(Path(a.package).glob('*.bin')):
         stage = f.name[:2]
         if stage not in ('vs', 'ps', 'gs', 'tc', 'te', 'cs'): continue
@@ -122,7 +122,10 @@ def main():
             key = key_of(ctl, code)
             if key in jobs: continue
             rp = out / f'{key}.res.json'   # translated by an earlier run of this chain version (the key covers the shader's bytes)
-            if (out / f'{key}.spv').exists() and rp.exists() and json.loads(rp.read_text(encoding='utf-8')).get('android') == sa.ANDROID_CHAIN: have += 1; continue
+            if (out / f'{key}.spv').exists() and rp.exists():
+                ch = json.loads(rp.read_text(encoding='utf-8')).get('android')
+                if ch == sa.EXT_FROM and sa.ANDROID_CHAIN == sa.EXT_FROM + 1: sa.upgrade(out, key); ch = sa.EXT_FROM + 1; upg += 1   # (its .spv files are chain EXT_FROM + 1's: only res.json's extents were missing; after a later bump of ANDROID_CHAIN, translated again)
+                if ch == sa.ANDROID_CHAIN: have += 1; continue
             j, why = job(key, stage, code, ctl, w, facts)
             if not j: skipped[key] = why; continue
             jobs[key] = j
@@ -161,7 +164,7 @@ def main():
         if k not in done and k not in failed: failed[k] = 'no output from the translator'
     for k, why in sorted(skipped.items()): print(f'[RED] {k}: {why}')
     for k, why in sorted(failed.items()): print(f'[RED] {k}: {why}')
-    print(f'spv_build: {len(done)} translated, {have} already there, {len(failed)} failed, {len(skipped)} skipped, {sum(1 for k in jobs if jobs[k].get("no_facts"))} without facts')
+    print(f'spv_build: {len(done)} translated, {have} already there ({upg} given their constant buffer extents), {len(failed)} failed, {len(skipped)} skipped, {sum(1 for k in jobs if jobs[k].get("no_facts"))} without facts')
     shutil.rmtree(w, ignore_errors=True)
 
 if __name__ == '__main__':
