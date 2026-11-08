@@ -1691,6 +1691,7 @@ static VkImageView dummy_ms(int depth) {
 //     bumped, so an image kept is alive and is what vt_get would answer (another stage's vt_get or rp_prepare's may make a serial anew: a texture registered as an image too)
 //   - nvn_dirty_now(), the landing token for their contents: a packaged texture vt_get found clean (or uploaded) stays clean while no protected page was written, by the
 //     game or by a write-back or copy the completion thread landed (dm_guest_write_prepare stamps the pages it unprotects), which is what vt_get would check again
+//     (except an image adopted from its own write-back, ab_take: its edge pages may be unprotected, so it is not kept and stage_set asks vt_get again)
 // A GPU texture's v->used is g_fence, which moves only at a submission's end. A packaged texture outside every tracked range (no span) was uploaded at both lookups; it is
 // uploaded once. The element's ID is compared with the one kept (the handles cannot change between: they are bound state). A sampler ID's VkSampler is kept per
 // registration (g_scache, emptied by reg_samp under g_reg_mu; VkSamplers are never destroyed). The kept entries go with the draw or dispatch (tc_clear).
@@ -1725,7 +1726,10 @@ static void stage_textures(vshader *s) {
                 tc_ent *x = &c->e[n]; x->tid = tid; if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) x->r = g_treg[tid]; else x->r.ok = 0; }
         }
         pthread_mutex_unlock(&g_reg_mu);
-        for (int j = 0; j < n; j++) c->e[j].v = c->e[j].r.ok ? vt_get(&c->e[j].r.t) : NULL;
+        for (int j = 0; j < n; j++) { vtex *v = c->e[j].r.ok ? vt_get(&c->e[j].r.t) : NULL;
+            // an image adopted from its own write-back (gfx_vk.c ab_take) comes back with seen at the note's stamp, not the clock: an edge page a neighbour unprotected
+            // after the note can still be written with no stamp, so the clock is no landing token for it (vt_get looks at its pages again, and so does stage_set then)
+            c->e[j].v = v && v->pkg && v->seen != nvn_dirty_now() ? NULL : v; }
         c->n = n; c->gen = gen; c->tok = tok; c->s = s;
         return;
     }
