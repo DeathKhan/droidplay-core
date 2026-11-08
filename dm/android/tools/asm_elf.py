@@ -4,6 +4,7 @@
 #   _name → name (Mach-O prefixes C symbols with an underscore), with the renames below for Darwin functions the Android build provides under another name
 #   every .globl symbol is also .hidden: the host is one shared library, and adrp / b to a preemptible symbol does not link
 #   .private_extern → .hidden
+#   .zerofill __DATA,__bss,sym,size,align → sym in .bss, 2^align aligned, then back to .text (entry.S's gate stack tops)
 import re, sys
 
 RENAME = {'mach_absolute_time': 'dm_mach_absolute_time'}
@@ -17,6 +18,8 @@ def convert(text):
         code = re.sub(r'\b(\w+)@PAGE\b', r'\1', code)
         code = code.replace('.private_extern', '.hidden')
         code = re.sub(r'^(\s*)\.cstring\b', r'\1.section .rodata.str1.1,"aMS",@progbits,1', code)
+        code = re.sub(r'^(\s*)\.zerofill\s+__DATA\s*,\s*__bss\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*$',
+                      r'\1.bss\n\1.p2align \4\n\2:\n\1.zero \3\n\1.text ', code)
         out.append(code + sep + comment)
         g = re.match(r'\s*\.globl\s+(\w+)', code)
         if g: out.append(f'    .hidden {g.group(1)}')

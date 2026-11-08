@@ -8,11 +8,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef struct { uint64_t a, b; uint32_t name; uint16_t nlen; uint8_t type, pad; } __attribute__((packed)) img_ent;   // directory: a = first child, b = children; file: a = offset, b = size
+typedef struct { uint64_t a, b; uint32_t name; uint16_t nlen; uint8_t type, flags; } __attribute__((packed)) img_ent;   // directory: a = first child, b = children; file: a = offset, b = size
 _Static_assert(sizeof(img_ent) == 24, "RomFS image entry layout");
+#define IMG_ENT_DAMAGED 1    // in the image: this file failed the NCA's hash check and was written as read (nx_extract --allow-damaged)
+#define IMG_ENT_REPORTED 2   // in memory only: the host has named this damaged file in its log
 // base: where the image starts in fd's file, 0 for an image file of its own; an Android game app's image is a stored entry of its APK, or a file the player picked,
 // each handed over as an open descriptor (romfs_image_spec)
-typedef struct { int fd; uint64_t n; img_ent *e; const char *names; int64_t base; } romfs_img;
+typedef struct { int fd; uint64_t n, damaged; img_ent *e; const char *names; int64_t base; } romfs_img;
 
 static void romfs_image_close(romfs_img *m) {
     if (m) { close(m->fd); free(m->e); free(m); }
@@ -69,7 +71,8 @@ static romfs_img *romfs_image_open(const char *path) {
     if (m->e[0].type || m->e[0].nlen) goto bad;
     for (uint64_t k = 0; k < n; k++) {
         const img_ent *x = &m->e[k];
-        if ((uint64_t)x->name + x->nlen > pool || x->type > 1 || x->pad) goto bad;
+        if ((uint64_t)x->name + x->nlen > pool || x->type > 1 || x->flags > (x->type ? IMG_ENT_DAMAGED : 0)) goto bad;
+        m->damaged += x->flags;
         const char *name = m->names + x->name;
         if (k && (!x->nlen || x->nlen > 0x300 || memchr(name, 0, x->nlen) || memchr(name, '/', x->nlen) || (x->nlen == 1 && name[0] == '.') || (x->nlen == 2 && !memcmp(name, "..", 2)))) goto bad;
         if (x->type) { if (x->a < sizeof h || x->a > ioff || x->b > ioff - x->a) goto bad; }

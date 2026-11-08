@@ -9,6 +9,7 @@
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
 #include "nvn_timestamp.h"
+#include "nvn_queue.h"
 #include <stdatomic.h>
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -80,13 +81,14 @@ uint64_t mtl_sub_commit(void) {
     uint64_t now = gpu_ticks();
     for (int i = 0; i < g_npost; i++) {
         post_op *o = &g_post[i];
-        if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; }
+        if (o->kind == 1) nvn_event_publish_gpu(o->val, o->mode, o->v, atomic_load(&g_fence) + 1);   // releases the queues waiting on the word (nvn_queue.inc)
         else { uint64_t rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 0 : (o->type == 0 || o->type == 0x10) ? now : 0, now}; memcpy((void *)o->addr, rec, sizeof rec); }
     }
     g_npost = 0;
     pthread_mutex_lock(&g_mu);
     uint64_t f = atomic_fetch_add(&g_fence, 1) + 1; atomic_store(&g_done, f); pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
+    nvn_queue_gpu_progress();
     return f;
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
@@ -187,3 +189,30 @@ void dm_gfx_passdump_next(long n) { (void)n; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_texlist(int target) { (void)target; }
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
+
+// The NVN queue scheduler's hooks (hle_nvn.c nvn_queue.inc): nothing outlives a submission here, so nothing is pinned
+uint64_t mtl_completed_fence(void) { return atomic_load(&g_done); }
+void mtl_prepare(void) {}
+void mtl_queue_activate(uint64_t serial) { (void)serial; }
+void mtl_queue_forget(uint64_t serial) { (void)serial; }
+void mtl_prog_snapshot(prog_t *copy, const prog_t *source) { *copy = *source; }
+void mtl_prog_unpin(prog_t *p) { (void)p; }
+void mtl_prog_forget(const prog_t *p) { (void)p; }
+void mtl_prog_prefetch(const prog_t *p) { (void)p; }
+void mtl_tex_pin(uint64_t serial) { (void)serial; }
+void mtl_tex_unpin(uint64_t serial) { (void)serial; }
+void mtl_tex_gpu_written(const tex_t *t) { (void)t; }
+void mtl_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }
+void mtl_sp_phys_gone(const void *mem, uint64_t size) { (void)mem; (void)size; }
+int mtl_probe_ramp_on(void) { return 0; }
+void mtl_present_layer(uint32_t w, uint32_t h) { (void)w; (void)h; }
+void mtl_present_screen(uint32_t w, uint32_t h) { (void)w; (void)h; }
+void mtl_present_progress(uint64_t *queued, uint64_t *done) { *queued = *done = atomic_load(&g_presents); }
+void mtl_fb_stats(uint64_t *snaps, uint64_t *reused, uint64_t *tile, uint64_t *wait) { *snaps = *reused = *tile = *wait = 0; }
+void mtl_pool_stats(uint64_t s[6]) { memset(s, 0, 6 * sizeof *s); }
+void mtl_geohoist_stats(uint64_t *moved, uint64_t *runs, uint64_t *stops) { *moved = *runs = 0; memset(stops, 0, 6 * sizeof *stops); }
+void mtl_geomesh_stats(uint64_t *n, uint64_t *wait, uint64_t *run_draws, uint64_t *runs, uint64_t ends[4]) { *n = *wait = *run_draws = *runs = 0; memset(ends, 0, 4 * sizeof *ends); }
+void dm_gfx_restop(void) {}
+void *objc_autoreleasePoolPush(void) { return NULL; }
+void objc_autoreleasePoolPop(void *pool) { (void)pool; }
+int mtl_addr_known(uint64_t addr, uint64_t len) { return mtl_addr(addr, len, NULL, NULL); }

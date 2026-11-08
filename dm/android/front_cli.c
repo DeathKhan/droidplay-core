@@ -12,6 +12,7 @@ void front_run(void (*guest)(void)) {
 void *front_metal_layer(void) { return NULL; }
 int front_has_window(void) { return 0; }
 int front_screen_max_fps(void) { return 0; }
+int front_ctrl_support(int min, int max) { (void)min; (void)max; return -1; }   // no controller prompt yet: the applet closes as the player would (hle_hid.c ctrl_support)
 void front_screen_match(int fps) { (void)fps; }
 void front_progress(const char *title, long done, long total) { if (title) LOG("progress: %s %ld / %ld", title, done, total); }
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {

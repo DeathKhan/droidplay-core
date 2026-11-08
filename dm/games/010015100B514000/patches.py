@@ -25,3 +25,7 @@ def frame_step(ctx):
 
 
 FRAME_STEP = {'ff773e90972d544eb79406eaa65396d5': frame_step}
+BINDING = [
+    {'what': 'render scale: the 3D view\'s dynamic-resolution factor x the host\'s', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+     'why': "1.2.1's main at a fixed offset (the Android fork's render-scale setting); a function-matched frame step (MATCH_FRAME_STEP) could carry it over updates"},
+]

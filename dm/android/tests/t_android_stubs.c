@@ -9,3 +9,4 @@ __attribute__((weak)) void dm_guest_frame_tick(void) {}
 __attribute__((weak)) int front_screen_max_fps(void) { return 0; }
 __attribute__((weak)) uint64_t guest_ns(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC); }
 __attribute__((weak)) void mtl_present_test_stall(uint64_t ns) { (void)ns; }
+__attribute__((weak)) int dm_opmode(void) { return 1; }   // hle_oe.c: docked (the graphics tests have no front end to ask)

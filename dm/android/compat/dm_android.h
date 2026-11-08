@@ -251,6 +251,13 @@ int dm_android_fcntl(int fd, int cmd, ...);
 // mincore: Linux sets bit 0 for a resident page, as Darwin's MINCORE_INCORE
 #define MINCORE_INCORE 1
 
+// ---- Code made at run time (hle_jit.c): Linux maps anonymous memory read + write + execute without a JIT flag and has no per-thread write switch ----
+#define MAP_JIT 0
+static inline void pthread_jit_write_protect_np(int enabled) { (void)enabled; }
+
+// ---- Sorting: BSD's stable sort (plat_android.c) ----
+int mergesort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *));
+
 // ---- strings ----
 size_t strlcpy(char *, const char *, size_t);
 size_t strlcat(char *, const char *, size_t);

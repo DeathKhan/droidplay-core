@@ -450,6 +450,42 @@ void dispatch_release(void *o) {
     dispatch_semaphore_t s = o; if (!s) return;
     pthread_mutex_destroy(&s->m); pthread_cond_destroy(&s->c); free(s);
 }
+// The global queues: the qos is taken on the work's own thread, as a global queue's worker runs at it
+struct dm_dispatch_queue { long qos; };
+static struct dm_dispatch_queue g_global_q[6];
+dispatch_queue_t dispatch_get_global_queue(long qos, unsigned long flags) {
+    (void)flags; long i = qos >= QOS_CLASS_USER_INTERACTIVE ? 0 : qos >= QOS_CLASS_USER_INITIATED ? 1 : qos >= QOS_CLASS_DEFAULT ? 2 : qos >= QOS_CLASS_UTILITY ? 3 : qos ? 4 : 5;
+    g_global_q[i].qos = qos; return &g_global_q[i];
+}
+typedef struct { void *ctx; void (*work)(void *); long qos; } dm_async_item;
+static void *dm_async_main(void *p) {
+    dm_async_item it = *(dm_async_item *)p; free(p);
+    if (it.qos) dm_android_qos_set((qos_class_t)it.qos);
+    it.work(it.ctx); return NULL;
+}
+void dispatch_async_f(dispatch_queue_t q, void *ctx, void (*work)(void *)) {
+    dm_async_item *it = malloc(sizeof *it); pthread_t th;
+    if (!it) { work(ctx); return; }   // no memory for the item: run it here rather than lose it
+    *it = (dm_async_item){ctx, work, q ? q->qos : 0};
+    if (pthread_create(&th, NULL, dm_async_main, it)) { free(it); work(ctx); return; }
+    pthread_detach(th);
+}
+
+// ---- mergesort (BSD libc): a stable sort; bionic has none (hle_hid.c sorts DM_KEYS steps with it) ----
+int mergesort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
+    if (n < 2 || !size) return 0;
+    char *a = base, *t = malloc(n * size); if (!t) { errno = ENOMEM; return -1; }
+    for (size_t w = 1; w < n; w *= 2) {   // bottom-up: runs of w merged into runs of 2w, ties taken from the left run
+        for (size_t lo = 0; lo < n; lo += 2 * w) {
+            size_t mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n, i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) { if (cmp(a + j * size, a + i * size) < 0) memcpy(t + k++ * size, a + j++ * size, size); else memcpy(t + k++ * size, a + i++ * size, size); }
+            if (i < mid) memcpy(t + k * size, a + i * size, (mid - i) * size), k += mid - i;
+            if (j < hi) memcpy(t + k * size, a + j * size, (hi - j) * size);
+        }
+        memcpy(a, t, n * size);
+    }
+    free(t); return 0;
+}
 
 // ---- SHA-256 (FIPS 180-4) ----
 static const uint32_t K256[64] = {

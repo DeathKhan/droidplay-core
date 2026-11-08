@@ -26,6 +26,7 @@
 #include "gfx_vk.h"
 #include "spv_readonly.h"
 #include "nvn_fstep.h"   // FSTEP_FIT: the performance hint's target (hint_frame)
+#include "nvn_queue.h"   // the queue scheduler (hle_nvn.c nvn_queue.inc): event publication and GPU progress
 #include <stdatomic.h>
 #include <math.h>
 #define BCDEC_IMPLEMENTATION
@@ -708,7 +709,8 @@ static void *chunk_thread(void *arg) {
                   busy = (uint64_t)((double)(t[1] - s) * g_vk.props.limits.timestampPeriod); last = t[1]; } }
         int had_wb = c->nwb != 0, had_cop = c->ncop != 0, had_fwd = c->nfwd != 0;
         chunk_done(c); c->nwb = c->ncop = c->nfwd = 0;
-        if (c->nvn_fence) { pthread_mutex_lock(&g_fmu); if (atomic_load(&g_done) < c->nvn_fence) atomic_store(&g_done, c->nvn_fence); pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu); }
+        if (c->nvn_fence) { pthread_mutex_lock(&g_fmu); if (atomic_load(&g_done) < c->nvn_fence) atomic_store(&g_done, c->nvn_fence); pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu);
+                            nvn_queue_gpu_progress(); }   // the queue scheduler's waits on GPU progress (nvn_queue.inc), as nvn_mtl.m post_complete
         qr_done(c, fr == VK_SUCCESS, ts, nq, ntq, npq);   // after every read of them, after the NVN fence (the game waits on it), before busy = 0
         pthread_mutex_lock(&g_cmu);
         memmove(g_fifo, g_fifo + 1, --g_fifo_n * sizeof *g_fifo);
@@ -1184,13 +1186,14 @@ void vt_drop_pool(const void *pool) {
     pthread_mutex_unlock(&g_bk);
 }
 void mtl_tex_init(const tex_t *t) { (void)t; }
-void mtl_tex_release(tex_t *t) {
-    if (!t->serial) return;
-    void vkb_frame_forget(uint64_t serial);
-    pthread_mutex_lock(&g_bk);
-    vtex *v = nvn_hm_del(&g_tex, &t->serial); nvn_hm_del(&g_cpuw, &t->serial);
+static void tex_drop(uint64_t serial) {   // g_bk held
+    vtex *v = nvn_hm_del(&g_tex, &serial); nvn_hm_del(&g_cpuw, &serial);
     if (v) { g_vt_gen++; vt_unref(v); }   // a shared image stays for the next object over its storage
-    pthread_mutex_unlock(&g_bk);
+}
+static int tex_pinned_release(uint64_t serial);   // with the queue scheduler's hooks
+void mtl_tex_release(tex_t *t) {
+    if (!t->serial || tex_pinned_release(t->serial)) return;   // a queued job or the bound targets still name it: dropped at its last unpin
+    pthread_mutex_lock(&g_bk); tex_drop(t->serial); pthread_mutex_unlock(&g_bk);
 }
 void mtl_tex_cpu_written(const tex_t *t) { pthread_mutex_lock(&g_bk); if (!nvn_hm_get(&g_cpuw, &t->serial)) nvn_hm_put(&g_cpuw, &t->serial, (void *)1); pthread_mutex_unlock(&g_bk); }
 int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_bk); vtex *v = nvn_hm_get(&g_tex, &serial); int r = v && !v->pkg; pthread_mutex_unlock(&g_bk); return r; }
@@ -1448,8 +1451,10 @@ static unsigned g_place_cpu[16], g_place_n;   // under g_bk
 // after one clear the two compare equal and later conditional clears of that target are skipped. Ignored, every clear ran: Animal Crossing's four clear-only passes wiped its
 // composite before the window copy, and every frame was black on an Ayn Odin 2.
 // Evaluated here at replay, on the CPU, from the records in memory, as on Metal (Vulkan's VK_EXT_conditional_rendering reads a 32-bit value, not two 64-bit counters). A report
-// replayed earlier in this submission is not written yet (the completion thread does it): a timestamp one counts with its known counter 0; a samples-passed result is unknown,
-// and a condition on it keeps drawing (occlusion culling only saves work). Inside a block evaluated false, draws and clears are dropped
+// replayed earlier may not be written yet (the completion thread does it): a timestamp one counts with its known counter 0; a samples-passed result is unknown, and a condition
+// on it keeps drawing (occlusion culling only saves work). Inside a block evaluated false, draws and clears are dropped. The state carries over from one of the queue's
+// continuations to the next (hle_nvn.c nvn_queue.inc splits a submission at every event signal and wait), as nvn_mtl.m keeps it: reset per continuation, a block opened
+// before a signal lost its condition
 static int g_rc_skip;   // a render-enable block evaluated false is active
 static uint64_t g_rc_skipped;   // clears and draws dropped by it (the first is logged)
 #define RC_PEND 256
@@ -1460,7 +1465,8 @@ static int rc_occ_has(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095,
 static void rc_note(uint64_t a, int kind) {
     if (kind == 2) rc_occ_add(a);
     for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].addr == a) { g_rc_pend[i].kind = kind; return; }
-    if (g_rc_npend < RC_PEND) { g_rc_pend[g_rc_npend].addr = a; g_rc_pend[g_rc_npend++].kind = kind; }
+    if (g_rc_npend == RC_PEND) { memmove(g_rc_pend, g_rc_pend + RC_PEND / 2, sizeof *g_rc_pend * (RC_PEND / 2)); g_rc_npend = RC_PEND / 2; }   // the older half has landed by now
+    g_rc_pend[g_rc_npend].addr = a; g_rc_pend[g_rc_npend++].kind = kind;
 }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at replay
     if (rc_occ_has(a)) return 0;
@@ -1473,7 +1479,7 @@ static int rc_skips(void) {   // the clear or draw at hand is dropped
     return 1;
 }
 void mtl_sub_begin(void) {
-    pthread_mutex_lock(&g_bk); hint_note(); g_rc_npend = 0; g_rc_skip = 0;   // conditional rendering starts afresh each submission
+    pthread_mutex_lock(&g_bk); hint_note();
     static __thread int placed; if (!placed) { placed = 1; void dm_android_place_thread(int done); dm_android_place_thread(0); }
     if (place_log_on()) { int c = sched_getcpu(); g_place_cpu[c >= 0 && c < 16 ? c : 15]++; g_place_n++; }
 }
@@ -1492,7 +1498,8 @@ static int cop_add(uint64_t src, uint64_t dst, uint64_t n, uint32_t value, int f
 }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { if (!n || cop_add(src, dst, n, 0, 0)) return; mem_view(src, n, dst, n); memmove((void *)dst, (const void *)src, n); }
 void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) { if (cop_add(0, dst, n, value, 1)) return; mem_view(0, 0, dst, n); uint8_t *d = (uint8_t *)dst; for (uint64_t i = 0; i + 4 <= n; i += 4) memcpy(d + i, &value, 4); }
-void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0}); }
+// q0: the fence of the submission it ends (nvn_queue.inc ends a continuation at each signal), for the queue scheduler's event ordering (nvn_event_publish_gpu)
+void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0, atomic_load(&g_fence) + 1, 0}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { post((post_op){2, NULL, 0, 0, addr, type}); }
 static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); return nvn_timestamp_from_ns(g ? g : clock_gettime_nsec_np(CLOCK_MONOTONIC)); }
 enum { EARLY_DRAWS = 48, MID_DRAWS = 64 };   // MID_DRAWS: a chunk that long goes to the GPU before the next draw, in the middle of a pass (the pass is begun again with its targets
@@ -1506,6 +1513,7 @@ static void mid_poll(uint64_t presents) {
     int v = 0; if (fscanf(f, "%d", &v) == 1 && v > 0 && v != g_mid_draws) { LOG("[vk] chunks sent in the middle of a pass after %d draws (was %d)", v, g_mid_draws); g_mid_draws = v; }
     fclose(f);
 }
+static uint64_t g_op_warned;   // ops this replay does not handle, logged once each
 void mtl_exec(const uint8_t *p) {
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
@@ -1542,8 +1550,10 @@ void mtl_exec(const uint8_t *p) {
             case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s, d, n); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); mem_view(0, 0, d, n); if (n) memcpy((void *)d, a + 16, n); break; }
             case OP_COPY_STRIDE: { const p_copy_stride *c = (const p_copy_stride *)a; if (c->image) S.img = c->stride; else S.row = c->stride; break; }
-            case OP_COPY_B2T: copy_b2t((const p_copy_b2t *)a); break;
-            case OP_COPY_T2B: copy_t2b((const p_copy_b2t *)a); break;
+            case OP_COPY_B2T: case OP_COPY_T2B: {   // the command buffer's copy strides travel in the record (nvn_obj.h copy_strides); none: tightly packed
+                const p_copy_strides *cs = copy_strides(a, h.size); S.row = cs ? cs->row : 0; S.img = cs ? cs->image : 0;
+                if (h.op == OP_COPY_B2T) copy_b2t((const p_copy_b2t *)a); else copy_t2b((const p_copy_b2t *)a);
+                break; }
             case OP_COPY_T2T: copy_t2t((const p_copy_t2t *)a); break;
             case OP_SET_RT:   // new render targets: a chunk with enough work goes to the GPU now, so that it draws while the rest of the submission is recorded
                 // (one command buffer per frame kept the GPU idle until the CPU had recorded everything: Super Mario Bros. Wonder's level took CPU 29 ms + GPU 41 ms
@@ -1561,14 +1571,15 @@ void mtl_exec(const uint8_t *p) {
                 if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
                 { p_draw_idx t; if (!vk_draw(NULL, draw_idx_rec(a, h.size, &t))) g_draws_dropped++; break; }
             case OP_DISPATCH: if (!vk_dispatch((const p_dispatch *)a)) g_draws_dropped++; break;
-            default: draw_state_op(h.op, a); break;   // state for draws (programs, bindings, render state)
+            default: if (!draw_state_op(h.op, a) && h.op < 64 && !(g_op_warned & 1ull << h.op)) { g_op_warned |= 1ull << h.op; LOG("[RED] [vk] command op %u is not replayed on Vulkan: skipped", h.op); }
+                break;   // state for draws (programs, bindings, render state)
         }
         if (!h.size) { LOG("[RED] [vk] command record of size 0 (op %u) at %p: the rest of the list is skipped", h.op, (const void *)p); return; }
         p += h.size;
     }
 }
 static void post_apply(const post_op *o) {   // the completion thread, when the GPU has done the commands before it
-    if (o->kind == 1) { if (o->mode == 1) __atomic_fetch_add(o->val, o->v, __ATOMIC_SEQ_CST); else __atomic_store_n(o->val, o->v, __ATOMIC_SEQ_CST); return; }
+    if (o->kind == 1) { nvn_event_publish_gpu(o->val, o->mode, o->v, o->q0); return; }   // writes the word and releases the queues waiting on it (nvn_queue.inc)
     // render_cond: a timestamp report's counter field is 0, as on the GPU, which the conditions after it compare (rc_value); without the key it holds the time, as before
     int ts = (o->type == 0 || o->type == 0x10) && !DM_GAME_RENDER_COND;
     uint64_t now = gpu_ticks(), rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 0 : ts ? now : 0, now};
@@ -1576,8 +1587,10 @@ static void post_apply(const post_op *o) {   // the completion thread, when the 
     if (o->kind == 3) { uint64_t sum = 0, a = o->q1 - o->q0 > QRES ? o->q1 - QRES : o->q0; for (uint64_t q = a; q < o->q1; q++) sum += g_qres[q % QRES]; rec[0] = sum; }
     dm_guest_write_prepare((void *)(uintptr_t)o->addr, sizeof rec); memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
 }
+static void bound_preserve(void);   // below, with the queue scheduler's hooks
 // A submission's end: its last chunk completes NVN fence f (the completion thread sets g_done); the GPU may still be at it on return
 uint64_t mtl_sub_commit(void) {
+    bound_preserve();
     uint64_t f = atomic_fetch_add(&g_fence, 1) + 1;
     if (!cur()) { pthread_mutex_unlock(&g_bk); return f; }
     chunk_submit(f);
@@ -1873,3 +1886,89 @@ void dm_gfx_passdump_next(long n) { (void)n; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_texlist(int target) { (void)target; }
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
+
+// ---------------- The NVN queue scheduler's hooks (hle_nvn.c nvn_queue.inc) ----------------
+// Submissions are copied when the game submits them and replayed in order on the scheduler's thread, "NVN queue replay", a continuation at a time (a submission is cut at each
+// event signal and wait). The copies hold snapshots of the programs and textures their records name (nvn_capture.c cap_rec_fields), freed once the job is replayed.
+uint64_t mtl_completed_fence(void) { return atomic_load(&g_done); }
+void mtl_prepare(void) {}   // the prewarm starts at the 30th present (mtl_present)
+// One replay state for every NVN queue, as before the scheduler (nvn_mtl.m keeps one per queue): a game's second queue (Fire Emblem: Three Houses) sees the first's bindings
+void mtl_queue_activate(uint64_t serial) { static uint64_t last; if (last && serial != last) RED_ONCE(130, "a second NVN queue submits: the Vulkan replay shares one state between queues"); last = serial; }
+void mtl_queue_forget(uint64_t serial) { (void)serial; }
+// A program snapshot needs nothing kept alive here: shaders are found by the program's serial (hle_nvn.c prog_key, prog_c1) and stay in the shader cache
+void mtl_prog_snapshot(prog_t *copy, const prog_t *source) { *copy = *source; }
+void mtl_prog_unpin(prog_t *p) { (void)p; }
+// The bound programs are snapshots (a job's or bound_preserve's copies), never the game's object, so a finalized program cannot be left bound here
+void mtl_prog_forget(const prog_t *p) { (void)p; }
+void mtl_prog_prefetch(const prog_t *p) { (void)p; }   // SPIR-V modules are made at first use and kept in the pipeline cache
+
+// Texture pins: a queued job, a queued present or the bound render targets name a texture by serial, and the game may finalize it before the queue gets there. Its image stays
+// in g_tex until the last pin goes, as nvn_mtl.m keeps the Metal texture. g_pin_mu is a leaf, so the game's threads pin without waiting for a replay holding g_bk
+typedef struct { int refs, released; } tex_pin;
+static pthread_mutex_t g_pin_mu = PTHREAD_MUTEX_INITIALIZER; static nvn_hmap g_pins = {.klen = 8};
+void mtl_tex_pin(uint64_t serial) {
+    if (!serial) return;
+    pthread_mutex_lock(&g_pin_mu);
+    tex_pin *p = nvn_hm_get(&g_pins, &serial);
+    if (!p) { p = calloc(1, sizeof *p); if (!p) die("texture pin allocation failed"); nvn_hm_put(&g_pins, &serial, p); }
+    p->refs++;
+    pthread_mutex_unlock(&g_pin_mu);
+}
+static int tex_unpin_(uint64_t serial) {   // 1: the game finalized it meanwhile and this was its last pin, so the caller drops it (tex_drop, under g_bk)
+    pthread_mutex_lock(&g_pin_mu);
+    tex_pin *p = nvn_hm_get(&g_pins, &serial); int drop = 0;
+    if (p && !--p->refs) { drop = p->released; nvn_hm_del(&g_pins, &serial); free(p); }
+    pthread_mutex_unlock(&g_pin_mu);
+    return drop;
+}
+void mtl_tex_unpin(uint64_t serial) { if (serial && tex_unpin_(serial)) { pthread_mutex_lock(&g_bk); tex_drop(serial); pthread_mutex_unlock(&g_bk); } }
+static int tex_pinned_release(uint64_t serial) {
+    pthread_mutex_lock(&g_pin_mu); tex_pin *p = nvn_hm_get(&g_pins, &serial); if (p) p->released = 1; pthread_mutex_unlock(&g_pin_mu);
+    return p != NULL;
+}
+// NVN's bound state carries over to the next submission, but a job's snapshots go once it is replayed: at each commit the bound programs and render targets are copied into
+// the replay's own, as nvn_mtl.m queue_program_preserve and rt_preserve_bound do, and the targets' serials stay pinned while bound. Read every source before writing: a stage
+// may already point into the copies. g_bk held
+static prog_t g_own_prog[6]; static tex_t g_own_rt[9]; static uint64_t g_rt_pin[9];
+static void bound_preserve(void) {
+    const prog_t *b[6] = {D.bst[0], D.bst[1], D.bst[2], D.bst[3], D.bst[4], D.cprog};
+    int need = 0; for (int i = 0; i < 6; i++) need |= b[i] && (b[i] < g_own_prog || b[i] >= g_own_prog + 6);
+    if (need) {
+        prog_t next[6]; const prog_t *from[6]; int idx[6], n = 0;
+        for (int i = 0; i < 6; i++) {
+            idx[i] = -1; if (!b[i]) continue;
+            int k = 0; while (k < n && from[k] != b[i]) k++;
+            if (k == n) { from[n] = b[i]; next[n++] = *b[i]; }
+            idx[i] = k;
+        }
+        memcpy(g_own_prog, next, (size_t)n * sizeof *next);
+        for (int i = 0; i < 5; i++) D.bst[i] = idx[i] < 0 ? NULL : &g_own_prog[idx[i]];
+        D.cprog = idx[5] < 0 ? NULL : &g_own_prog[idx[5]];
+    }
+    if (!R.has_rt) return;
+    const tex_t *src[9]; tex_t next[9]; unsigned pend = 0;
+    for (int k = 0; k < 9; k++) {
+        src[k] = k == 8 ? R.rt.depth : k < R.rt.n ? R.rt.color[k] : NULL;
+        uint64_t ser = src[k] ? src[k]->serial : 0;
+        if (ser != g_rt_pin[k]) { mtl_tex_pin(ser); if (g_rt_pin[k] && tex_unpin_(g_rt_pin[k])) tex_drop(g_rt_pin[k]); g_rt_pin[k] = ser; }
+        if (src[k] && src[k] != &g_own_rt[k]) { next[k] = *src[k]; pend |= 1u << k; }
+    }
+    for (int k = 0; k < 9; k++) if (pend >> k & 1) { g_own_rt[k] = next[k]; if (k == 8) R.rt.depth = &g_own_rt[k]; else R.rt.color[k] = &g_own_rt[k]; }
+}
+
+// The rest of the interface Metal gives and Android does not need yet
+void mtl_tex_gpu_written(const tex_t *t) { (void)t; }   // Metal's record of GPU-written storage (tex_cpu_content); tex_init_fill here decides by the pool's flags
+void mtl_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }   // raw global memory (Metal's GPU addresses): every pool's storage is the CPU address here
+void mtl_sp_phys_gone(const void *mem, uint64_t size) { (void)mem; (void)size; }   // sparse pools' physical pages: no sparse pools on Vulkan
+int mtl_addr_known(uint64_t addr, uint64_t len) { return mtl_addr(addr, len, NULL, NULL); }
+int mtl_probe_ramp_on(void) { return 0; }   // macOS's GPU clock ramp: the frame step's probes have their iPhone grace here
+void mtl_present_layer(uint32_t w, uint32_t h) { (void)w; (void)h; }   // the picture's shape (iOS / Mac layout); the front end letterboxes the crop it is given
+void mtl_present_screen(uint32_t w, uint32_t h) { (void)w; (void)h; }
+void mtl_present_progress(uint64_t *queued, uint64_t *done) { *queued = *done = atomic_load(&g_presents); }   // presents are shown when made
+void mtl_fb_stats(uint64_t *snaps, uint64_t *reused, uint64_t *tile, uint64_t *wait) { *snaps = *reused = *tile = *wait = 0; }
+void mtl_pool_stats(uint64_t s[6]) { memset(s, 0, 6 * sizeof *s); }
+void mtl_geohoist_stats(uint64_t *moved, uint64_t *runs, uint64_t *stops) { *moved = *runs = 0; memset(stops, 0, 6 * sizeof *stops); }
+void mtl_geomesh_stats(uint64_t *n, uint64_t *wait, uint64_t *run_draws, uint64_t *runs, uint64_t ends[4]) { *n = *wait = *run_draws = *runs = 0; memset(ends, 0, 4 * sizeof *ends); }
+void dm_gfx_restop(void) {}   // DM_CTL restop: Metal's residency set
+void *objc_autoreleasePoolPush(void) { return NULL; }   // nvn_queue.inc brackets its Metal work with autorelease pools
+void objc_autoreleasePoolPop(void *pool) { (void)pool; }
