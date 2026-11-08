@@ -40,7 +40,10 @@ jobs:
       - name: Python modules the packing script imports
         run: python -m pip install lz4 capstone fonttools
       - name: NDK and CMake
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" > /dev/null
+        run: |
+          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          (yes || true) | "$sdk" --licenses > /dev/null   # yes ends on a broken pipe once the licences are taken, which pipefail would count as a failure
+          "$sdk" --install "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" > /dev/null
       - name: Build the Android host (the game library, the command-line host and the loader)
         run: |
           CM="$ANDROID_HOME/cmake/$CMAKE_VERSION/bin"

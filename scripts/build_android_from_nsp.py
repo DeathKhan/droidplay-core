@@ -201,7 +201,7 @@ GAME_APP_LIMIT = (2 << 30) - (64 << 20)   # the APK's size with the RomFS inside
 
 
 def make_game_app(sdk, g, game, patched, spv, font, aoc, lang, so, meta, work, logs, env, out_dir, xapk):
-    sys.path.insert(0, str(REPO / 'dm/android/tools')); import build_apk
+    sys.path.insert(0, str(REPO / 'dm/android/tools')); import build_apk   # pyright: ignore[reportMissingImports]  # dm/android/tools, put on the path here
     pkg = build_apk.game_package(g.id)
     rom = bi.rfs.source(game)
     if not bi.rfs.is_image(rom): raise BuildError(f'a game app reads the RomFS as one image ({game}/RomFS.img), and this extraction has a RomFS folder: extract the game again')
@@ -692,7 +692,8 @@ def main(argv):
     derived = ''
     if not prov:
         need = g.words('shader_versions')
-        if pkg_ver not in builds: derived = f'{pkg_ver} is not a version game profile {g.id} registers ({", ".join(f"{v} {b["display"]}" for v, b in builds.items())})'
+        registered = ', '.join(f'{v} {b["display"]}' for v, b in builds.items())
+        if pkg_ver not in builds: derived = f'{pkg_ver} is not a version game profile {g.id} registers ({registered})'
         elif not all(v in have for v in need): derived = f'the folder has no {", ".join(v for v in need if v not in have)}, whose files game profile {g.id}\'s shader tables were made from'
         if derived: say(f'{derived}: packing {pkg_ver} from a profile derived from it')
     work = nsp_dir / f'{g.id}_build'; logs = work / 'logs'; ex = work / 'extract'

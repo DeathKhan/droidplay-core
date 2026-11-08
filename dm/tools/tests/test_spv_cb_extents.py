@@ -14,7 +14,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'dm/android/tools'))
-import spv_android as sa   # noqa: E402
+import spv_android as sa   # noqa: E402  # pyright: ignore[reportMissingImports]  # dm/android/tools, put on the path above
 from test_spv_readonly import NDK, HOST, EXE   # noqa: E402
 
 SPV_AS = (NDK / 'shader-tools' / HOST / f'spirv-as{EXE}') if NDK else shutil.which('spirv-as')
@@ -135,7 +135,7 @@ class CbExtents(unittest.TestCase):
 
     def asm(self, body, extra='', head=HEAD):
         p = self.tmp / 't.spvasm'; p.write_text(head.replace('%BODY%', body).replace('%EXTRA%', extra))
-        subprocess.run([SPV_AS, '--target-env', 'vulkan1.1', '--preserve-numeric-ids', p, '-o', self.tmp / 't.spv'], check=True)
+        subprocess.run([str(SPV_AS), '--target-env', 'vulkan1.1', '--preserve-numeric-ids', str(p), '-o', str(self.tmp / 't.spv')], check=True)
         return (self.tmp / 't.spv').read_bytes()
 
     def ext(self, data, why=None):
@@ -259,7 +259,7 @@ OpFunctionEnd
             consts = {'m': m, 's': s, 'o': o, 'n': n}
             for x, f in cases:
                 ops = [None if w is None else frozenset((consts[w],)) for w in x[3:]]
-                r = sa._cb_eval([x[0], 1, 2] + list(range(10, 10 + len(ops))), lambda w: ops[w - 10], set())
+                r = sa._cb_eval([x[0], 1, 2] + list(range(10, 10 + len(ops))), lambda w, ops=ops: ops[w - 10], set())
                 if r is None: continue
                 for _ in range(20):
                     v = rnd.getrandbits(32)
