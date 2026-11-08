@@ -822,7 +822,8 @@ static void rp_end(void) {
     if (!P.active) return;
     occl_end(); prof_pass_end(); vkCmdEndRenderPass(C->cb); P.active = 0; if (dump_on()) dump_pass_end();
     for (int i = 0; i < 8; i++) if (g_bcrt_pend[i].sh) { bcrt_copy(g_bcrt_pend[i].base, g_bcrt_pend[i].sh, g_bcrt_pend[i].lv, g_bcrt_pend[i].ly, 1); g_bcrt_pend[i].sh = NULL; }
-    for (int i = 0; i < 8; i++) if (P.cv[i]) lin_writeback(P.cv[i], P.clv[i], P.cly[i]);
+    static int linwb = -1; if (linwb < 0) { const char *e = getenv("DM_VK_LINWB"); linwb = !e || atoi(e) != 0; }   // DM_VK_LINWB=0 (env.txt): no linear write-back, a diagnostic
+    if (linwb) for (int i = 0; i < 8; i++) if (P.cv[i]) lin_writeback(P.cv[i], P.clv[i], P.cly[i]);
 }
 // the render pass of the bound render targets (R.rt): images, views and framebuffer, made before the draw's textures are resolved (that may record uploads, outside a pass)
 static int rp_prepare(void) {
