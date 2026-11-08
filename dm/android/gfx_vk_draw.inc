@@ -96,6 +96,7 @@ typedef struct {
     int vid;   // a vertex shader reading gl_VertexIndex: its draws keep their vertex numbers (bind_vbufs lo 0)
     uint32_t io_in, io_out;   // the locations of its user-defined inputs and outputs (bit n: location n)
     struct { uint32_t miss; VkShaderModule m; } var[4]; int nvar;   // fragment shaders: variants with unwritten inputs made constants (ps_variant)
+    int b0;   // a module of its set (.spv, .z.spv, .tf.spv; ps_variant only makes inputs private) reads binding 0, the support buffer (spv_b0_used): stage_set writes it only then
 } vshader;
 static nvn_hmap g_sh = {.klen = 16};
 static char g_spv_dir[512];
@@ -127,6 +128,51 @@ static int spv_vid(const uint32_t *w, size_t n) {   // a variable decorated Buil
         if (op == 71 && len >= 4 && w[i + 2] == 11 && w[i + 3] == 42) return 1;   // OpDecorate id BuiltIn VertexIndex
         i += len; }
     return 0;
+}
+// ---- Which modules read the support buffer (binding 0) ----
+// Word q of an instruction with opcode op in a function body is a literal, never an id: an extended instruction's number, a function's or a merge's control,
+// a variable's storage class, memory operands, composite indices and shuffle components, branch weights, switch cases, image operand masks, group operations, line numbers.
+// An opcode not listed has every word taken for an id, so that an unknown one can only make a use seen where there is none (safe), never hide one
+static int spv_lit(uint32_t op, uint32_t q) {
+    switch (op) {
+        case 8: case 317: return 1;   // OpLine (an OpString and two numbers), OpNoLine
+        case 12: return q == 4;   // OpExtInst type result set instruction operands...
+        case 54: case 59: return q == 3;   // OpFunction type result control ftype; OpVariable type result class [initializer]
+        case 61: return q >= 4;   // OpLoad type result pointer [memory operands]
+        case 62: case 63: return q >= 3;   // OpStore pointer object [memory operands]; OpCopyMemory target source [memory operands]
+        case 64: return q >= 4;   // OpCopyMemorySized
+        case 79: case 82: return q >= 5;   // OpVectorShuffle type result v1 v2 components...; OpCompositeInsert type result object composite indices...
+        case 81: return q >= 4;   // OpCompositeExtract type result composite indices...
+        case 246: return q >= 3;   // OpLoopMerge merge continue control [parameters]
+        case 247: case 256: case 257: return q == 2;   // OpSelectionMerge merge control; OpLifetimeStart / Stop pointer size
+        case 250: return q >= 4;   // OpBranchConditional condition true false [weights]
+        case 251: return q >= 3;   // OpSwitch selector default (literal label)...: the labels are no variables
+        case 87: case 88: case 91: case 92: case 95: case 98: case 305: case 306: case 309: case 310: case 313: case 320: return q == 5;   // image sample / fetch / read: the operand mask
+        case 89: case 90: case 93: case 94: case 96: case 97: case 307: case 308: case 311: case 312: case 314: case 315: return q == 6;   // with a depth reference or a gather component
+        case 99: return q == 4;   // OpImageWrite image coordinate texel [mask]
+        case 342: return q == 4;   // OpGroupNonUniformBallotBitCount type result scope operation value
+        default: return op >= 349 && op <= 364 && q == 4;   // OpGroupNonUniform arithmetic / bitwise / logical: the group operation
+    }
+}
+// 1 when the module statically uses binding 0 (Vulkan: an instruction in the entry point's call tree names the variable): a variable decorated Binding 0 is an id operand
+// of an instruction in a function body, or a global variable's initializer; 1 too when the module cannot be followed (malformed, decoration groups). The support buffer
+// is binding 0 of every set (Ryujinx's 1,392 bytes: render scale, the viewport's inverse and size), read by few shaders: 200 of Breath of the Wild's 19,592 (render scale
+// only). By operand, not by word: its variable is %13 there, and a literal 13 (an extended instruction's number, a composite index) is no use of it. spv_cb_ext's word match
+// takes 15,833 of the game's 28,523 modules (main and .z) for readers; this scan 219, the same modules as spirv-dis's operands
+static int spv_b0_used(const uint32_t *w, size_t n) {
+    if (n < 5) return 1;
+    uint32_t bound = w[3]; uint8_t *b0 = calloc(bound ? bound : 1, 1); int any = 0, used = 0, fn = 0;
+    if (!b0) return 1;
+    for (size_t i = 5; i < n; ) { uint32_t len = w[i] >> 16, op = w[i] & 0xffff; if (!len || i + len > n) { used = 1; break; }
+        if (op == 71 && len >= 4 && w[i + 2] == 33 && w[i + 3] == 0 && w[i + 1] < bound) { b0[w[i + 1]] = 1; any = 1; }   // OpDecorate id Binding 0
+        if (op >= 73 && op <= 75) { used = 1; break; }   // OpDecorationGroup / OpGroupDecorate / OpGroupMemberDecorate: not followed
+        i += len; }
+    for (size_t i = 5; any && !used && i < n; ) { uint32_t len = w[i] >> 16, op = w[i] & 0xffff; if (!len || i + len > n) { used = 1; break; }
+        if (op == 54) fn = 1;   // the functions come after every global declaration
+        if (fn) { for (uint32_t q = 1; q < len && !used; q++) if (w[i + q] < bound && b0[w[i + q]] && !spv_lit(op, q)) used = 1; }
+        else if (op == 59 && len >= 5 && w[i + 4] < bound && b0[w[i + 4]]) used = 1;   // OpVariable type result class initializer
+        i += len; }
+    free(b0); return used;
 }
 // How many bytes of each constant buffer the shader reads (ext[i] for binding bind[i]; 0 = all of it): the translator declares every one as 4096 vec4, and the replay copied
 // the bound buffer whole for every draw (up to 64 KB, six or seven a shader) where Super Mario Bros. Wonder's scene shaders read 64 bytes to 2.3 KB of each. The extent is the
@@ -224,8 +270,9 @@ static VkShaderModule ps_variant(vshader *s, uint32_t miss) {
     if (s->nvar < 4) { s->var[s->nvar].miss = miss; s->var[s->nvar++].m = m; }
     return m;
 }
-static VkShaderModule sh_module(const char *path) {
+static VkShaderModule sh_module(const char *path, int *b0) {   // *b0 |= the module reads the support buffer (spv_b0_used)
     size_t n = 0; uint32_t *code = spv_read(path, &n); if (!code) return VK_NULL_HANDLE;
+    *b0 |= spv_b0_used(code, n);
     if (!g_vk_feat.vertexPipelineStoresAndAtomics) {   // the Mali-G76: the vertex pipeline's storage resources must be NonWritable (spv_readonly.h)
         size_t cap = n + 3 * (size_t)code[3], on = 0; int wr = 0;
         uint32_t *s = malloc(2 * (size_t)code[3] * 4), *o = malloc(cap * 4);
@@ -292,11 +339,11 @@ static vshader *sh_get(const char *key) {
     a = js_get(&r, "tf");   // [[outputs, stride] or [] per feedback buffer]
     for (int b = 0; a && a->t == 3 && b < a->n && b < 4; b++) if (a->kid[b].t == 3 && a->kid[b].n == 2) s->tf_stride[b] = (uint32_t)a->kid[b].kid[1].num;
     js_free(&r);
-    snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key); s->mod = sh_module(p);
+    snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key); s->mod = sh_module(p, &s->b0);
     { size_t nw = 0; uint32_t *w = spv_read(p, &nw);
       if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); uint32_t ext[18]; spv_cb_ext(w, nw, s->cb, s->ncb, ext); for (int i = 0; i < s->ncb; i++) s->cb[i].ext = ext[i]; free(w); } }
-    if (s->stage == SH_VS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p); }
-    if (s->tf_stride[0] | s->tf_stride[1] | s->tf_stride[2] | s->tf_stride[3]) { snprintf(p, sizeof p, "%s/%s.tf.spv", g_spv_dir, s->key); s->modtf = sh_module(p); }
+    if (s->stage == SH_VS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p, &s->b0); }
+    if (s->tf_stride[0] | s->tf_stride[1] | s->tf_stride[2] | s->tf_stride[3]) { snprintf(p, sizeof p, "%s/%s.tf.spv", g_spv_dir, s->key); s->modtf = sh_module(p, &s->b0); }
     if (!s->mod) return NULL;
     // the set's layout: support buffer, constant buffers, storage buffers, textures, images
     VkDescriptorSetLayoutBinding b[1 + 18 + 16 + 64 + 16 + 4]; uint32_t nb = 0;
@@ -313,7 +360,7 @@ static vshader *sh_get(const char *key) {
         if (vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &s->dsl_tf) != VK_SUCCESS) s->modtf = VK_NULL_HANDLE;
     }
     s->ok = 1;
-    if (vk_debug()) LOG("[vk] shader %s stage %d: %d constant buffers, %d storage buffers, %d textures, %d images%s", s->key, s->stage, s->ncb, s->nsb, s->ntx, s->nim, s->modz ? ", depth -1..1 variant" : "");
+    if (vk_debug()) LOG("[vk] shader %s stage %d: %d constant buffers, %d storage buffers, %d textures, %d images%s%s", s->key, s->stage, s->ncb, s->nsb, s->ntx, s->nim, s->modz ? ", depth -1..1 variant" : "", s->b0 ? ", reads the support buffer" : "");
     return s;
 }
 static void key_hex(const uint8_t k[8], char out[17]) { static const char *hx = "0123456789abcdef"; for (int i = 0; i < 8; i++) { out[2 * i] = hx[k[i] >> 4]; out[2 * i + 1] = hx[k[i] & 15]; } out[16] = 0; }
@@ -1241,19 +1288,56 @@ static void bank_c0(int nst, uint8_t *b, uint32_t base_inst) {
     for (int r = 0; r < 16 && o && o + 16 * r + 12 <= 0x800; r++) { uint64_t a = D.ssbo[nst][r].addr; uint32_t n = (uint32_t)D.ssbo[nst][r].size; memcpy(b + o + 16 * r, &a, 8); memcpy(b + o + 16 * r + 8, &n, 4); }
     memcpy(b + 0x644, &base_inst, 4);
 }
+// c2's layout, as nvn_mtl.m's C2_* and c2_handle: a 32-bit handle word every 8 bytes, the row's upper word 0; combined slots 0..40 from 0x20 (32..40 share the
+// image table: a bound image is what lies there; nvn_mtl.m tex_slot_h stops at 39, the image table's 8 slots), separate textures from 0x168, separate samplers from 0x568;
+// 0 below 0x20 and from 0x968 to the bank's end
+enum { C2_ROW = 8, C2_TEX = 0x20, C2_TEX_SLOTS = 41, C2_SEPTEX = 0x168, C2_SAMP = 0x568, C2_SEP_SLOTS = 128, C2_SIZE = 0xA00 };
+_Static_assert(C2_TEX + C2_ROW * C2_TEX_SLOTS == C2_SEPTEX && C2_SEPTEX + C2_ROW * C2_SEP_SLOTS == C2_SAMP && C2_SAMP + C2_ROW * C2_SEP_SLOTS <= C2_SIZE, "c2 tables");
+_Static_assert(NTEX >= 128 + C2_SEP_SLOTS && sizeof D.img[0] / sizeof D.img[0][0] > C2_TEX_SLOTS - 1 - 32 && sizeof D.samp[0] / sizeof D.samp[0][0] >= C2_SEP_SLOTS, "c2 sources");
 static void bank_c2(int nst, uint8_t *b) {
-    memset(b, 0, 0xA00);
-    // as nvn_mtl.m c2_handle: combined slots 0..40 (32..39 share the image table: a bound image is what lies there), separate textures, separate samplers
-    for (int r = 0; r < 41; r++) { uint32_t h = (uint32_t)(r >= 32 && D.img[nst][r - 32] ? D.img[nst][r - 32] : D.tex[nst][r]); memcpy(b + 0x20 + 8 * r, &h, 4); }
-    for (int r = 0; r < 128; r++) { uint32_t h = (uint32_t)D.tex[nst][128 + r]; memcpy(b + 0x168 + 8 * r, &h, 4); }
-    for (int r = 0; r < 128; r++) { uint32_t h = (uint32_t)D.samp[nst][r]; memcpy(b + 0x568 + 8 * r, &h, 4); }
+    memset(b, 0, C2_SIZE);
+    for (int r = 0; r < C2_TEX_SLOTS; r++) { uint32_t h = (uint32_t)(r >= 32 && D.img[nst][r - 32] ? D.img[nst][r - 32] : D.tex[nst][r]); memcpy(b + C2_TEX + C2_ROW * r, &h, 4); }
+    for (int r = 0; r < C2_SEP_SLOTS; r++) { uint32_t h = (uint32_t)D.tex[nst][128 + r]; memcpy(b + C2_SEPTEX + C2_ROW * r, &h, 4); }
+    for (int r = 0; r < C2_SEP_SLOTS; r++) { uint32_t h = (uint32_t)D.samp[nst][r]; memcpy(b + C2_SAMP + C2_ROW * r, &h, 4); }
+}
+// The word bank_c2 writes at byte (a multiple of 4: every caller reads (w0 + 2e) × 4 or w1 × 4), read straight from the bound state: D's handles change only by state ops,
+// which mtl_exec replays between draws, never while a draw's stages are set up. Building the whole bank for each lookup was stage_textures' and stage_set's for every stage of
+// every draw, used or not: Breath of the Wild on the Odin 2, bank_c2 6.6% of the replay thread (2.65 ms a frame: 15,000 banks of 2,560 bytes, 297 handle stores each)
+// and 0.3 ms more in its memset, for the 2 to 4 handle words a stage reads. DM_VK_C2_DIRECT=0 (env.txt): the bank as before, for each stage
+static uint32_t c2_word(int nst, uint32_t byte) {
+    if (byte < C2_TEX || (byte - C2_TEX) % C2_ROW) return 0;
+    uint32_t r = (byte - C2_TEX) / C2_ROW;
+    if (r < C2_TEX_SLOTS) return (uint32_t)(r >= 32 && D.img[nst][r - 32] ? D.img[nst][r - 32] : D.tex[nst][r]);
+    if ((r -= C2_TEX_SLOTS) < C2_SEP_SLOTS) return (uint32_t)D.tex[nst][128 + r];
+    if ((r -= C2_SEP_SLOTS) < C2_SEP_SLOTS) return (uint32_t)D.samp[nst][r];
+    return 0;
+}
+static int c2_direct(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_C2_DIRECT"); v = !(e && *e == '0'); } return v; }
+// DM_VK_C2_CHECK=1 (env.txt; a diagnostic, off by default): the bank is built as before and its word used, and every lookup is compared with c2_word, every 64th bank whole;
+// a difference is a [RED] line (the first 16), the counts are in the periodic statistics (mtl_mem_stat)
+static int c2_check(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_C2_CHECK"); v = e && *e && *e != '0'; } return v; }
+static uint64_t g_c2_checked, g_c2_bad;
+static void c2_differs(int nst, uint32_t byte, uint32_t bank, uint32_t direct) {
+    if (g_c2_bad++ < 16) LOG("[RED] [vk] c2 check: stage %d byte %#x: the bank holds %#x, c2_word gives %#x", nst, byte, bank, direct);
+}
+// stage_textures' and stage_set's c2: NULL to read each word with c2_word, else the bank built in buf (DM_VK_C2_DIRECT=0, DM_VK_C2_CHECK=1)
+static const uint8_t *c2_bank(int nst, uint8_t *buf) {
+    if (c2_direct() && !c2_check()) return NULL;
+    bank_c2(nst, buf);
+    static uint32_t nb; if (c2_check() && !(nb++ & 63)) for (uint32_t b = 0; b < C2_SIZE; b += 4) { uint32_t w; memcpy(&w, buf + b, 4); uint32_t d = c2_word(nst, b); g_c2_checked++; if (w != d) c2_differs(nst, b, w, d); }
+    return buf;
 }
 static int nvn_stage_of(int s) { return s == SH_PS ? 1 : s == SH_GS ? 2 : s == SH_CS ? 5 : 0; }
-// a word of a constant bank: c2 as made, or a game uniform buffer (c3 + slot)
+// a word of a constant bank: c2 (c2_bank: NULL reads it with c2_word), or a game uniform buffer (c3 + slot)
 static uint32_t bank_word(int nst, const uint8_t *c2, int slot, uint32_t byte) {
     uint32_t w = 0;
     if (slot < 0) slot = 2;   // a bound texture's handle: the translator gives no bank (-1), the driver's c2
-    if (slot == 2) { if (byte + 4 <= 0xA00) memcpy(&w, c2 + byte, 4); return w; }
+    if (slot == 2) {
+        if (!c2) return c2_word(nst, byte);
+        if (byte + 4 <= C2_SIZE) memcpy(&w, c2 + byte, 4);
+        if (c2_check()) { uint32_t d = c2_word(nst, byte); g_c2_checked++; if (d != w) c2_differs(nst, byte, w, d); }
+        return w;
+    }
     if (slot >= 3 && slot - 3 < 16) { const p_bind_buf *u = &D.ubo[nst][slot - 3]; if (u->addr && byte + 4 <= u->size) memcpy(&w, (const void *)(uintptr_t)(u->addr + byte), 4); }
     return w;
 }
@@ -1362,7 +1446,7 @@ static VkImageView dummy_ms(int depth) {
 static void stage_textures(vshader *s) {
     int nst = nvn_stage_of(s->stage);
     {
-        uint8_t c2p[0xA00]; bank_c2(nst, c2p);
+        uint8_t c2buf[C2_SIZE]; const uint8_t *c2p = c2_bank(nst, c2buf);
         for (int pass = 0; pass < 2; pass++) for (int i = 0; i < (pass ? s->nim : s->ntx); i++) {
             const rb_tex *t = pass ? &s->im[i] : &s->tx[i]; if ((t->type & 0xff) == 2) continue;
             int cnt = t->array > 1 ? (t->array > 1024 ? 1024 : t->array) : 1; uint32_t w0 = (uint32_t)t->handle & 0x3fff;
@@ -1376,6 +1460,9 @@ static void stage_textures(vshader *s) {
 // equal to a shadow kept in host memory (the arena is write-combined: it is not read back). Super Mario Bros. Wonder's scene draws read six or seven uniform buffers
 // each, mostly the same from draw to draw; copying them again for every draw was the largest cost of its render thread on an Adreno 619 (memcpy, 15%)
 typedef struct { const void *src; size_t n; uint64_t seq; VkBuffer b; VkDeviceSize off; uint8_t *shadow; size_t cap; } ucopy_t;
+static int support_skip(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SUPPORT_SKIP"); v = !(e && *e == '0'); } return v; }   // stage_set
+static int desc_scratch(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DESC_SCRATCH"); v = !(e && *e == '0'); } return v; }   // stage_set
+static uint64_t g_sup_written, g_sup_skipped;   // stages that wrote the support buffer / left it unwritten (stage_set)
 static ucopy_t g_ucopy[1024]; static uint64_t g_ucopy_hit, g_ucopy_miss;
 static int ucopy(const void *src, size_t n, size_t al, VkBuffer *b, VkDeviceSize *off) {   // src NULL: al zero bytes (not cached)
     if (!src) { uint8_t *d = ar_alloc(al, b, off); if (!d) return 0; memset(d, 0, al); return 1; }
@@ -1393,18 +1480,25 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
     int nst = nvn_stage_of(s->stage);
     // one write per binding; every element of an array is written (an unwritten descriptor is undefined)
     VkWriteDescriptorSet wr[1 + 18 + 16 + 64 + 16]; VkDescriptorBufferInfo bi[1 + 18 + 16]; VkDescriptorImageInfo *ii; VkBufferView *bvs; uint32_t nw = 0, nbi = 0, nii = 0, nbv = 0;
-    uint8_t c2[0xA00]; bank_c2(nst, c2);
-    // support buffer: render scale 1, the viewport's inverse and size
-    VkBuffer b; VkDeviceSize off; static uint8_t p[1392];
-    float vw = D.has_vp ? D.vp[0][2] : (float)P.w, vh = D.has_vp ? D.vp[0][3] : (float)P.h;
-    float vinv[4] = {vw ? 2.f / vw : 0, vh ? 2.f / vh : 0, 0, 0}, vsz[4] = {vw, vh, 1, 0}; memcpy(p + 144, vinv, 16); memcpy(p + 160, vsz, 16);
-    { static int once; if (!once++) for (int i = 0; i < 73; i++) { float one = 1.f; memcpy(p + 192 + 16 * i, &one, 4); } }
-    if (!ucopy(p, 1392, 1392, &b, &off)) return 0;
-    bi[nbi] = (VkDescriptorBufferInfo){b, off, 1392}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, &bi[nbi++], NULL};
+    uint8_t c2buf[C2_SIZE]; const uint8_t *c2 = c2_bank(nst, c2buf);   // NULL: handle words read with c2_word, the whole bank made only for a c2 constant buffer (below)
+    // support buffer: render scale 1, the viewport's inverse and size. Written only for a stage whose modules read it (sh_get spv_b0_used): a descriptor no instruction of the
+    // pipeline uses need not be valid (Vulkan: VUID-vkCmdDraw-None-08114, valid "if they are statically used"), so binding 0 stays in the layout, unwritten. Breath of the Wild
+    // on the Odin 2: 41 of a frame's 7,506 stages read it, and its 1,392-byte ucopy compare in every stage cost 1.05 ms a frame (2.6% of the replay thread), its descriptor
+    // write about 0.3 ms more. DM_VK_SUPPORT_SKIP=0 (env.txt): written for every stage, as before
+    VkBuffer b; VkDeviceSize off;
+    if (s->b0 || !support_skip()) {
+        static uint8_t p[1392]; static int filled;   // filled: a flag (a counter here, `if (!once++)`, overflowed after 2^31 stages, about 4.4 hours at 136,000 a second)
+        float vw = D.has_vp ? D.vp[0][2] : (float)P.w, vh = D.has_vp ? D.vp[0][3] : (float)P.h;
+        float vinv[4] = {vw ? 2.f / vw : 0, vh ? 2.f / vh : 0, 0, 0}, vsz[4] = {vw, vh, 1, 0}; memcpy(p + 144, vinv, 16); memcpy(p + 160, vsz, 16);
+        if (!filled) { for (int i = 0; i < 73; i++) { float one = 1.f; memcpy(p + 192 + 16 * i, &one, 4); } filled = 1; }
+        if (!ucopy(p, 1392, 1392, &b, &off)) return 0;
+        bi[nbi] = (VkDescriptorBufferInfo){b, off, 1392}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, &bi[nbi++], NULL};
+        g_sup_written++;
+    } else g_sup_skipped++;
     for (int i = 0; i < s->ncb; i++) {
         int slot = s->cb[i].slot; size_t n = 16; const void *src = NULL; uint8_t bank[0xA00];
         if (slot == 0) { bank_c0(nst, bank, base_inst); src = bank; n = 0x800; }
-        else if (slot == 2) { src = c2; n = 0xA00; }
+        else if (slot == 2) { if (!c2) bank_c2(nst, bank); src = c2 ? c2 : bank; n = C2_SIZE; }   // c2 read as a constant buffer: 81 of Breath of the Wild's 19,592 shaders, none of a measured frame's
         else if (slot == 1) {   // the shader's own constant segment, in its code memory: its bounds were read from the control section at SetShaders (gone by now: Danganronpa V3's movie shader read zeros)
             const NVNshaderData *sd = pr && prog_stage >= 0 ? &pr->sd[prog_stage] : NULL; uint32_t o = 0, e = 0;
             if (sd && sd->data && prog_c1(pr, (unsigned)prog_stage, &o, &e) && e > o && e - o <= 0x10000) { src = (const void *)(uintptr_t)(sd->data + o); n = e - o; }
@@ -1412,7 +1506,7 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
             if (u->addr && u->size) { src = (const void *)(uintptr_t)u->addr; n = u->size > 0x10000 ? 0x10000 : (size_t)u->size;
                 size_t rd = s->cb[i].ext && n > s->cb[i].ext ? s->cb[i].ext : n;   // in a memory pool still, as storage buffers below (else it reads 0)
                 if (!mtl_addr(u->addr, rd, NULL, NULL)) { RED_ONCE(119, "uniform buffer slot %d of shader %s at %#llx is in no memory pool: it reads 0", slot - 3, s->key, (unsigned long long)u->addr); src = NULL; n = 16; } }
-            else { static int nlog; if (nlog++ < 8) LOG("[RED] [vk] shader %s reads uniform slot %d, which has no buffer bound: it reads 0", s->key, slot - 3); } }
+            else { static int nlog; if (nlog < 8) { nlog++; LOG("[RED] [vk] shader %s reads uniform slot %d, which has no buffer bound: it reads 0", s->key, slot - 3); } } }
         if (s->cb[i].ext && n > s->cb[i].ext) n = s->cb[i].ext;   // only what the shader reads (spv_cb_ext)
         if (dump_on() && slot != 0 && slot != 2) {   // the draw's constant buffers in the dump's log: c1 (the shader's own segment) and the game's uniform buffers, the first 8 vec4
             char vb[700]; int q = 0; const float *fv = src; size_t nf = src ? n / 4 : 0; if (nf > 32) nf = 32;
@@ -1448,8 +1542,16 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
     }
     size_t nel = 0; for (int i = 0; i < s->ntx; i++) nel += s->tx[i].array > 1 ? (size_t)(s->tx[i].array > 1024 ? 1024 : s->tx[i].array) : 1;
     for (int i = 0; i < s->nim; i++) nel += s->im[i].array > 1 ? (size_t)(s->im[i].array > 1024 ? 1024 : s->im[i].array) : 1;
-    ii = malloc((nel + 1) * sizeof *ii); bvs = malloc((nel + 1) * sizeof *bvs);
-    if (!ii || !bvs) { free(ii); free(bvs); return 0; }   // the texture and image descriptors (no early return past here)
+    // the texture and image descriptors' infos in a scratch kept from call to call, grown to nel + 1 here, before any pointer into it is in wr[], and never in the middle: a malloc
+    // and a free of each per stage cost Breath of the Wild 1.6 ms a frame on the Odin 2 (30,000 calls, mostly scudo's lock atomics). One scratch serves because stage_set is
+    // the replay's alone: its callers (vk_draw, tf_capture, vk_dispatch) run only in mtl_exec, between mtl_sub_begin and mtl_sub_commit under g_bk, nothing it calls reaches
+    // them again, and Vulkan reads pImageInfo / pTexelBufferView only during vkUpdateDescriptorSets (as the static support buffer p above, and C).
+    // DM_VK_DESC_SCRATCH=0 (env.txt): a malloc and a free of each per stage, as before (the A/B of this alone)
+    static VkDescriptorImageInfo *g_ii; static VkBufferView *g_bvs; static size_t g_icap; int own = !desc_scratch();
+    if (own) { ii = malloc((nel + 1) * sizeof *ii); bvs = malloc((nel + 1) * sizeof *bvs); if (!ii || !bvs) { free(ii); free(bvs); return 0; } }
+    else { if (nel + 1 > g_icap) { size_t c = nel + 1 > 64 ? nel + 1 : 64; VkDescriptorImageInfo *ni = realloc(g_ii, c * sizeof *ni); if (!ni) return 0; g_ii = ni;
+               VkBufferView *nb = realloc(g_bvs, c * sizeof *nb); if (!nb) return 0; g_bvs = nb; g_icap = c; }
+           ii = g_ii; bvs = g_bvs; }   // (no early return past here)
     pthread_mutex_lock(&g_reg_mu);
     for (int i = 0; i < s->ntx; i++) {
         const rb_tex *t = &s->tx[i]; int cnt = t->array > 1 ? (t->array > 1024 ? 1024 : t->array) : 1;
@@ -1513,7 +1615,7 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
     }
     pthread_mutex_unlock(&g_reg_mu);
     vkUpdateDescriptorSets(g_vk.dev, nw, wr, 0, NULL);
-    free(ii); free(bvs);
+    if (own) { free(ii); free(bvs); }
     return 1;
 }
 
@@ -1654,7 +1756,7 @@ static int tf_capture(vshader *vs, const prog_t *pr, int pst, const p_draw *dw, 
     if (ok) vkCmdDraw(c, (uint32_t)dw->count, 1, 0, (uint32_t)dw->base_instance);   // gl_VertexIndex counts from 0: the vertex buffers start at the first vertex
     vkCmdEndRenderPass(c); cb_barrier();
     g_drawing = 0;
-    { static int once; if (!once++) LOG("[vk] transform feedback: first capture (vertex %s, %d vertices)", vs->key, dw->count); }
+    { static int once; if (!once) { once = 1; LOG("[vk] transform feedback: first capture (vertex %s, %d vertices)", vs->key, dw->count); } }
     g_captures++;
     return ok;
 }
@@ -1772,7 +1874,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     VkDescriptorSet sets[4] = {0};
     g_bind_bad = 0;
     for (int i = 0; i < 4; i++) if (k.sh[i]) { sets[i] = ds_alloc(k.sh[i]->dsl); if (!sets[i] || !stage_set(k.sh[i], sets[i], pprog[i], pst[i], base_inst)) { g_drop[3]++; return 0; } }
-    if (g_bind_bad) { g_drop[4]++; static int nb; if (nb++ < 10) LOG("[RED] [vk] draw skipped: a binding has no valid descriptor (shaders %s %s)", k.sh[0]->key, k.sh[1] ? k.sh[1]->key : "-"); return 0; }
+    if (g_bind_bad) { g_drop[4]++; static int nb; if (nb < 10) { nb++; LOG("[RED] [vk] draw skipped: a binding has no valid descriptor (shaders %s %s)", k.sh[0]->key, k.sh[1] ? k.sh[1]->key : "-"); } return 0; }
     if (!rp_start()) { g_drop[5]++; return 0; }   // after the textures: their uploads end a pass begun before (it is begun again on the same targets)
     VkCommandBuffer c = C->cb;
     occl_begin();
