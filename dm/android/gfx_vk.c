@@ -907,8 +907,10 @@ static void vt_clear_new(vtex *v) {   // fresh Switch memory reads as 0
     } else { VkClearDepthStencilValue z = {0, 0}; vkCmdClearDepthStencilImage(c, v->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg); }
     cb_barrier();
 }
+static nvn_hmap g_img_refused = {.klen = 8};   // serials whose image was over DM_VK_IMAGE_MAX_MB (vt_create; g_bk held)
 static vtex *vt_create(const tex_t *t) {
     uint32_t m = 0; uint8_t swz[4];
+    if (nvn_hm_get(&g_img_refused, &t->serial)) return NULL;
     if (!nvn_fmt_to_mtl(t->d.format, &m, swz) || !m) { RED_ONCE(10, "texture format %#x has no Vulkan counterpart yet (first case ser=%llu)", t->d.format, (unsigned long long)t->serial); return NULL; }
     if (t->d.target == NVN_TEXTURE_TARGET_BUFFER) { RED_ONCE(11, "buffer textures are not on Vulkan yet"); return NULL; }
     VkFormat nf = vk_of_mtl(m), f = nf; int conv = CONV_NONE, px = 0;
@@ -946,6 +948,22 @@ static vtex *vt_create(const tex_t *t) {
     if (v->samples > 1) ic.mipLevels = 1;
     if (vkCreateImage(g_vk.dev, &ic, NULL, &v->img) != VK_SUCCESS) { RED_ONCE(15, "vkCreateImage %ux%ux%u ×%u levels %u format %d failed", v->w, v->h, v->d, v->layers, v->levels, f); free(v); return NULL; }
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_vk.dev, v->img, &mr);
+    // A phone shares its RAM with the GPU, and the replay makes every texture whole: Mario Kart World's terrain arrays (8192x8192x68, 5.8 GB in BC6H, 1.45 GB in ASTC 8x8), sparse in a
+    // virtual pool on the Switch 2 with a fraction of their pages mapped, took the Ayn Odin 2's 11.5 GB until the low-memory killer ended the game, as each failed lookup made the image again.
+    // An image over DM_VK_IMAGE_MAX_MB (1024 by default; 0: no limit), or one in a virtual pool over DM_VK_SPARSE_MAX_MB (256 by default: the console maps only part of such a texture, and
+    // Mario Kart World's 341 and 382 MB ones in virtual pools, made whole beside the arrays, still ended it after 75 s), is refused once and for all: the texture reads as missing and
+    // the game goes on. Partially resident images (the driver has sparse residency for 2D images) would be the fix
+    if (mr.size >= (256ull << 20)) {
+        static int once; if (!once) { once = 1; VkPhysicalDeviceFeatures pf; vkGetPhysicalDeviceFeatures(g_vk.pd, &pf);
+            LOG("[vk] sparse binding %u, residency buffer %u, image 2D %u, image 3D %u, aliased %u (what partially resident images would need)", pf.sparseBinding, pf.sparseResidencyBuffer, pf.sparseResidencyImage2D, pf.sparseResidencyImage3D, pf.sparseResidencyAliased); }
+        static long max_mb = -1, sparse_mb = -1;
+        if (max_mb < 0) { const char *e = getenv("DM_VK_IMAGE_MAX_MB"), *sp = getenv("DM_VK_SPARSE_MAX_MB"); max_mb = e ? atol(e) : 1024; sparse_mb = sp ? atol(sp) : 256; }
+        long lim = t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && sparse_mb > 0 && (sparse_mb < max_mb || max_mb <= 0) ? sparse_mb : max_mb;
+        int refuse = lim > 0 && mr.size > (uint64_t)lim << 20;
+        static int n; if (n++ < 32) LOG("%s[vk] large image ser=%llu %ux%ux%u x%u layers, %u levels, format %d (NVN %#x%s): %.0f MB%s", refuse ? "[RED] " : "", (unsigned long long)t->serial, v->w, v->h, v->d, v->layers, v->levels, f, t->d.format,
+                                        t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? ", in a virtual pool" : "", mr.size / 1048576.0, refuse ? ": over the image limit (DM_VK_IMAGE_MAX_MB, DM_VK_SPARSE_MAX_MB in a virtual pool), not made (the texture reads as missing)" : "");
+        if (refuse) { nvn_hm_put(&g_img_refused, &t->serial, (void *)1); vkDestroyImage(g_vk.dev, v->img, NULL); free(v); return NULL; }
+    }
     uint32_t mt = vkb_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt == UINT32_MAX ? vkb_mem_type(mr.memoryTypeBits, 0) : mt};
     if (vkAllocateMemory(g_vk.dev, &ma, NULL, &v->mem) != VK_SUCCESS) { RED_ONCE(16, "image memory of %llu bytes failed", (unsigned long long)mr.size); vkDestroyImage(g_vk.dev, v->img, NULL); free(v); return NULL; }
