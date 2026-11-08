@@ -25,6 +25,7 @@
 #include "nvn_fmt_mtl.h"
 #include "gfx_vk.h"
 #include "spv_readonly.h"
+#include "nvn_fstep.h"   // FSTEP_FIT: the performance hint's target (hint_frame)
 #include <stdatomic.h>
 #include <math.h>
 #define BCDEC_IMPLEMENTATION
@@ -422,6 +423,7 @@ static pthread_mutex_t g_fmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t 
 static void *chunk_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-done");
     uint64_t last = 0;   // the GPU time the previous chunk ended (g_fgpu: each chunk counts its span after it)
+    void dm_android_hint_thread(int32_t tid); dm_android_hint_thread(gettid());   // in the performance hint session (plat_android.c): the replay waits for its write-backs
     for (;;) {
         pthread_mutex_lock(&g_cmu); while (!g_fifo_n) pthread_cond_wait(&g_ccv, &g_cmu); chunk *c = g_fifo[0]; pthread_mutex_unlock(&g_cmu);
         VkResult fr = vkWaitForFences(g_vk.dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
@@ -1068,7 +1070,41 @@ static void post(post_op o) {   // done when the current chunk completes, after 
     if (C->npost == C->cappost) { C->cappost = C->cappost ? 2 * C->cappost : 64; C->post = realloc(C->post, C->cappost * sizeof *C->post); }
     C->post[C->npost++] = o;
 }
-void mtl_sub_begin(void) { pthread_mutex_lock(&g_bk); }
+// ---------------- The frame's work, for the performance hint (plat_android.c dm_android_hint_frame) ----------------
+// Present to present, from the end of the last present's pacing sleep to the start of this one's, less the acquires' pacing waits in between (hle_nvn.c dm_acquire_paced):
+// the frame step's cost (fstep_tick: the time between frame starts less the acquire's wait) with mtl_present's own sleep left out as well. That sleep counted as work,
+// so at hold 3 the cost was 3 vsyncs whatever the work (Breath of the Wild on an Ayn Odin 2: about 43 ms of work and about 7 ms asleep in present per 50 ms frame);
+// reported to the hint, it would have asked for full boost at any load. Wall clock, as the hint's contract asks: the replay's waits for the GPU (about 5 ms a
+// frame there) are part of the frame. The threads that acquired or replayed since the last present go with it, so the session follows the threads doing the work
+static _Atomic uint64_t g_hint_paced, g_hint_gen = 1;   // the acquires' pacing since the last present; presents so far (+ 1), for hint_note
+static pthread_mutex_t g_hint_mu = PTHREAD_MUTEX_INITIALIZER; static int32_t g_hint_tid[3]; static int g_hint_ntid;
+static void hint_note(void) {   // the calling thread works on this frame (once per thread and frame)
+    static __thread uint64_t seen; uint64_t g = atomic_load_explicit(&g_hint_gen, memory_order_relaxed);
+    if (seen == g) return;
+    seen = g; int32_t t = gettid();
+    pthread_mutex_lock(&g_hint_mu);
+    int i = 0; while (i < g_hint_ntid && g_hint_tid[i] != t) i++;
+    if (i == g_hint_ntid && i < 3) g_hint_tid[g_hint_ntid++] = t;
+    pthread_mutex_unlock(&g_hint_mu);
+}
+void dm_acquire_paced(uint64_t ns) { atomic_fetch_add_explicit(&g_hint_paced, ns, memory_order_relaxed); hint_note(); }
+// The frame's deadline, the target that work is held against, follows the frame step's hold (hle_nvn.c nvn_fstep_hold, read here after fstep_tick decided this frame's): the cost
+// its fit trial needs to try the next hold down, FSTEP_FIT × (k − 1) vsyncs, and at kmin the same share of kmin, the margin that keeps it. The declared period (rt_period_ns) is
+// kmin's whatever the hold: at Breath of the Wild's hold 3 on the Odin 2 it put 16.7 ms against about 43 ms of work, every frame about 2.6 times over, which holds a session at
+// full boost for as long as the hold is raised, at any load and through thermal mitigation: its answer no longer depends on the work. Aimed at k − 1 it asks for what the next hold
+// takes (28.3 ms at hold 3, 14.2 ms at holds 2 and 1 at a 60 fps cap; 28.3 ms at a 30 cap), so it eases off once the work fits it, and with the full k − 1 instead the work
+// would settle just above what the fit trial accepts and stay boosted at hold k. The frame step sees that cost once its own cost leaves the present's sleep out (plan A1).
+// Without the frame step (no cap, the game's own step) the target is the declared period. *thermal: the thermal cap holds 30 fps (plat_android.c closes the session then)
+static void hint_frame(uint64_t now, uint64_t from) {   // the present thread, before its pacing sleep; from: when the last one ended (0 = no present yet)
+    void dm_android_hint_frame(uint64_t work_ns, const int32_t *tids, int n, uint64_t hold_ns, int thermal);
+    uint64_t nvn_fstep_hold(int *k, int *kmin, int *thermal);
+    int32_t t[3]; pthread_mutex_lock(&g_hint_mu); int n = g_hint_ntid; memcpy(t, g_hint_tid, sizeof t); g_hint_ntid = 0; pthread_mutex_unlock(&g_hint_mu);
+    atomic_fetch_add_explicit(&g_hint_gen, 1, memory_order_relaxed);
+    uint64_t paced = atomic_exchange_explicit(&g_hint_paced, 0, memory_order_relaxed), span = from && now > from ? now - from : 0;
+    int k, kmin, th; uint64_t vs = nvn_fstep_hold(&k, &kmin, &th), hold = vs ? (uint64_t)(FSTEP_FIT * (k - 1 > kmin ? k - 1 : kmin) * (double)vs) : 0;
+    dm_android_hint_frame(span > paced && span < 1000000000ull ? span - paced : 0, t, n, hold, th);   // a second or more since the last present (loading, the app in the background) is no frame
+}
+void mtl_sub_begin(void) { pthread_mutex_lock(&g_bk); hint_note(); }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 // Buffer copies and fills: done on the CPU (GPU address = CPU address). A large one goes to the completion thread, in its place in the queue, so the submitting
@@ -1303,7 +1339,7 @@ uint64_t mtl_present_slept_ns(uint64_t *end_ns) {
     return on ? g_psleep_ns : 0;
 }
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
-    static uint64_t next;
+    static uint64_t next, slept;   // slept: when the last present's pacing sleep ended, where the next frame's work starts (hint_frame)
     pthread_mutex_lock(&g_bk);
     vtex *v = vt_get(t); flush();
     dump_poll(atomic_load(&g_presents)); prof_poll(atomic_load(&g_presents)); mid_poll(atomic_load(&g_presents));
@@ -1320,8 +1356,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     pthread_mutex_unlock(&g_bk);
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), per = period_s > 0 ? (uint64_t)(period_s * 1e9) : 16666667ull;
+    hint_frame(now, slept);
     if (next > now && next - now < 1000000000ull) { mach_wait_until(next); g_psleep_end = clock_gettime_nsec_np(CLOCK_MONOTONIC); g_psleep_ns = g_psleep_end - now; } else { next = now; g_psleep_ns = 0; }
-    next += per;
+    next += per; slept = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     void front_android_present(const tex_t *t, const int crop[4]); front_android_present(t, crop);
     return atomic_fetch_add(&g_presents, 1) + 1;
 }

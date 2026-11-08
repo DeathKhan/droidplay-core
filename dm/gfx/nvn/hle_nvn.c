@@ -1306,6 +1306,7 @@ __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n =
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 __attribute__((weak)) void dm_yield_top(char *out, size_t n) { if (n) snprintf(out, n, "-"); }   // hle_thread.c: the threads that yielded most since the last call; none in graphics unit tests
 __attribute__((weak)) void dm_thread_cpu(char *out, size_t n, double secs) { (void)secs; if (n) snprintf(out, n, "-"); }   // hle_thread.c: guest-thread CPU by Switch priority band since the last call
+__attribute__((weak)) void dm_acquire_paced(uint64_t ns) { (void)ns; }   // each acquire's pacing wait: Android's performance hint (gfx_vk.c) leaves it out of the frame's work; nothing on Apple
 void mtl_res_stats(char *out, size_t n);
 void mtl_barrier_stats(uint64_t *skip, uint64_t *full);
 extern uint32_t mtl_present_qos(void);
@@ -1351,6 +1352,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
     pace_ns += mtl_snap_acquire_wait();   // ring capacity is waited for at acquire, where the game does not hold its present lock
+    dm_acquire_paced(pace_ns);
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
@@ -1694,6 +1696,16 @@ static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
     if (!period || !c || !fstep_on() || __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED)) return period;
     int kmin = 60 / c;
     return present_itv(o) > kmin ? (uint64_t)kmin * 1000000000ull / (uint64_t)g_hz : period;
+}
+// The frame step's hold, for a platform whose frame deadline is a target the system holds the frame's measured work against (Android's performance hint session, gfx_vk.c
+// hint_frame, which follows the hold with it; nothing on Apple calls it): returns the vsync in ns and sets the hold in force and kmin in vsyncs, or returns 0 while the host does
+// not decide the hold (no frame step cap, the game's own step, uncapped presents), where the deadline stays the declared period (rt_period_ns). *thermal: the thermal cap holds 30 fps
+uint64_t nvn_fstep_hold(int *k, int *kmin, int *thermal) {
+    int c = fps_step_cap(), h = atomic_load(&g_fs_k);
+    *thermal = c && thermal_capped(); *k = *kmin = 0;
+    if (!c || g_hz <= 0 || __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED)) return 0;
+    *kmin = 60 / c; *k = h > *kmin ? h : *kmin;
+    return 1000000000ull / (uint64_t)g_hz;
 }
 // Whether the CPU runs below its speed for reasons other than heat (nvn_fstep_next's slow, which allows probes): under 30% of the process's CPU time on performance cores in
 // each of the last two windows of 30 presents, on a system with two core types, at thermal state nominal or fair, Low Power Mode off. A game that waits out a long hold is parked

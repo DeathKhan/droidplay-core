@@ -59,6 +59,207 @@ static __thread qos_class_t t_qos;
 int dm_android_qos_set(qos_class_t q) { t_qos = q; setpriority(PRIO_PROCESS, (id_t)gettid(), dm_qos_nice(q)); return 0; }
 qos_class_t dm_android_qos_get(void) { return t_qos ? t_qos : QOS_CLASS_DEFAULT; }
 
+// ---- The frame's deadline: an Android Performance Hint session (ADPF) for the threads that do each frame's work ----
+// The time-constraint declaration (hle_nvn.c set_time_constraint, through compat mach/thread_policy.h) is how the host tells the system the frame's deadline: the present
+// period, or the cap's while the frame step holds frames longer for late ones (rt_period_ns: a longer hold declared parked an iPhone on its efficiency cores). Android had
+// no taker for it, and the governor sized the clock to the hold: Breath of the Wild 1.9.0 on an Ayn Odin 2 (Snapdragon 8 Gen 2, Android 13) at hold 3 kept its Presentation
+// thread about 80% busy, 86% of it on the gold cores, while the Cortex-X3 (cpu7) sat idle 88% of the time, and when the mtl_addr fix cut the replay from 117 M to 97 M cycles
+// a frame its CPU time stayed at 37 ms and the game at 20 fps: the clock fell to fill the same 50 ms. A hint session (APerformanceHint, API 33, through dlsym: the build targets
+// API 29) holds every present's report of the frame's work (gfx_vk.c hint_frame: present to present without the pacing sleeps) against a target, and the power HAL raises the
+// threads' clock and placement (uclamp.min) while the work runs over it. The target: under the frame step, the cost its fit trial needs to try the next hold down (gfx_vk.c
+// hint_frame, from hle_nvn.c nvn_fstep_hold), so it follows the hold and the boost scales with the gap to the next hold; otherwise the declared period. Its threads: the ones
+// that acquired, replayed or presented the frame, and the replay's completion thread (gfx_vk.c vk-done: the write-backs the replay waits for). Android 13 has no
+// APerformanceHint_setThreads, so frames that run on another set for HINT_STABLE presents in a row get a new session. No thread is pinned to a core.
+// A new session is made before the one it replaces is closed, so a make that fails (a binder or power HAL error, a thread that exited before the system took it) leaves the old
+// one and its threads in place. Before, the old one was closed first: one failure left the process with no session for the rest of the run, as frames on the same threads never
+// asked again. A failed make is tried again after HINT_STABLE presents, doubling, and after HINT_TRIES failures in a row no more (logged). A power HAL without hint sessions
+// reports a preferred rate of −1 (HintManagerService isHalSupported), and no session is tried then.
+// Thermal: while the device is serious or worse (dm_thermal_now() >= 2) or the frame step's thermal cap holds 30 fps, the session is closed (Android 13 has no pause, and how long a
+// session keeps its boost without reports is up to the power HAL). At severe the cap gives Breath of the Wild a 33.3 ms hold and a 28.3 ms target that its 43 ms of work overruns,
+// so the hint would keep asking for full boost (the Cortex-X3) exactly while the cap is meant to let the device cool. A session comes back after HINT_STABLE presents in a row
+// with neither.
+// DM_VK_ADPF=0: no session, the declaration fails as before; DM_VK_ADPF_HOLD=0: the target is the declared period whatever the hold (rt_period_ns: kmin's while the hold is
+// raised); DM_VK_ADPF_THERMAL=0: the session stays through thermal mitigation; DM_VK_ADPF_DONE=0: the completion thread is left out; DM_VK_ADPF_LOG=1: the reported work every
+// 300 presents and each change of the target
+#include <dlfcn.h>
+#include <android/api-level.h>
+typedef struct APerformanceHintManager APerformanceHintManager;
+typedef struct APerformanceHintSession APerformanceHintSession;
+static struct {
+    APerformanceHintManager *(*manager)(void);
+    APerformanceHintSession *(*create)(APerformanceHintManager *, const int32_t *, size_t, int64_t);
+    int64_t (*rate)(APerformanceHintManager *);
+    int (*target)(APerformanceHintSession *, int64_t);
+    int (*report)(APerformanceHintSession *, int64_t);
+    void (*close)(APerformanceHintSession *);
+} g_ph;
+enum { HINT_MAXT = 6, HINT_STABLE = 60, HINT_TRIES = 6 };
+static pthread_mutex_t g_hint_mu = PTHREAD_MUTEX_INITIALIZER;   // everything below; a session is not thread-safe
+static int g_hint_on;   // 0 = not looked at yet (nothing declared), 1 = sessions can be made, −1 = none (DM_VK_ADPF=0, Android before 13, no manager, a power HAL without
+                        // hint sessions, or HINT_TRIES failed makes in a row with no session left)
+static APerformanceHintManager *g_hint_mgr; static APerformanceHintSession *g_hint;
+static int64_t g_hint_target, g_hint_decl, g_hint_hold; static uint64_t g_hint_comp;   // the session's target; the declared period and computation; the frame step's target (0 = none); ns
+static int32_t g_hint_done;   // the replay's completion thread (0 = none yet)
+static int32_t g_hint_t[HINT_MAXT]; static int g_hint_nt;   // the session's threads (sorted)
+static int32_t g_hint_w[HINT_MAXT]; static int g_hint_nw, g_hint_same;   // another set the frames ran on, and for how many presents in a row
+static int g_hint_fail, g_hint_wait;   // failed makes in a row; presents before the next try (−1 = no more tries)
+static int g_hint_hot, g_hint_cool;   // 1: the session is closed for heat; presents in a row since the device was last serious or capped
+static unsigned g_hint_made, g_hint_nfail, g_hint_err, g_hint_nhot;
+static int hint_env_on(const char *name) { const char *e = getenv(name); return !(e && !strcmp(e, "0")); }
+static int hint_done_on(void) { static int v = -1; if (v < 0) v = hint_env_on("DM_VK_ADPF_DONE"); return v; }
+static int hint_hold_on(void) { static int v = -1; if (v < 0) v = hint_env_on("DM_VK_ADPF_HOLD"); return v; }
+static int hint_thermal_on(void) { static int v = -1; if (v < 0) v = hint_env_on("DM_VK_ADPF_THERMAL"); return v; }
+static int hint_log_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_ADPF_LOG"); v = e && atoi(e); } return v; }
+static int hint_load(void) {   // under g_hint_mu
+    if (g_hint_on) return g_hint_on > 0;
+    g_hint_on = -1;
+    if (!hint_env_on("DM_VK_ADPF")) { LOG("[hint] DM_VK_ADPF=0: no performance hint session, the frame's deadline is declared to no one"); return 0; }
+    void *h = dlopen("libandroid.so", RTLD_NOW);
+#define PH_SYM(f, name) g_ph.f = h ? (__typeof__(g_ph.f))dlsym(h, name) : NULL
+    PH_SYM(manager, "APerformanceHint_getManager"); PH_SYM(create, "APerformanceHint_createSession"); PH_SYM(rate, "APerformanceHint_getPreferredUpdateRateNanos");
+    PH_SYM(target, "APerformanceHint_updateTargetWorkDuration"); PH_SYM(report, "APerformanceHint_reportActualWorkDuration"); PH_SYM(close, "APerformanceHint_closeSession");
+#undef PH_SYM
+    if (!g_ph.manager || !g_ph.create || !g_ph.rate || !g_ph.target || !g_ph.report || !g_ph.close) {
+        LOG("[hint] no performance hint session: Android API %d has no APerformanceHint (it came with 33)", android_get_device_api_level()); return 0; }
+    if (!(g_hint_mgr = g_ph.manager())) { LOG("[hint] no performance hint session: APerformanceHint_getManager returned none"); return 0; }
+    int64_t r = g_ph.rate(g_hint_mgr);
+    if (r < 0) { LOG("[hint] no performance hint session: the power HAL has none (preferred report rate %lld)", (long long)r); return 0; }
+    g_hint_on = 1; return 1;
+}
+static int hint_add(int32_t *t, int n, int32_t tid) {   // into a sorted set of at most HINT_MAXT threads
+    if (tid <= 0 || n >= HINT_MAXT) return n;
+    int i = 0; while (i < n && t[i] < tid) i++;
+    if (i < n && t[i] == tid) return n;
+    memmove(t + i + 1, t + i, (size_t)(n - i) * sizeof *t); t[i] = tid; return n + 1;
+}
+static int hint_eq(const int32_t *a, int na, const int32_t *b, int nb) { return na == nb && !memcmp(a, b, (size_t)na * sizeof *a); }
+// Under g_hint_mu: a session for these threads in place of the one there is, closed only once the new one exists. A failed make keeps the old session and its threads, and the
+// next try waits HINT_STABLE presents, doubling (hint_due); after HINT_TRIES failures in a row there are no more, and with no session left the declaration fails from then on
+static int hint_make(const int32_t *t, int n) {
+    if (!n || g_hint_target <= 0) return 0;
+    char ids[96]; size_t o = 0; ids[0] = 0;
+    for (int i = 0; i < n && o < sizeof ids - 16; i++) o += snprintf(ids + o, sizeof ids - o, "%s%d", i ? ", " : "", t[i]);
+    APerformanceHintSession *s = g_ph.create(g_hint_mgr, t, (size_t)n, g_hint_target);
+    if (!s) {
+        if (++g_hint_fail >= HINT_TRIES) {
+            g_hint_wait = -1; if (!g_hint) g_hint_on = -1;
+            LOG("[hint] the system made no performance hint session for threads %s (target %.3f ms) %d times in a row: no more tries, %s", ids, g_hint_target / 1e6, g_hint_fail,
+                g_hint ? "the session there is keeps its threads" : "the frame's deadline is declared to no one from here on");
+        } else {
+            g_hint_wait = HINT_STABLE << (g_hint_fail - 1);
+            if (g_hint_nfail++ < 8) LOG("[hint] the system made no performance hint session for threads %s (target %.3f ms; failure %d of %d in a row), %s; next try in %d presents",
+                                         ids, g_hint_target / 1e6, g_hint_fail, HINT_TRIES, g_hint ? "the session there is stays" : "none for now", g_hint_wait);
+        }
+        return 0;
+    }
+    if (g_hint) g_ph.close(g_hint);
+    g_hint = s; memcpy(g_hint_t, t, (size_t)n * sizeof *t); g_hint_nt = n; g_hint_fail = g_hint_wait = g_hint_same = 0;
+    if (g_hint_made++ < 8) LOG("[hint] performance hint session made for threads %s: target %.3f ms, preferred report rate %.3f ms (DM_VK_ADPF=0 turns it off)%s",
+                               ids, g_hint_target / 1e6, g_ph.rate(g_hint_mgr) / 1e6, g_hint_made == 8 ? "; further sessions not logged" : "");
+    return 1;
+}
+static int hint_due(void) { if (g_hint_wait > 0) g_hint_wait--; return !g_hint_wait; }   // under g_hint_mu, once per present that wants a make: whether a failed make's wait is over
+static void hint_retarget(void) {   // under g_hint_mu: the frame step's target while it decides the hold, else the declared period
+    int64_t t = g_hint_hold > 0 ? g_hint_hold : g_hint_decl;
+    if (t == g_hint_target) return;
+    static unsigned nlog;
+    if (hint_log_on() && g_hint_target > 0 && nlog++ < 40) LOG("[hint] target %.3f → %.3f ms (%s)%s", g_hint_target / 1e6, t / 1e6, g_hint_hold > 0 ? "the frame step's hold" : "the declared period", nlog == 40 ? "; further changes not logged" : "");
+    g_hint_target = t;
+    if (g_hint && t > 0) { int r = g_ph.target(g_hint, t); if (r && g_hint_err++ < 4) LOG("[hint] setting the target to %.3f ms failed (%d)", t / 1e6, r); }
+}
+// compat mach/thread_policy.h thread_policy_set: the declaring thread's period becomes the target (unless the frame step's is in force); the first declaration makes the session
+// (with the completion thread when it exists). Accepted while the session is closed for heat: it comes back with the declared deadline
+kern_return_t dm_android_rt_declare(mach_port_t t, uint64_t period_ns, uint64_t comp_ns) {
+    pthread_mutex_lock(&g_hint_mu);
+    if (period_ns && hint_load()) {
+        g_hint_comp = comp_ns; g_hint_decl = (int64_t)period_ns; hint_retarget();
+        if (!g_hint && !g_hint_hot && !g_hint_made && !g_hint_fail) { int32_t s[HINT_MAXT]; int n = hint_add(s, 0, (int32_t)t); if (hint_done_on()) n = hint_add(s, n, g_hint_done); hint_make(s, n); }
+    }
+    kern_return_t kr = g_hint || (g_hint_on > 0 && g_hint_hot) ? KERN_SUCCESS : KERN_FAILURE;
+    pthread_mutex_unlock(&g_hint_mu);
+    return kr;
+}
+int dm_android_rt_declared(mach_port_t t, uint64_t *period_ns, uint64_t *comp_ns) {   // thread_policy_get: whether thread t is in a session, and what was declared
+    pthread_mutex_lock(&g_hint_mu);
+    int in = 0; for (int i = 0; g_hint && i < g_hint_nt; i++) in |= g_hint_t[i] == (int32_t)t;
+    if (in) { *period_ns = (uint64_t)g_hint_decl; *comp_ns = g_hint_comp; }
+    pthread_mutex_unlock(&g_hint_mu);
+    return in;
+}
+void dm_android_hint_thread(int32_t tid) { pthread_mutex_lock(&g_hint_mu); g_hint_done = tid; pthread_mutex_unlock(&g_hint_mu); }   // gfx_vk.c chunk_thread
+int dm_thermal_now(void);
+// gfx_vk.c hint_frame, on the present thread once per present: the frame's work (0 = none to report), the other threads that acquired or replayed it, the frame step's target
+// (0 = it does not decide the hold) and whether its thermal cap holds 30 fps
+void dm_android_hint_frame(uint64_t work_ns, const int32_t *tids, int n, uint64_t hold_ns, int thermal) {
+    pthread_mutex_lock(&g_hint_mu);
+    if (g_hint_on > 0) { g_hint_hold = hint_hold_on() ? (int64_t)hold_ns : 0; hint_retarget(); }
+    if (g_hint_on > 0 && g_hint_target > 0) {
+        int32_t w[HINT_MAXT]; int nw = hint_add(w, 0, gettid());
+        for (int i = 0; i < n; i++) nw = hint_add(w, nw, tids[i]);
+        if (hint_done_on()) nw = hint_add(w, nw, g_hint_done);
+        int th = hint_thermal_on() ? dm_thermal_now() : -1;
+        if (hint_thermal_on() && (thermal || th >= 2)) {   // thermally serious, or the frame step's thermal cap: no session until that has passed
+            g_hint_cool = 0;
+            if (!g_hint_hot) {
+                g_hint_hot = 1; g_hint_same = 0;
+                if (g_hint) { g_ph.close(g_hint); g_hint = NULL; }
+                if (g_hint_nhot++ < 16) LOG("[hint] thermal state %d%s: the performance hint session is closed, no boost until neither holds for %d presents (DM_VK_ADPF_THERMAL=0 keeps it)%s",
+                                            th, thermal ? ", the frame step's thermal cap holds 30 fps" : "", HINT_STABLE, g_hint_nhot == 16 ? "; further closes not logged" : "");
+            }
+        } else if (g_hint_hot) {
+            if (++g_hint_cool >= HINT_STABLE) {
+                g_hint_hot = 0; g_hint_fail = g_hint_wait = 0;
+                if (g_hint_nhot < 16) LOG("[hint] thermal state %d and no thermal cap for %d presents: a performance hint session again", th, HINT_STABLE);
+                hint_make(w, nw);
+            }
+        } else if (!g_hint) { if (hint_due()) hint_make(w, nw); }   // none: the declaration's make failed, or the last one did
+        else if (!hint_eq(w, nw, g_hint_t, g_hint_nt)) {   // a frame on other threads than the session's: a new session once that holds
+            if (hint_eq(w, nw, g_hint_w, g_hint_nw)) { if (g_hint_same < HINT_STABLE) g_hint_same++; } else { memcpy(g_hint_w, w, (size_t)nw * sizeof *w); g_hint_nw = nw; g_hint_same = 1; }
+            if (g_hint_same >= HINT_STABLE && hint_due()) hint_make(w, nw);
+        } else g_hint_same = 0;
+        if (g_hint && work_ns) {
+            int r = g_ph.report(g_hint, (int64_t)work_ns);
+            if (r && g_hint_err++ < 4) LOG("[hint] reporting the frame's work failed (%d)", r);
+            static unsigned nf, over; static double sum, mx;
+            if (hint_log_on()) { double ms = work_ns / 1e6; sum += ms; if (ms > mx) mx = ms; over += (int64_t)work_ns > g_hint_target;
+                if (++nf == 300) { LOG("[hint] frame work reported over the last 300 presents: mean %.2f ms, max %.2f ms, %u over the target (now %.3f ms)", sum / nf, mx, over, g_hint_target / 1e6); nf = over = 0; sum = mx = 0; } }
+        }
+    }
+    pthread_mutex_unlock(&g_hint_mu);
+}
+
+// ---- Thermal status: hle_nvn.c dm_thermal_now, in iOS's NSProcessInfo thermalState terms (0 nominal, 1 fair, 2 serious, 3 critical; −1 unknown) ----
+// AThermal (API 30) through dlsym. NONE 0; LIGHT and MODERATE 1 (Android: throttling "where UX is not largely impacted"); SEVERE 2, where the frame step's thermal cap holds
+// 30 fps (hle_nvn.c thermal_capped); CRITICAL and above 3. Probes and the GPU-slowed signal stay allowed up to 1. Read at most once a second, as each read is a binder call
+// (thermal_capped asks once a second, the performance hint every present, the probe gates and the power lines too). From 2 the performance hint closes its session
+// (dm_android_hint_frame), so it does not run the Odin 2's Cortex-X3 flat out while the cap lets the device cool.
+// DM_VK_THERMAL=0: no thermal state (−1) as before; DM_THERMAL_CAP=0 keeps the state and turns only the cap off
+typedef struct AThermalManager AThermalManager;
+static AThermalManager *g_th_mgr; static int (*g_th_status)(AThermalManager *);
+static void thermal_load(void) {
+    const char *e = getenv("DM_VK_THERMAL");
+    if (e && !strcmp(e, "0")) { LOG("[thermal] DM_VK_THERMAL=0: no thermal state (the frame step's thermal cap stays off)"); return; }
+    void *h = dlopen("libandroid.so", RTLD_NOW);
+    AThermalManager *(*acquire)(void) = h ? (AThermalManager *(*)(void))dlsym(h, "AThermal_acquireManager") : NULL;
+    g_th_status = h ? (int (*)(AThermalManager *))dlsym(h, "AThermal_getCurrentThermalStatus") : NULL;
+    if (acquire && g_th_status) g_th_mgr = acquire();
+    if (!g_th_mgr) { g_th_status = NULL; LOG("[thermal] no thermal state: Android API %d has no AThermal manager (it came with 30)", android_get_device_api_level()); }
+}
+int dm_thermal_now(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT; static _Atomic int v = -1; static _Atomic uint64_t last; static int was = -2; static unsigned nlog;
+    pthread_once(&once, thermal_load);
+    if (!g_th_status) return -1;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), l = atomic_load(&last);
+    if ((!l || now - l >= 1000000000ull) && atomic_compare_exchange_strong(&last, &l, now)) {   // one reader at a time; the others take the last state
+        static const char *const name[] = {"none", "light", "moderate", "severe", "critical", "emergency", "shutdown"};
+        int s = g_th_status(g_th_mgr), m = s < 0 ? -1 : s == 0 ? 0 : s <= 2 ? 1 : s == 3 ? 2 : 3;
+        atomic_store(&v, m);
+        if (s != was && nlog++ < 64) LOG("[thermal] Android thermal status %d (%s): thermal state %d%s", s, s >= 0 && s <= 6 ? name[s] : "error", m, nlog == 64 ? "; further changes not logged" : "");
+        was = s;
+    }
+    return atomic_load(&v);
+}
+
 // The usable stack, as Darwin's pthread_get_stackaddr_np / pthread_get_stacksize_np give it. Bionic's range for a pthread_create thread starts at its mapping, guard page(s) included:
 // QueryMemory reported that unreadable page as the start of the main thread's stack, and Unity's conservative GC, which scans the whole stack it was told of, faulted on it
 // at the first collection (Danganronpa V3, main+0x2194c4 under GC mark, an address 8 MB below sp).
