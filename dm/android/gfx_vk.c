@@ -149,6 +149,7 @@ typedef struct chunk {
     VkQueryPool qp; int nq; uint64_t qg[1024];   // occlusion queries begun in it: query i counts NVN samples-passed slot qg[i] (occl_* below)
     VkQueryPool pq; int npq;   // render pass timestamps of a profiled frame (prof_* in gfx_vk_draw.inc)
     VkQueryPool tq; int ntq; uint64_t t_end;   // timestamps of the game's counter reports (kind 4 posts); the GPU time the chunk ended (g_tsq)   // hold: a later chunk reads this one's arena on the GPU (gfx_vk_draw.inc fwd_find): kept busy (held) until that one completes   // ndraw: draws and dispatches recorded (early submission: mtl_exec)   // ts: GPU timestamps written at its start and end (g_tsq)
+    uint64_t gf; int gtag;   // gtag: its GPU time counts toward frame gf's (g_fgpu, mtl_gpu_ms)
     stg_t *stg; int nstg, capstg; wb_t *wb; int nwb, capwb; post_op *post; int npost, cappost; dead_t *dead; int ndead, capdead; cop_t *cop; int ncop, capcop;
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
     VkDescriptorPool *dp; int ndp, cdp, dp_cur; VkBufferView *bv; int nbv, cbv;
@@ -187,9 +188,33 @@ static int chunk_make(chunk *c) {
 // GPU time: each chunk's command buffer writes a timestamp at its start and its end; the completion thread adds up the differences (the chunks run one after
 // another on the queue, so the sum is the GPU's busy time). Logged with the memory line every 300 frames (mtl_mem_stat)
 static VkQueryPool g_tsq; static _Atomic uint64_t g_gpu_ns, g_gpu_chunks;
+// GPU time per frame (mtl_gpu_ms), as nvn_mtl.m keeps it: a chunk counts toward the frame current when it is submitted (mtl_set_frame comes after the present that flushed the frame's
+// last chunk), and a frame's time is known once all its chunks have completed. Each chunk adds the part of its span after the previous chunk's end (one queue: the union of the spans is
+// the GPU's busy time, even if a TOP_OF_PIPE timestamp were written while the chunk before still ran). It is the frame step's GPU term (hle_nvn.c fstep_tick: cost = max(CPU, GPU));
+// mtl_gpu_ms returned -1 here, so the cost was the CPU's alone, and once the present's grid sleep left the cost (mtl_present_slept_ns) a GPU-bound frame whose CPU part fitted k - 1
+// would have started a trial the GPU cannot hold (Breath of the Wild on an Ayn Odin 2: GPU busy 19.5-20.6 ms a frame at hold 3, CPU about 43 ms). It also fills the timing line's GPU
+// column and the long-frame lines. DM_VK_FRAME_GPU=0: no GPU time per frame (mtl_gpu_ms -1, as before)
+enum { FGPU = 64 };   // frames kept (hle_nvn.c reads up to 8 back)
+static struct { _Atomic uint64_t frame, ns; _Atomic int pending; } g_fgpu[FGPU];   // frame + 1 (0 = none), its busy time so far, its chunks not completed yet
+static _Atomic uint64_t g_cur_frame; static _Atomic int g_fgpu_on = -1;
+static int fgpu_on(void) {
+    if (g_fgpu_on < 0) { const char *e = getenv("DM_VK_FRAME_GPU"); g_fgpu_on = !(e && !strcmp(e, "0")); if (!g_fgpu_on) LOG("[vk] DM_VK_FRAME_GPU=0: no GPU time per frame (the frame step's cost is the CPU's alone)"); }
+    return g_fgpu_on;
+}
+static void fgpu_begin(uint64_t f) {   // under g_cmu, before the chunk goes to the completion thread; pending is set before the frame, so a reader never sees a new frame complete
+    unsigned k = f % FGPU;
+    if (atomic_load(&g_fgpu[k].frame) != f + 1) { atomic_store(&g_fgpu[k].pending, 1); atomic_store(&g_fgpu[k].ns, 0); atomic_store(&g_fgpu[k].frame, f + 1); }
+    else atomic_fetch_add(&g_fgpu[k].pending, 1);
+}
+static void fgpu_done(uint64_t f, uint64_t ns) {   // under g_cmu (completion thread)
+    unsigned k = f % FGPU;
+    if (atomic_load(&g_fgpu[k].frame) != f + 1) return;
+    atomic_fetch_add(&g_fgpu[k].ns, ns); atomic_fetch_sub(&g_fgpu[k].pending, 1);
+}
 static int chunks_init(void) {
     static int ok = -1; if (ok >= 0) return ok;
     ok = 0; if (!vkb()) return 0;
+    fgpu_on();
     if (g_vk.props.limits.timestampComputeAndGraphics) { VkQueryPoolCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * NCHUNK};
         if (vkCreateQueryPool(g_vk.dev, &qc, NULL, &g_tsq) != VK_SUCCESS) g_tsq = VK_NULL_HANDLE; else if (g_qreset) g_qreset(g_vk.dev, g_tsq, 0, 2 * NCHUNK); }
     for (int i = 0; i < NCHUNK; i++) if (!chunk_make(&g_ch[i])) { LOG("[RED] [vk] command buffers could not be made"); return 0; }
@@ -286,6 +311,7 @@ static uint64_t chunk_submit(uint64_t nvn_fence) {
     pthread_mutex_lock(&g_cmu);
     if (c->nwb) atomic_fetch_add(&g_inflight_wb, 1);
     if (c->ncop) atomic_fetch_add(&g_inflight_cop, 1);
+    if (c->ts && g_fgpu_on > 0) { c->gf = atomic_load(&g_cur_frame); c->gtag = 1; fgpu_begin(c->gf); }
     g_fifo[g_fifo_n++] = c; uint64_t seq = c->seq;
     pthread_cond_broadcast(&g_ccv);
     pthread_mutex_unlock(&g_cmu);
@@ -395,14 +421,17 @@ static _Atomic uint64_t g_fence, g_done, g_presents;
 static pthread_mutex_t g_fmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_fcv = PTHREAD_COND_INITIALIZER;
 static void *chunk_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-done");
+    uint64_t last = 0;   // the GPU time the previous chunk ended (g_fgpu: each chunk counts its span after it)
     for (;;) {
         pthread_mutex_lock(&g_cmu); while (!g_fifo_n) pthread_cond_wait(&g_ccv, &g_cmu); chunk *c = g_fifo[0]; pthread_mutex_unlock(&g_cmu);
         VkResult fr = vkWaitForFences(g_vk.dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
         int ts = c->ts, nq = c->nq, ntq = c->ntq, npq = c->npq;   // the queries it used, reset once read (qr_done): the counts are zeroed on the way
-        c->t_end = 0;
+        c->t_end = 0; uint64_t busy = 0;
         if (c->ts) { uint64_t t[2]; c->ts = 0;
             if (vkGetQueryPoolResults(g_vk.dev, g_tsq, 2 * (uint32_t)(c - g_ch), 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
-                { atomic_fetch_add(&g_gpu_ns, (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod)); atomic_fetch_add(&g_gpu_chunks, 1); c->t_end = t[1]; } }
+                { atomic_fetch_add(&g_gpu_ns, (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod)); atomic_fetch_add(&g_gpu_chunks, 1); c->t_end = t[1];
+                  uint64_t s = t[1] > last && t[0] < last ? last : t[0];   // from the previous chunk's end when it started before it; an end at or before that one (the counter started again) counts the whole span
+                  busy = (uint64_t)((double)(t[1] - s) * g_vk.props.limits.timestampPeriod); last = t[1]; } }
         int had_wb = c->nwb != 0, had_cop = c->ncop != 0;
         chunk_done(c); c->nwb = c->ncop = 0;
         if (c->nvn_fence) { pthread_mutex_lock(&g_fmu); if (atomic_load(&g_done) < c->nvn_fence) atomic_store(&g_done, c->nvn_fence); pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu); }
@@ -412,6 +441,7 @@ static void *chunk_thread(void *arg) {
         if (had_wb) atomic_fetch_sub(&g_inflight_wb, 1);
         if (had_cop) atomic_fetch_sub(&g_inflight_cop, 1);
         g_seq_done = c->seq;
+        if (c->gtag) { fgpu_done(c->gf, busy); c->gtag = 0; }
         if (c->hold > c->seq) c->held = 1; else { c->busy = 0; c->hold = 0; }
         for (int i = 0; i < NCHUNK; i++) if (g_ch[i].held && g_ch[i].hold <= g_seq_done) { g_ch[i].held = 0; g_ch[i].hold = 0; g_ch[i].busy = 0; }
         pthread_cond_broadcast(&g_ccv);
@@ -1261,6 +1291,17 @@ static pthread_mutex_t g_frame_mu = PTHREAD_MUTEX_INITIALIZER; static vkb_frame 
 int vkb_frame_lock(vkb_frame *f) { pthread_mutex_lock(&g_frame_mu); if (!g_frame.img) { pthread_mutex_unlock(&g_frame_mu); return 0; } *f = g_frame; return 1; }
 void vkb_frame_unlock(void) { pthread_mutex_unlock(&g_frame_mu); }
 void vkb_frame_forget(uint64_t serial) { pthread_mutex_lock(&g_frame_mu); if (g_frame_serial == serial) { memset(&g_frame, 0, sizeof g_frame); g_frame_serial = 0; } pthread_mutex_unlock(&g_frame_mu); }
+// The last present's sleep to its vsync grid (mtl_present, presenting thread): its length (0 = it did not sleep) and when it ended, on CLOCK_MONOTONIC (the host's now_ns)
+static uint64_t g_psleep_ns, g_psleep_end;
+// For the frame step (hle_nvn.c fstep_tick): that sleep is pacing, as the acquire's wait is, not the frame's work. Counted as work it made the cost the hold whatever the work, so the
+// hold could never come down: Breath of the Wild on an Ayn Odin 2 held 3 vsyncs for good with about 43 ms of work a frame (p50) and 7 ms asleep here (NVN submit+present p50 49.7 ms).
+// DM_VK_FSTEP_SLEEP=0 counts it as work again (the old accounting, for A/B)
+uint64_t mtl_present_slept_ns(uint64_t *end_ns) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_VK_FSTEP_SLEEP"); on = !(e && !strcmp(e, "0")); if (!on) LOG("[vk] DM_VK_FSTEP_SLEEP=0: the frame step counts the present's sleep to its vsync grid as the frame's work"); }
+    if (end_ns) *end_ns = on ? g_psleep_end : 0;
+    return on ? g_psleep_ns : 0;
+}
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     static uint64_t next;
     pthread_mutex_lock(&g_bk);
@@ -1279,7 +1320,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     pthread_mutex_unlock(&g_bk);
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), per = period_s > 0 ? (uint64_t)(period_s * 1e9) : 16666667ull;
-    if (next > now && next - now < 1000000000ull) mach_wait_until(next); else next = now;
+    if (next > now && next - now < 1000000000ull) { mach_wait_until(next); g_psleep_end = clock_gettime_nsec_np(CLOCK_MONOTONIC); g_psleep_ns = g_psleep_end - now; } else { next = now; g_psleep_ns = 0; }
     next += per;
     void front_android_present(const tex_t *t, const int crop[4]); front_android_present(t, crop);
     return atomic_fetch_add(&g_presents, 1) + 1;
@@ -1307,7 +1348,7 @@ void mtl_reg_image(int id, const tex_t *t, const view_t *v) {   // RegisterImage
 }
 unsigned mtl_cpu_tex_count(void) { return 0; }   // Metal's CPU-written texture set: the replay has none
 int mtl_link_tick(uint64_t n, double *target, double *lead_ms, int *ticks, double *gap_ms) { (void)n; (void)target; (void)lead_ms; (void)ticks; (void)gap_ms; return 0; }   // no display link
-void mtl_set_frame(uint64_t f) { (void)f; }
+void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); }   // the frame later chunks count toward (g_fgpu)
 int mtl_pso_prebuild_tool(void) { return 0; }
 
 // ---------------- Statistics the interface layer reads ----------------
@@ -1323,7 +1364,12 @@ uint64_t mtl_ds_omit(void) { return 0; }
 uint64_t mtl_drawable_ns_take(void) { return 0; }
 void mtl_bw(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = *c = 0; }
 uint64_t mtl_udc_saved_bytes(void) { return 0; }
-double mtl_gpu_ms(uint64_t f) { (void)f; return -1; }
+double mtl_gpu_ms(uint64_t f) {   // frame f's GPU busy time once all its chunks have completed; -1 until then, for a frame with no recorded chunk, or with DM_VK_FRAME_GPU=0
+    unsigned k = f % FGPU;
+    if (g_fgpu_on <= 0 || atomic_load(&g_fgpu[k].frame) != f + 1 || atomic_load(&g_fgpu[k].pending)) return -1;
+    double ms = (double)atomic_load(&g_fgpu[k].ns) / 1e6;
+    return atomic_load(&g_fgpu[k].frame) == f + 1 ? ms : -1;   // not taken by a later frame meanwhile
+}
 void mtl_ab_gpu(uint64_t f, double g, double fr) { (void)f; (void)g; (void)fr; }
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; (void)t0; (void)t1; return 0; }
 void mtl_ub_present(double iv) { (void)iv; }
