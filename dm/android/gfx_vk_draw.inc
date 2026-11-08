@@ -1476,6 +1476,32 @@ static int ucopy(const void *src, size_t n, size_t al, VkBuffer *b, VkDeviceSize
     if (e->shadow) { memcpy(e->shadow, src, n); e->src = src; e->n = n; e->seq = C->seq; e->b = *b; e->off = *off; } else e->src = NULL;
     return 1;
 }
+// ---- The program-to-shader memo (vk_draw_) ----
+// Which shader each stage of a draw takes depends on the five bound programs (D.bst) alone: prog_key reads the program's key record (hle_nvn.c pk_get, found by the program's
+// address), set at SetShaders or computed once at the first draw, and sh_get's table only grows (a vshader is never freed, a failed one stays failed). Resolving it again
+// for every draw (two g_pk_mu round trips and a CFDictionary lookup per program, a hex key, a hash and a 16-byte compare per stage, and stage_set's prog_c1 with g_pk_mu
+// again) cost Breath of the Wild on the Odin 2 about 3.2% of the replay thread (prog_key 1.15%, sh_get 1.1%, prog_c1 0.36%, the loop 0.5%: about 1.2 ms a frame), where
+// 90% of the draws bind the programs of the draw before. An entry is keyed on all five (program address, serial) pairs, as nvn_mtl.m bind_stages keys its ring: SetShaders
+// gives a program a new serial (nvn_new_serial), a by-value copy of an NVNprogram has another address (and its own key record, found by address), and a program of
+// serial 0 (initialized and never set: a struct the game wrote itself) is never memoized. Any Finalize or SetShaders (gfx_vk.c mtl_prog_release, which both call before they
+// drop or reset a key record) empties the memo (g_prog_gen), so an entry repeats what the key records held when it was made. Only a complete resolution is kept: a missing
+// shader, a tessellation stage or no vertex shader takes the full path every time, with its counters and logs. An entry holds the shaders, their stage index in the program
+// and each stage's c1 range (prog_c1), never a program pointer (pprog[slot] is D.bst[slot]) nor c1's bytes (stage_set copies them from the program's code every draw).
+// The replay alone uses it (mtl_exec, under g_bk). DM_VK_PROG_MEMO=0 (env.txt): resolved for every draw, as before
+static int prog_memo_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PROG_MEMO"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_PROG_MEMO=0: every draw resolves its programs' shaders"); } return v; }
+// DM_VK_MEMO_LOG=1 (env.txt; a diagnostic, off by default): the per-draw memos' counts in the periodic statistics (mtl_mem_stat), cumulative
+static int memo_log(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_MEMO_LOG"); v = e && *e && *e != '0'; } return v; }
+enum { PMEMO = 512 };   // direct-mapped by the pairs' hash: a frame of Breath of the Wild binds about 250 program pairs
+typedef struct { const prog_t *pr[5]; uint64_t ser[5], gen; vshader *sh[4]; int pst[4]; int8_t c1ok[4]; uint32_t c1[4][2]; } prog_memo_t;   // c1ok: prog_c1's result, -1 not asked
+static prog_memo_t g_pmemo[PMEMO]; static uint64_t g_pmemo_hit, g_pmemo_miss, g_pmemo_ser0;
+// the c1 ranges of the draw being made (vk_draw_ to stage_set, also its tf_capture): -1 when the memo has none for (pr, stage), else prog_c1's result into *o / *e
+static struct { const prog_t *pr; int st, ok; uint32_t o, e; } g_c1d[4]; static int g_c1d_on;
+static int c1_memo(const prog_t *pr, int st, uint32_t *o, uint32_t *e) {
+    if (!g_c1d_on) return -1;
+    for (int i = 0; i < 4; i++) if (g_c1d[i].pr == pr && g_c1d[i].st == st && g_c1d[i].ok >= 0) { *o = g_c1d[i].o; *e = g_c1d[i].e; return g_c1d[i].ok; }
+    return -1;
+}
+static int has_c1(const vshader *s) { for (int i = 0; i < s->ncb; i++) if (s->cb[i].slot == 1) return 1; return 0; }
 static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog_stage, uint32_t base_inst) {
     int nst = nvn_stage_of(s->stage);
     // one write per binding; every element of an array is written (an unwritten descriptor is undefined)
@@ -1500,8 +1526,8 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
         if (slot == 0) { bank_c0(nst, bank, base_inst); src = bank; n = 0x800; }
         else if (slot == 2) { if (!c2) bank_c2(nst, bank); src = c2 ? c2 : bank; n = C2_SIZE; }   // c2 read as a constant buffer: 81 of Breath of the Wild's 19,592 shaders, none of a measured frame's
         else if (slot == 1) {   // the shader's own constant segment, in its code memory: its bounds were read from the control section at SetShaders (gone by now: Danganronpa V3's movie shader read zeros)
-            const NVNshaderData *sd = pr && prog_stage >= 0 ? &pr->sd[prog_stage] : NULL; uint32_t o = 0, e = 0;
-            if (sd && sd->data && prog_c1(pr, (unsigned)prog_stage, &o, &e) && e > o && e - o <= 0x10000) { src = (const void *)(uintptr_t)(sd->data + o); n = e - o; }
+            const NVNshaderData *sd = pr && prog_stage >= 0 ? &pr->sd[prog_stage] : NULL; uint32_t o = 0, e = 0; int c1m;
+            if (sd && sd->data && ((c1m = c1_memo(pr, prog_stage, &o, &e)) >= 0 ? c1m : prog_c1(pr, (unsigned)prog_stage, &o, &e)) && e > o && e - o <= 0x10000) { src = (const void *)(uintptr_t)(sd->data + o); n = e - o; }
         } else if (slot >= 3 && slot - 3 < 16) { const p_bind_buf *u = &D.ubo[nst][slot - 3];
             if (u->addr && u->size) { src = (const void *)(uintptr_t)u->addr; n = u->size > 0x10000 ? 0x10000 : (size_t)u->size;
                 size_t rd = s->cb[i].ext && n > s->cb[i].ext ? s->cb[i].ext : n;   // in a memory pool still, as storage buffers below (else it reads 0)
@@ -1766,7 +1792,7 @@ static int ind_read(uint64_t addr, void *out, size_t n) {   // indirect argument
     if (!addr || !mtl_addr(addr, n, NULL, NULL)) { RED_ONCE(105, "indirect arguments at %#llx are in no memory pool: the draw is skipped", (unsigned long long)addr); return 0; }
     memcpy(out, (const void *)(uintptr_t)addr, n); return 1;
 }
-static int vk_draw__(const p_draw *dw, const p_draw_idx *di) { int r = vk_draw_(dw, di); g_drawing = 0; g_fwd_nwb = -1; return r; }
+static int vk_draw__(const p_draw *dw, const p_draw_idx *di) { int r = vk_draw_(dw, di); g_drawing = 0; g_fwd_nwb = -1; g_c1d_on = 0; return r; }
 // What a draw copies from guest memory lands first when an earlier draw, dispatch or copy wrote it and that write is still pending (gfx_vk.c ranges_view):
 // the vertex streams, the index buffer, each stage's uniform slots and storage buffers. A buffer texture or image reads memory found only in the texture
 // pool, so a shader with one syncs on anything pending (cpu_view). Called before anything of the draw is recorded
@@ -1818,6 +1844,17 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!g_d_init) draw_state_reset();
     if (!D.bst[0]) { RED_ONCE(95, "draw with no vertex program bound"); return 0; }
     pipe_key k; memset(&k, 0, sizeof k); int pst[4] = {-1, -1, -1, -1}; const prog_t *pprog[4] = {0};
+    prog_memo_t *pe = NULL; uint64_t pser[5] = {0}, pgen = 0;   // the program-to-shader memo (prog_memo_on): pe the entry of the bound programs
+    if (prog_memo_on()) {
+        pgen = atomic_load_explicit(&g_prog_gen, memory_order_acquire); uint64_t h = pgen; int ok = 1;
+        for (int b = 0; b < 5 && ok; b++) { const prog_t *pr = D.bst[b]; if (pr && !(pser[b] = pr->serial)) ok = 0; h = (h ^ (uintptr_t)pr ^ pser[b] * 0x9e3779b97f4a7c15ull) * 0xff51afd7ed558ccdull; }
+        if (!ok) g_pmemo_ser0++;
+        else if ((pe = &g_pmemo[(h >> 40) & (PMEMO - 1)])->gen == pgen && !memcmp(pe->pr, D.bst, sizeof pe->pr) && !memcmp(pe->ser, pser, sizeof pser)) {
+            for (int q = 0; q < 4; q++) { if ((k.sh[q] = pe->sh[q])) { pst[q] = pe->pst[q]; pprog[q] = D.bst[q]; }
+                g_c1d[q].pr = pprog[q]; g_c1d[q].st = pst[q]; g_c1d[q].ok = pe->c1ok[q]; g_c1d[q].o = pe->c1[q][0]; g_c1d[q].e = pe->c1[q][1]; }
+            g_c1d_on = 1; g_pmemo_hit++; goto resolved;
+        }
+    }
     for (int b = 0; b < 5; b++) {   // each bound program gives the stages it is bound for
         const prog_t *pr = D.bst[b]; if (!pr) continue;
         int dup = 0; for (int q = 0; q < b; q++) dup |= D.bst[q] == pr; if (dup) continue;
@@ -1832,6 +1869,14 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
         }
     }
     if (!k.sh[0]) { RED_ONCE(96, "draw with no vertex shader"); return 0; }
+    if (pe) {   // a complete resolution: kept, with the c1 ranges of the stages that read c1 (asked here instead of in stage_set)
+        memcpy(pe->pr, D.bst, sizeof pe->pr); memcpy(pe->ser, pser, sizeof pser); pe->gen = pgen;
+        for (int q = 0; q < 4; q++) { pe->sh[q] = k.sh[q]; pe->pst[q] = pst[q]; pe->c1ok[q] = -1; pe->c1[q][0] = pe->c1[q][1] = 0;
+            if (k.sh[q] && has_c1(k.sh[q])) pe->c1ok[q] = (int8_t)prog_c1(pprog[q], (unsigned)pst[q], &pe->c1[q][0], &pe->c1[q][1]);
+            g_c1d[q].pr = pprog[q]; g_c1d[q].st = pst[q]; g_c1d[q].ok = pe->c1ok[q]; g_c1d[q].o = pe->c1[q][0]; g_c1d[q].e = pe->c1[q][1]; }
+        g_c1d_on = 1; g_pmemo_miss++;
+    }
+    resolved:;
     draw_view(k.sh, di, 1);   // what this draw reads of guest memory: pending GPU writes to it land first
     if (D.rast_discard) return tf_capture(k.sh[0], pprog[0], pst[0], dw, di);   // the vertex stage only: a capture, or nothing
     for (int i = 0; i < 4; i++) if (k.sh[i]) stage_textures(k.sh[i]);

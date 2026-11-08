@@ -874,7 +874,10 @@ int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_bk); vtex *v = nv
 static void reg_tex(int id, const tex_t *t, const view_t *v); static void reg_samp(int id, const samp_par *p);   // gfx_vk_draw.inc
 void mtl_reg_tex(int id, const tex_t *t, const view_t *vw) { reg_tex(id, t, vw); }
 void mtl_reg_samp(int id, const samp_par *p) { reg_samp(id, p); }
-void mtl_prog_release(prog_t *p) { (void)p; }
+// hle_nvn.c calls it at a program's Finalize and SetShaders, before the program's key record (pk_get) is dropped or reset: the replay's program-to-shader memo
+// (gfx_vk_draw.inc prog_memo) holds what the key records said, so any of them changing empties it (the game's threads; read by the replay)
+static _Atomic uint64_t g_prog_gen = 1;
+void mtl_prog_release(prog_t *p) { (void)p; atomic_fetch_add_explicit(&g_prog_gen, 1, memory_order_release); }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 
 // ---------------- Copies ----------------
@@ -1435,6 +1438,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     LOG("[vk] constant and storage buffer copies: %llu reused, %llu made (cumulative; gfx_vk_draw.inc ucopy)", (unsigned long long)g_ucopy_hit, (unsigned long long)g_ucopy_miss);
     LOG("[vk] support buffer: %llu stages wrote it, %llu left it unwritten (no module reads binding 0) (cumulative; gfx_vk_draw.inc stage_set)", (unsigned long long)g_sup_written, (unsigned long long)g_sup_skipped);
     if (c2_check()) LOG("[vk] c2 check: %llu handle words compared with c2_word, %llu differed (cumulative; gfx_vk_draw.inc bank_word)", (unsigned long long)g_c2_checked, (unsigned long long)g_c2_bad);
+    if (memo_log()) LOG("[vk] memo programs: %llu draws found their shaders, %llu resolved and kept, %llu with a program of serial 0 resolved; program changes %llu (cumulative; gfx_vk_draw.inc prog_memo, DM_VK_PROG_MEMO %d)",
+        (unsigned long long)g_pmemo_hit, (unsigned long long)g_pmemo_miss, (unsigned long long)g_pmemo_ser0, (unsigned long long)(atomic_load(&g_prog_gen) - 1), prog_memo_on());
     LOG("[vk] geometry kept on the GPU: %llu index / vertex bindings from kept copies, %llu copies kept (%llu MB now), %llu copied per draw (cumulative; gfx_vk_draw.inc gc_get)",
         (unsigned long long)g_gc_hit, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy);
     { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);
