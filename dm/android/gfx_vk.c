@@ -157,7 +157,7 @@ typedef struct chunk {
     VkQueryPool pq; int npq;   // render pass timestamps of a profiled frame (prof_* in gfx_vk_draw.inc)
     VkQueryPool tq; int ntq; uint64_t t_end;   // timestamps of the game's counter reports (kind 4 posts); the GPU time the chunk ended (g_tsq)   // hold: a later chunk reads this one's arena on the GPU (gfx_vk_draw.inc fwd_find): kept busy (held) until that one completes   // ndraw: draws and dispatches recorded (early submission: mtl_exec)   // ts: GPU timestamps written at its start and end (g_tsq)
     uint64_t gf; int gtag;   // gtag: its GPU time counts toward frame gf's (g_fgpu, mtl_gpu_ms)
-    stg_t *stg; int nstg, capstg; wb_t *wb; int nwb, capwb; post_op *post; int npost, cappost; dead_t *dead; int ndead, capdead; cop_t *cop; int ncop, capcop;
+    stg_t *stg; int nstg, capstg; wb_t *wb; int nwb, capwb, nfwd; post_op *post; int npost, cappost; dead_t *dead; int ndead, capdead; cop_t *cop; int ncop, capcop;
     stg_t *sb; int nsb, csb;   // the staging pool blocks it took while recorded, the last one being cut (stg_take); back to the free list in chunk_done
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
     VkDescriptorPool *dp; int ndp, cdp, dp_cur; VkBufferView *bv; int nbv, cbv;
@@ -166,8 +166,8 @@ enum { NCHUNK = 4 };
 static chunk g_ch[NCHUNK], *C;   // C: the chunk being recorded (NULL: none yet)
 static chunk *g_fifo[NCHUNK]; static int g_fifo_n;   // submitted, oldest first
 static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
-static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
-static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c);   // gfx_vk_draw.inc
+static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop, g_inflight_fwd; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
+static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c); static void bf_reset(void);   // gfx_vk_draw.inc
 static void *chunk_thread(void *arg); static int stg_pool_on(void);
 // ---------------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------------
 // NVN's samples passed is a counter on the queue: ResetCounter zeroes it, every draw after adds its samples, ReportCounter writes the sum at that point when the GPU gets
@@ -276,7 +276,7 @@ static VkCommandBuffer cb(void) {
         if (C->qp && C->qd) { vkCmdResetQueryPool(C->cb, C->qp, 0, (uint32_t)C->qd); g_qr_cmd += (uint64_t)C->qd; }   // the queries the last recording used (Query resets above)
         if (C->tq && C->td) { vkCmdResetQueryPool(C->cb, C->tq, 0, (uint32_t)C->td); g_qr_cmd += (uint64_t)C->td; }
         if (C->pq && C->pd) { vkCmdResetQueryPool(C->cb, C->pq, 0, (uint32_t)C->pd); g_qr_cmd += (uint64_t)C->pd; }
-        C->qd = C->td = C->pd = 0; C->nq = C->ntq = C->npq = 0; }
+        C->qd = C->td = C->pd = 0; C->nq = C->ntq = C->npq = 0; bf_reset(); }   // a new recording holds no bound state (gfx_vk_draw.inc bf_*)
     rp_end();   // transfers and clears run outside a draw's render pass (only the draw path records inside one, through C->cb)
     return C->cb;
 }
@@ -400,6 +400,7 @@ static uint64_t chunk_submit(uint64_t nvn_fence) {
     pthread_mutex_lock(&g_cmu);
     if (c->nwb) atomic_fetch_add(&g_inflight_wb, 1);
     if (c->ncop) atomic_fetch_add(&g_inflight_cop, 1);
+    if (c->nfwd) atomic_fetch_add(&g_inflight_fwd, 1);   // chunks in flight with a forwardable write-back (nfwd: gfx_vk_draw.inc stream_fwd)
     if (c->ts && g_fgpu_on > 0) { c->gf = atomic_load(&g_cur_frame); c->gtag = 1; fgpu_begin(c->gf); }
     g_fifo[g_fifo_n++] = c; uint64_t seq = c->seq;
     pthread_cond_broadcast(&g_ccv);
@@ -668,14 +669,15 @@ static void *chunk_thread(void *arg) {
                 { atomic_fetch_add(&g_gpu_ns, (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod)); atomic_fetch_add(&g_gpu_chunks, 1); c->t_end = t[1];
                   uint64_t s = t[1] > last && t[0] < last ? last : t[0];   // from the previous chunk's end when it started before it; an end at or before that one (the counter started again) counts the whole span
                   busy = (uint64_t)((double)(t[1] - s) * g_vk.props.limits.timestampPeriod); last = t[1]; } }
-        int had_wb = c->nwb != 0, had_cop = c->ncop != 0;
-        chunk_done(c); c->nwb = c->ncop = 0;
+        int had_wb = c->nwb != 0, had_cop = c->ncop != 0, had_fwd = c->nfwd != 0;
+        chunk_done(c); c->nwb = c->ncop = c->nfwd = 0;
         if (c->nvn_fence) { pthread_mutex_lock(&g_fmu); if (atomic_load(&g_done) < c->nvn_fence) atomic_store(&g_done, c->nvn_fence); pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu); }
         qr_done(c, fr == VK_SUCCESS, ts, nq, ntq, npq);   // after every read of them, after the NVN fence (the game waits on it), before busy = 0
         pthread_mutex_lock(&g_cmu);
         memmove(g_fifo, g_fifo + 1, --g_fifo_n * sizeof *g_fifo);
         if (had_wb) atomic_fetch_sub(&g_inflight_wb, 1);
         if (had_cop) atomic_fetch_sub(&g_inflight_cop, 1);
+        if (had_fwd) atomic_fetch_sub(&g_inflight_fwd, 1);   // after its write-backs landed (chunk_done), as g_inflight_wb
         g_seq_done = c->seq;
         if (c->gtag) { fgpu_done(c->gf, busy); c->gtag = 0; }
         if (c->hold > c->seq) c->held = 1; else { c->busy = 0; c->hold = 0; }
@@ -840,8 +842,12 @@ static VkImageAspectFlags aspect_of(VkFormat f) {
 static int is_linear(const tex_t *t) { return (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0; }
 static int is_packaged(const tex_t *t) { return t->mem && (t->has_layout || is_linear(t) || nvn_hm_get(&g_cpuw, &t->serial)); }
 void vkb_frame_forget(uint64_t serial);
+// g_vt_gen: bumped (under g_bk) whenever a vtex is freed or a serial stops resolving to the vtex it did (vt_destroy, the g_tex deletions): a draw's textures resolved in
+// stage_textures are used again in stage_set only while it has not moved (gfx_vk_draw.inc tex_once)
+static uint64_t g_vt_gen = 1;
 static void vt_destroy(vtex *v) {   // with the replay's lock held; the front end may be drawing the image: it is taken off the presented frame first (vkb_frame_forget waits for that)
     if (!v) return;
+    g_vt_gen++;
     vkb_frame_forget(v->serial);
     if (v->img) views_drop(v->img);   // the image, its views and framebuffers go when the current chunk completes: recorded and submitted commands may use them
     dead_add(3, (uint64_t)v->img); dead_add(4, (uint64_t)v->mem);
@@ -1079,15 +1085,19 @@ static void share_take_over(const share_key *nk) {
         i = (uint32_t)-1;   // the table moved entries on delete: scan again
     }
 }
+// vkb()'s answer, once it was yes: a flag instead of pthread_once on every lookup (0.17% of Breath of the Wild's replay thread on the Odin 2); DM_VK_TEX_ONCE=0 asks vkb() each time
+static int tex_once(void);   // gfx_vk_draw.inc
+static _Atomic int g_vkb_up;
+static int vkb_up(void) { if (atomic_load_explicit(&g_vkb_up, memory_order_acquire)) return 1; if (!vkb()) return 0; if (tex_once()) atomic_store_explicit(&g_vkb_up, 1, memory_order_release); return 1; }
 // The image of a texture: made at first use; a texture whose content lives in guest memory is uploaded, and uploaded again when its pages were written
 static vtex *vt_get(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
-    if (!t || !t->serial || !vkb()) return NULL;
+    if (!t || !t->serial || !vkb_up()) return NULL;
     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(30, "texture object no longer valid (magic %#x)", t->magic); return NULL; }
     vtex *v = nvn_hm_get(&g_tex, &t->serial);
     if (v && (v->store != t->mem || memcmp(&v->desc, &t->d, sizeof v->desc))) {
         static int n; if (n++ < 8) LOG("[vk] texture ser=%llu met again with %s: made anew (storage %p, now %p)", (unsigned long long)t->serial, v->store != t->mem ? "other storage" : "another description", (const void *)v->store, (const void *)t->mem);
-        nvn_hm_del(&g_tex, &t->serial); vt_unref(v); v = NULL; }
+        nvn_hm_del(&g_tex, &t->serial); g_vt_gen++; vt_unref(v); v = NULL; }
     int pkg = is_packaged(t);
     if (v && v->pkg) {
         uint64_t now = nvn_dirty_now();
@@ -1100,7 +1110,7 @@ static vtex *vt_get(const tex_t *ct) {
         return v;
     }
     if (v && !pkg) { v->used = atomic_load(&g_fence); return v; }
-    if (v) { nvn_hm_del(&g_tex, &t->serial); vt_unref(v); }   // written by the CPU since it was made as a GPU texture: made again from guest memory, its own
+    if (v) { nvn_hm_del(&g_tex, &t->serial); g_vt_gen++; vt_unref(v); }   // written by the CPU since it was made as a GPU texture: made again from guest memory, its own
     share_key k = share_of(t);
     if (!pkg && t->pool) {   // another object over the same storage, the same description: the same texture
         vtex *s = nvn_hm_get(&g_share, &k);
@@ -1120,7 +1130,7 @@ void vt_drop_pool(const void *pool) {
     for (uint32_t i = 0; i < g_tex.cap; i++) {   // the objects' references, then the sharing table's entries
         vtex *v = g_tex.vals[i];
         if (!v || v->pool != pool) continue;
-        uint64_t k; memcpy(&k, g_tex.keys + (size_t)i * g_tex.klen, 8); nvn_hm_del(&g_tex, &k); vt_unref(v);
+        uint64_t k; memcpy(&k, g_tex.keys + (size_t)i * g_tex.klen, 8); nvn_hm_del(&g_tex, &k); g_vt_gen++; vt_unref(v);
         i = (uint32_t)-1;   // the table may have moved entries on delete: scan again
     }
     for (uint32_t i = 0; i < g_share.cap; i++) {
@@ -1137,7 +1147,7 @@ void mtl_tex_release(tex_t *t) {
     void vkb_frame_forget(uint64_t serial);
     pthread_mutex_lock(&g_bk);
     vtex *v = nvn_hm_del(&g_tex, &t->serial); nvn_hm_del(&g_cpuw, &t->serial);
-    if (v) vt_unref(v);   // a shared image stays for the next object over its storage
+    if (v) { g_vt_gen++; vt_unref(v); }   // a shared image stays for the next object over its storage
     pthread_mutex_unlock(&g_bk);
 }
 void mtl_tex_cpu_written(const tex_t *t) { pthread_mutex_lock(&g_bk); if (!nvn_hm_get(&g_cpuw, &t->serial)) nvn_hm_put(&g_cpuw, &t->serial, (void *)1); pthread_mutex_unlock(&g_bk); }
@@ -1145,7 +1155,10 @@ int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_bk); vtex *v = nv
 static void reg_tex(int id, const tex_t *t, const view_t *v); static void reg_samp(int id, const samp_par *p);   // gfx_vk_draw.inc
 void mtl_reg_tex(int id, const tex_t *t, const view_t *vw) { reg_tex(id, t, vw); }
 void mtl_reg_samp(int id, const samp_par *p) { reg_samp(id, p); }
-void mtl_prog_release(prog_t *p) { (void)p; }
+// hle_nvn.c calls it at a program's Finalize and SetShaders, before the program's key record (pk_get) is dropped or reset: the replay's program-to-shader memo
+// (gfx_vk_draw.inc prog_memo) holds what the key records said, so any of them changing empties it (the game's threads; read by the replay)
+static _Atomic uint64_t g_prog_gen = 1;
+void mtl_prog_release(prog_t *p) { (void)p; atomic_fetch_add_explicit(&g_prog_gen, 1, memory_order_release); }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 
 // ---------------- Copies ----------------
@@ -1721,6 +1734,17 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     if (ext_check()) LOG("[vk] DM_VK_EXT_CHECK: %llu constant buffer bindings copied whole with NaN past their extents (cumulative)", (unsigned long long)g_ext_checked);
     LOG("[vk] support buffer: %llu stages wrote it, %llu left it unwritten (no module reads binding 0) (cumulative; gfx_vk_draw.inc stage_set)", (unsigned long long)g_sup_written, (unsigned long long)g_sup_skipped);
     if (c2_check()) LOG("[vk] c2 check: %llu handle words compared with c2_word, %llu differed (cumulative; gfx_vk_draw.inc bank_word)", (unsigned long long)g_c2_checked, (unsigned long long)g_c2_bad);
+    if (memo_log()) LOG("[vk] memo programs: %llu draws found their shaders, %llu resolved and kept, %llu with a program of serial 0 resolved; program changes %llu (cumulative; gfx_vk_draw.inc prog_memo, DM_VK_PROG_MEMO %d)",
+        (unsigned long long)g_pmemo_hit, (unsigned long long)g_pmemo_miss, (unsigned long long)g_pmemo_ser0, (unsigned long long)(atomic_load(&g_prog_gen) - 1), prog_memo_on());
+    if (memo_log()) LOG("[vk] memo pipelines: %llu draws had the draw before's, %llu built their key; state changes %llu; checked %llu, differed %llu (cumulative; gfx_vk_draw.inc pso_memo, DM_VK_PSO_MEMO %d, DM_VK_PSO_CHECK %d)",
+        (unsigned long long)g_pso_hit, (unsigned long long)g_pso_miss, (unsigned long long)(g_pso_gen - 1), (unsigned long long)g_pso_checked, (unsigned long long)g_pso_bad, pso_memo_on(), pso_check());
+    if (memo_log()) LOG("[vk] memo binds left out / recorded: pipeline %llu / %llu, dynamic state %llu / %llu, vertex buffers %llu / %llu, index buffer %llu / %llu (cumulative; gfx_vk_draw.inc bf_*, DM_VK_BIND_FILTER %d)",
+        (unsigned long long)g_bf_skip[0], (unsigned long long)g_bf_made[0], (unsigned long long)g_bf_skip[1], (unsigned long long)g_bf_made[1], (unsigned long long)g_bf_skip[2], (unsigned long long)g_bf_made[2],
+        (unsigned long long)g_bf_skip[3], (unsigned long long)g_bf_made[3], bind_filter());
+    if (memo_log()) LOG("[vk] memo forwarding: %llu vertex streams answered with no forwardable write-back pending, %llu looked up (cumulative; gfx_vk_draw.inc stream_fwd, DM_VK_FWD_EARLY %d)",
+        (unsigned long long)g_fwd_early, (unsigned long long)g_fwd_look, fwd_early());
+    if (memo_log()) LOG("[vk] memo textures: %llu elements taken as stage_textures resolved them, %llu resolved again; samplers %llu found per ID, %llu made or looked up; image generation %llu (cumulative; gfx_vk_draw.inc tex_once, DM_VK_TEX_ONCE %d)",
+        (unsigned long long)g_tc_hit, (unsigned long long)g_tc_again, (unsigned long long)g_sc_hit, (unsigned long long)g_sc_made, (unsigned long long)g_vt_gen, tex_once());
     LOG("[vk] geometry kept on the GPU: %llu index / vertex bindings from kept copies, %llu copies kept (%llu MB now), %llu copied per draw (cumulative; gfx_vk_draw.inc gc_get)",
         (unsigned long long)g_gc_hit, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy);
     { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);
