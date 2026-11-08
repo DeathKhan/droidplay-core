@@ -1,5 +1,7 @@
 # Pack a Switch game you own for Android: your NSP / XCI files and your prod.keys in, the nxnative app and the game files on the phone out.
 #   python scripts/build_android_from_nsp.py <NSP folder> -k <prod.keys> [-p <version>] [-l <language>] [--serial <adb device>] [--no-push]
+#   The folder may instead hold the game as one NUP container (a .nup file: base game, updates and DLC), or as a dump folder (scripts/pack_dump.py), or the .nup file may
+#   be given in its place: neither needs prod.keys (build_ipa_from_nsp.py reads them, as for iOS)
 #   python scripts/build_android_from_nsp.py <NSP folder> -k <prod.keys> --push-only [--serial ...]   install the app and copy a game built before, without building
 #   python scripts/build_android_from_nsp.py --apk-only [--serial ...]                                  the app with every game host built on this computer, installed
 #   python scripts/build_android_from_nsp.py --migrate --title <title ID> [--serial ...]               a one-game install's folder (files/game) into files/games/<title ID>
@@ -554,17 +556,45 @@ def provisional_profile(gamemod, nsp_dir, app):   # the provisional profile an e
     return gamemod.load(f'{app:016X}')
 
 
-def info(nsp_dir):
+def scan(src, keys, env, nsz=True):
+    """The game in src as build_ipa_from_nsp.py's main finds it: (folder, title ID, fam, kind). src is a folder of NSPs / XCIs (kind None), a dump folder ('folder')
+    or a NUP container ('nup': a .nup file, or the one .nup in the folder); the folder is where <title ID>_build goes. A NUP and a dump are not encrypted: no keys"""
+    nup = bi.nup_file(src)
+    folder = src.parent if src.is_file() else src
+    if nup:
+        app, fam = bi.scan_nup(nup)
+        say(f'a NUP: {nup.name}, {app:016X}, {len(fam["updates"])} update(s), {len(fam["dlc"])} DLC')
+        if fam['base'] is None: say(bi.pack_nup.NO_BASE)
+        return folder, app, fam, 'nup'
+    if bi.dump_folder(folder):
+        app, fam = bi.scan_dump(folder)
+        say(f'a dump folder: {app:016X}, {len(fam["updates"])} update(s), {len(fam["dlc"])} DLC')
+        return folder, app, fam, 'folder'
+    if not keys: raise BuildError('give -k <prod.keys>: the game is in NSP / XCI files, which are encrypted')
+    with bi.package_reader(REPO, keys, env) as packages:
+        app, fam = bi.scan_nsps(folder, packages.contents)
+        packages.check_keys(fam)
+    if nsz: fam = bi.decompress_nsz(folder, app, fam, keys, env)
+    return folder, app, fam, None
+
+
+def game_files(fam, kind):   # what the game was read from, for the desktop app: the NSPs, the NUP, or a dump's version folders
+    if kind == 'nup': p = Path(fam['nup'].path); return [{'name': p.name, 'bytes': p.stat().st_size}]
+    if kind == 'folder': return [{'name': p.name, 'bytes': bi.tree_size(p)[1]} for p in [fam['base'], *[p for _, p in fam['updates']]] if p]
+    return [{'name': p.name, 'bytes': p.stat().st_size} for p in [fam['base'], *[p for _, p in fam['updates']], *[p for _, _, p in fam['dlc']]] if p]
+
+
+def info(src, keys=None):
     sys.path.insert(0, str(REPO / 'dm/games')); import game as gamemod
     sys.path.insert(0, str(REPO / 'dm/tools')); import nacp
-    app, fam = bi.scan_nsps(nsp_dir)
+    env = dict(os.environ); bi.configure_dotnet(env)
+    nsp_dir, app, fam, kind = scan(src, keys, env, nsz=False)
     tid = f'{app:016X}'; g = gamemod.by_title(app); prov = False
     if g is None: g = provisional_profile(gamemod, nsp_dir, app); prov = g is not None   # an experimental build's: its art, versions and host show like a profiled game's
     out = {'title_id': tid, 'folder': str(nsp_dir), 'profile': bool(g), 'provisional': prov, 'name': g.get('name', '') if g else '', 'table': games_table().get(tid),
-           'android_tested': tid in ANDROID_TESTED, 'dlc': len(fam['dlc']),
-           'files': [{'name': p.name, 'bytes': p.stat().st_size} for p in [fam['base'], *[p for _, p in fam['updates']], *[p for _, _, p in fam['dlc']]] if p]}
+           'android_tested': tid in ANDROID_TESTED, 'dlc': len(fam['dlc']), 'container': kind or 'nsp', 'files': game_files(fam, kind)}
     if g:
-        have = bi.nsp_versions(fam, g.builds())
+        have = bi.nsp_versions(fam)
         out['versions'] = sorted(have, key=bi.vnum); out['newest'] = max(have, key=bi.vnum)
         work = nsp_dir / f'{g.id}_build'; ex = work / 'extract'
         out['extracted'] = {}
@@ -610,7 +640,7 @@ def main(argv):
     if not (a.check or a.info) and os.environ.get('NXNATIVE_JOURNAL', '1') != '0': bi.PROG = Journaled(bi.PROG.mode, argv)
     if a.check or a.info:   # stdout carries the JSON alone: messages on the way (say) go to stderr
         if a.info and not a.nsp_dir: raise BuildError('--info needs the NSP folder')
-        with contextlib.redirect_stdout(sys.stderr): out = check(a.sdk) if a.check else info(Path(a.nsp_dir).expanduser().resolve())
+        with contextlib.redirect_stdout(sys.stderr): out = check(a.sdk) if a.check else info(Path(a.nsp_dir).expanduser().resolve(), Path(a.keys).expanduser().resolve() if a.keys else None)
         print(json.dumps(out, indent=1)); return
     if a.apk_only or a.migrate:
         logs = data_dir() / 'logs'; logs.mkdir(parents=True, exist_ok=True)
@@ -624,10 +654,10 @@ def main(argv):
         bi.PROG.stage('APK'); apk = make_apk(sdk_dir(a.sdk), logs, env); bi.PROG.end(str(apk))
         bi.PROG.stage('install'); install(serial, apk, logs); bi.PROG.end(serial)
         return
-    if not a.nsp_dir or not a.keys: raise BuildError('give the NSP folder and -k <prod.keys> (or --check / --apk-only / --migrate)')
-    nsp_dir, keys = Path(a.nsp_dir).expanduser().resolve(), Path(a.keys).expanduser().resolve()
-    if not nsp_dir.is_dir(): raise BuildError(f'not a folder: {nsp_dir}')
-    if not keys.is_file(): raise BuildError(f'no such file: {keys}')
+    if not a.nsp_dir: raise BuildError('give the NSP folder (or the .nup file) and -k <prod.keys> (or --check / --apk-only / --migrate)')
+    src, keys = Path(a.nsp_dir).expanduser().resolve(), Path(a.keys).expanduser().resolve() if a.keys else None
+    if not src.exists(): raise BuildError(f'not a folder: {src}')
+    if keys and not keys.is_file(): raise BuildError(f'no such file: {keys}')
     missing = [m for m in ('lz4.block', 'capstone') if not bi._importable(m)]
     if missing: raise BuildError(f'the current Python ({sys.executable}) is missing modules: {", ".join(missing)} (pip install lz4 capstone)')
     if not (bi._importable('compression.zstd') or bi._importable('backports.zstd')):   # the shader split decompresses zstd files (Python 3.14's compression.zstd, or its backport)
@@ -637,8 +667,7 @@ def main(argv):
     sys.path.insert(0, str(REPO / 'dm/tools')); import nacp; bi.nacp = nacp
     sdk = sdk_dir(a.sdk)
     env = dict(os.environ); bi.configure_dotnet(env)
-    app, fam = bi.scan_nsps(nsp_dir)
-    fam = bi.decompress_nsz(nsp_dir, app, fam, keys, env)
+    nsp_dir, app, fam, kind = scan(src, keys, env)
     g = gamemod.by_title(app)
     if g is None:   # no game profile: surveyed and packed from a provisional profile outside the repository, as build_ipa_from_nsp.py does (the game may not boot)
         pdir = nsp_dir / f'{app:016X}_build' / 'profile'
@@ -654,14 +683,22 @@ def main(argv):
         if g is None: raise BuildError(f'no provisional profile in {pdir}: the survey wrote none')
         say('[RED] provisional game profile: values guessed from the survey, the game may not boot; bring it up per docs/agents after packing')
     say(f'game profile: {g.id} ({g.get("name", "")})')
-    builds = g.builds(); have = bi.nsp_versions(fam, builds)
+    builds = g.builds(); have = bi.nsp_versions(fam)
     pkg_ver = a.package or max(have, key=bi.vnum)
     if pkg_ver not in have: raise BuildError(f'version {pkg_ver} is not in the folder, which holds {", ".join(sorted(have, key=bi.vnum))}')
+    # A version the profile does not register, or one whose shader tables' versions are not all in the folder, is packed from a profile derived from it (derive_profile below),
+    # with its own shaders, as build_ipa_from_nsp.py's main does: Mario Kart World's NUP holds update 1.8.0 alone, and its profile registers the base game
+    prov = not g.dir.resolve().is_relative_to((REPO / 'dm/games').resolve())   # its captures are pulled (pull_captures)
+    derived = ''
+    if not prov:
+        need = g.words('shader_versions')
+        if pkg_ver not in builds: derived = f'{pkg_ver} is not a version game profile {g.id} registers ({", ".join(f"{v} {b["display"]}" for v, b in builds.items())})'
+        elif not all(v in have for v in need): derived = f'the folder has no {", ".join(v for v in need if v not in have)}, whose files game profile {g.id}\'s shader tables were made from'
+        if derived: say(f'{derived}: packing {pkg_ver} from a profile derived from it')
     work = nsp_dir / f'{g.id}_build'; logs = work / 'logs'; ex = work / 'extract'
     ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
     env.update(DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'), DM_TARGET='android', PYTHONUTF8='1')   # the tools' text files in UTF-8 on Windows too (its default is the ANSI code page)
     patched = work / f'patched_android_{pkg_ver}'
-    prov = not g.dir.resolve().is_relative_to((REPO / 'dm/games').resolve())   # its captures are pulled (pull_captures)
     serial = None if a.no_push else a.serial or os.environ.get('ANDROID_SERIAL')
     if not a.no_push and not serial:   # the phone now (its captures are pulled before the shader stages); none connected fails at the install, as before, unless only the phone is wanted
         try: serial = pick_device()
@@ -687,22 +724,38 @@ def main(argv):
             bi.PROG.end(f'{dst}/spv'); say('done: open the game again on the phone'); return
     else:
         # the shaders are split from every version the profile's shader tables were made from (shader_versions), as the iOS build does
-        sv = g.words('shader_versions') or [pkg_ver]
+        sv = [pkg_ver] if derived else g.words('shader_versions') or [pkg_ver]
         if not all(v in have for v in sv): say(f'[RED] the folder has no {", ".join(v for v in sv if v not in have)}, whose files the profile shader tables were made from: no shaders are translated'); sv = []
         picks = bi.pick_nsps(fam, have, sorted(set(sv) | {pkg_ver}, key=bi.vnum))
-        bi.PROG.plan(5 + 2 * bool(sv) + len(set(sv) - {pkg_ver}) + bool(fam['dlc']) + (not a.no_push))   # an extraction per other shader version, and the DLC's
-        bi.PROG.stage('build nx_extract'); nx = build_nx_extract(work, logs, env); bi.PROG.end()
-        b, u = picks[pkg_ver]
-        game = bi.extract(nx, keys, ex, pkg_ver, b, u, None, logs, g)
-        bad = bi.build_mismatch(game, pkg_ver, g)
-        if bad: say(f'[RED] not the builds game profile {g.id} registers ({"; ".join(bad)}): the per-build fixes of the profile do not reach these modules, the game may not boot')
-        g = bi.rewrite(sys.executable, REPO, game / 'ExeFS', patched, env, logs, g)
+        bi.PROG.plan(4 + (not kind) + 2 * bool(sv) + len(set(sv) - {pkg_ver}) + bool(fam['dlc']) + (not a.no_push))   # an extraction per other shader version, and the DLC's
+        nx = None
+        if not kind: bi.PROG.stage('build nx_extract'); nx = build_nx_extract(work, logs, env); bi.PROG.end()   # a NUP or a dump folder is read without it
+        def extract(v):   # one version into extract/<v>, as build_ipa_from_nsp.py's main does: a NUP's packages, a dump's folders, or the NSPs through nx_extract
+            b, u = picks[v]
+            if kind == 'nup': return bi.extract_nup(ex, v, u or b, b, app, fam['nup'])
+            if kind == 'folder': return bi.extract_dump(ex, v, u or b, app)
+            return bi.extract(nx, keys, ex, v, b, u, None, logs, g, app)
+        game = extract(pkg_ver)
+        bad = [] if derived or prov else bi.build_mismatch(game, pkg_ver, g)
+        if bad:   # files of another build under a registered version's tag: packed like any other version
+            derived = f'not the builds game profile {g.id} registers: {"; ".join(bad)}'; sv = [pkg_ver]
+            say(f'{derived}: packing {pkg_ver} from a profile derived from it')
+        reg = g   # the profile as registered (refine_after_rewrite checks a derived build's keys against it)
+        if derived:   # where a provisional profile goes (<id>_build/profile), and game.py (the host's CMake, the shader tools) takes it first (DM_GAMES_FIRST)
+            pdir = work / 'profile'
+            disp = bi.derive_profile(g, pdir / g.id, pkg_ver, game, g.words('modules'), app)
+            os.environ['DM_GAMES_DIR'] = env['DM_GAMES_DIR'] = os.pathsep.join([str(pdir)] + [d for d in os.environ.get('DM_GAMES_DIR', '').split(os.pathsep) if d and d != str(pdir)])
+            os.environ['DM_GAMES_FIRST'] = env['DM_GAMES_FIRST'] = '1'
+            g = gamemod.load(g.id)
+            say(f'derived game profile for {pkg_ver} ({disp}): {g.dir}')
+        g = bi.rewrite(sys.executable, REPO, game / 'ExeFS', patched, env, logs, g, bool(prov))
+        if prov or derived: bi.provisional_prep(sys.executable, REPO, env, logs, g); g = bi.refine_after_rewrite(g, game, patched, reg if derived else None)
         # the DLC in the folder, as for iOS: <id>_build/aoc/<index>.img, which push_game copies to the game's aoc/ and the host mounts and reports as owned (DM_AOC_DIR).
         # It was not extracted for Android: The Binding of Isaac's Repentance (DLC 010021C000B6B001) started as Afterbirth+
         aoc = bi.extract_aoc(nx, keys, REPO, work, app, fam, logs)
         if prov and serial: pull_captures(serial, g.id, capture_dir, logs)
         dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir() or p.suffix == '.img') if aoc else []
-        spv = build_shaders(sv, {v: (game if v == pkg_ver else bi.extract(nx, keys, ex, v, picks[v][0], picks[v][1], None, logs, g)) for v in sv}, work, logs, env, g, dlc_roms)
+        spv = build_shaders(sv, {v: (game if v == pkg_ver else extract(v)) for v in sv}, work, logs, env, g, dlc_roms)
         bi.PROG.stage('Android host'); so, loader, ndk = build_host(sdk, g.id, work, logs, env); st = build_selftest(ndk, work, logs, env)
         if not a.game_apk: library_add(g.id, so, loader, st, {'title_id': g.id, 'name': nacp.name(game / 'control.nacp') or g.get('name', ''), 'version': pkg_ver,
                                             'display': nacp.version(game / 'control.nacp'), 'nsp_dir': str(nsp_dir)})
