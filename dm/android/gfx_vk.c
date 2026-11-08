@@ -141,7 +141,11 @@ static void stg_free(stg_t *s) { if (s->b) { vkDestroyBuffer(g_vk.dev, s->b, NUL
 // posts, completes the NVN fence and recycles the chunk. Write-backs come before posts: a game waiting on an event reads what the GPU wrote.
 // A write-back with a snapshot (the guest bytes when the GPU took its copy) writes only the bytes that differ from it: the CPU may have written the others since.
 // Before the replay reads guest memory on the CPU (an upload, a draw's data, a buffer copy), pending write-backs land first (cpu_view).
-typedef struct { int st; size_t off, row_bytes, rows, src_pitch, dst_pitch; uint8_t *dst, *snap; int fwd; } wb_t;   // st < 0: the chunk's arena block -1 - st; st >= SP_ST: its staging pool block st - SP_ST (stg_take); otherwise its staging buffer st; fwd: a dispatch wrote it (later draws may read it on the GPU: gfx_vk_draw.inc fwd_find)
+typedef struct { int st; size_t off, row_bytes, rows, src_pitch, dst_pitch; uint8_t *dst, *snap; int fwd;   // st < 0: the chunk's arena block -1 - st; st >= SP_ST: its staging pool block st - SP_ST (stg_take); otherwise its staging buffer st; fwd: a dispatch wrote it (later draws may read it on the GPU: gfx_vk_draw.inc fwd_find)
+                 // a linear render target's (gfx_vk_draw.inc lin_writeback): lin 1, 2 when its texture is one level and one layer (the write-back covers all it uploads: ab_note); dsnap: the pass's
+                 // snapshot kept only for the revert check (DM_VK_LINWB_SNAP=0 with DM_VK_WB_REVERT=1); snap_cap: snap / dsnap is a pooled buffer of that size (snap_give), 0: malloc'd;
+                 // the texture's serial, image, NVN format, texel block bytes, size and storage size
+                 int lin; uint8_t *dsnap; size_t snap_cap; uint64_t ser, img; uint32_t fmt, bpb, w, h; uint64_t tsize; } wb_t;
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize n, used; } arena_blk;
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; uint64_t q0, q1; } post_op;   // kind 1 event, 2 counter, 3 samples passed (occlusion queries q0..q1)
 typedef struct { int kind; uint64_t h; } dead_t;
@@ -215,10 +219,11 @@ static void fgpu_done(uint64_t f, uint64_t ns) {   // under g_cmu (completion th
     if (atomic_load(&g_fgpu[k].frame) != f + 1) return;
     atomic_fetch_add(&g_fgpu[k].ns, ns); atomic_fetch_sub(&g_fgpu[k].pending, 1);
 }
+static int lsnap_on(void), wb_revert_on(void), wb_absorb_on(void), up_range_on(void);   // the linear write-back switches (below, before chunk_done): read before the completion thread starts
 static int chunks_init(void) {
     static int ok = -1; if (ok >= 0) return ok;
     ok = 0; if (!vkb()) return 0;
-    fgpu_on(); stg_pool_on();   // read before the completion thread starts (sp_done reads g_sp_on)
+    fgpu_on(); stg_pool_on(); lsnap_on(); wb_revert_on(); wb_absorb_on(); up_range_on();   // read before the completion thread starts (sp_done reads g_sp_on)
     if (g_vk.props.limits.timestampComputeAndGraphics) { VkQueryPoolCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * NCHUNK};
         if (vkCreateQueryPool(g_vk.dev, &qc, NULL, &g_tsq) != VK_SUCCESS) g_tsq = VK_NULL_HANDLE; else if (g_qreset) g_qreset(g_vk.dev, g_tsq, 0, 2 * NCHUNK); }
     for (int i = 0; i < NCHUNK; i++) if (!chunk_make(&g_ch[i])) { LOG("[RED] [vk] command buffers could not be made"); return 0; }
@@ -447,6 +452,15 @@ static void ranges_view_(const rd_rng *r, int n, int write) {
     g_view_free++;
 }
 static void ranges_view(const rd_rng *r, int n) { ranges_view_(r, n, 0); }
+// whether a write-back or a queued copy not landed yet (in the current chunk or one in flight) writes into [lo, hi): no wait, no count (gfx_vk_draw.inc lsnap_take)
+static int wr_pending(uintptr_t lo, uintptr_t hi) {
+    if (C && chunk_hits(C, lo, hi, 0)) return 1;
+    if (!atomic_load(&g_inflight_wb) && !atomic_load(&g_inflight_cop)) return 0;
+    int hit = 0; pthread_mutex_lock(&g_cmu);
+    for (int f = 0; f < g_fifo_n && !hit; f++) hit = chunk_hits(g_fifo[f], lo, hi, 0);
+    pthread_mutex_unlock(&g_cmu);
+    return hit;
+}
 static uint64_t g_mem_cur, g_mem_fly, g_mem_free;   // the same for the submission's own CPU writes and small copies (uniform buffer updates, buffer copies and fills)
 static void mem_view(uint64_t rd, uint64_t rn, uint64_t wr, uint64_t wn) {
     if (vk_safe()) { cpu_view(); return; }
@@ -456,18 +470,148 @@ static void mem_view(uint64_t rd, uint64_t rn, uint64_t wr, uint64_t wn) {
     if (wn) ranges_view_(w, 1, 1);
     g_mem_cur += g_view_cur - c; g_mem_fly += g_view_fly - f; g_mem_free += g_view_free - e; g_view_cur = c; g_view_fly = f; g_view_free = e;
 }
-static void wb_apply(const wb_t *w, const uint8_t *s) {
-    dm_guest_write_prepare(w->dst, w->dst_pitch * (w->rows ? w->rows - 1 : 0) + w->row_bytes);   // pages the dirty tracker protected become writable (and dirty) first
-    for (size_t y = 0; y < w->rows; y++) {
+// ---------------- Linear render targets' write-backs (gfx_vk_draw.inc lin_writeback) ----------------
+// A linear render target's level is copied back into guest memory when its pass's chunk completes, so the CPU reads what the GPU drew. It was copied back whole, with no snapshot,
+// after wb_apply prepared (unprotected and stamped) every page. Breath of the Wild's s7928 (512x512 RGBA8, linear, CPU_CACHED; the grass vertex shaders read it, its w scaling all
+// wind and flutter displacement) gets one draw a frame that changes its B byte under Link (MIN blend, mask 0x4): a few changed bytes became 1,048,576 written (Ayn Odin 2), and
+//   - a byte the CPU wrote between the pass's upload and the write-back landing (the first 3 to 6 ms of each replay) was put back to its old value, which the GPU never saw: the grass
+//     flicker's leading suspect (the revert check below counts it)
+//   - all 256 pages were stamped, so the next sampling re-uploaded the level: about 4 re-uploads (1 MB) and 2.1 to 2.65 upload syncs a frame, and a G-buffer split before the first grass draw
+// DM_VK_LINWB_SNAP (on; =0: written back whole, every page prepared, as before): the pass snapshots the target's guest bytes at rp_prepare, after vt_get made the image equal to them
+// (gfx_vk_draw.inc lsnap_take), and the write-back writes only the bytes the GPU changed against it, preparing only the span from the first of them to the last (none changed: nothing
+// prepared, no page stamped, no re-upload). A write still pending to those bytes at rp_prepare (an earlier pass's write-back, a queued copy) lands after the snapshot, and a byte this
+// pass leaves at (or sets back to) the snapshot's value would then keep that write's value: such a pass takes no snapshot and is written back whole, as before. Two differences from
+// the hardware remain, races a game would have anyway: a byte the CPU wrote between vt_get's upload and the snapshot is still put back; one the CPU wrote and the GPU set to the
+// snapshot's value keeps the CPU's.
+// The narrowing holds for every write-back with a snapshot (storage buffers' too): only the span written is prepared
+static int lsnap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_LINWB_SNAP"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[vk] DM_VK_LINWB_SNAP=0: linear render targets are written back whole, every page prepared (as before)"); } return v; }
+static uint64_t g_lsnap, g_lsnap_stale;   // passes' snapshots taken; not taken: a write to the target was pending (gfx_vk_draw.inc lsnap_take)
+static _Atomic uint64_t g_lwb_whole, g_lwb_diff, g_lwb_same, g_lwb_bytes;   // linear write-backs landed whole / as their changed bytes / with nothing changed; the bytes the latter two wrote
+// Snapshot buffers: one of 64 KB or more comes from a few kept for reuse (on Android a 1 MB malloc is an mmap and 256 first-touch faults, every pass), smaller ones are malloc'd
+enum { SNAP_POOL_MIN = 64 << 10, SNAP_KEEP = 8, SNAP_KEEP_BYTES = 32 << 20 };
+static struct { uint8_t *p; size_t cap; } g_snapf[SNAP_KEEP]; static int g_nsnapf; static size_t g_snapf_bytes; static pthread_mutex_t g_snap_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *snap_take(size_t n, size_t *cap) {   // *cap: the pooled buffer's size, 0 for a malloc'd one (both go back through snap_give)
+    *cap = 0; if (n < SNAP_POOL_MIN) return malloc(n ? n : 1);
+    uint8_t *p = NULL; size_t c = 0; int best = -1;
+    pthread_mutex_lock(&g_snap_mu);
+    for (int i = 0; i < g_nsnapf; i++) if (g_snapf[i].cap >= n && (best < 0 || g_snapf[i].cap < g_snapf[best].cap)) best = i;
+    if (best >= 0) { p = g_snapf[best].p; c = g_snapf[best].cap; g_snapf_bytes -= c; g_snapf[best] = g_snapf[--g_nsnapf]; }
+    pthread_mutex_unlock(&g_snap_mu);
+    if (!p && (p = malloc(n))) c = n;
+    *cap = c; return p;
+}
+static void snap_give(uint8_t *p, size_t cap) {   // either thread; cap 0: free
+    if (!p) return;
+    if (cap) { pthread_mutex_lock(&g_snap_mu);
+        int k = g_nsnapf < SNAP_KEEP ? g_nsnapf : -1;
+        if (k < 0) { k = 0; for (int i = 1; i < SNAP_KEEP; i++) if (g_snapf[i].cap < g_snapf[k].cap) k = i;   // full: a larger one replaces the smallest
+                     if (g_snapf[k].cap < cap) { free(g_snapf[k].p); g_snapf_bytes -= g_snapf[k].cap; g_nsnapf--; g_snapf[k] = g_snapf[g_nsnapf]; k = g_nsnapf; } else k = -1; }
+        if (k >= 0 && g_snapf_bytes + cap <= SNAP_KEEP_BYTES) { g_snapf[k].p = p; g_snapf[k].cap = cap; g_nsnapf++; g_snapf_bytes += cap; p = NULL; }
+        pthread_mutex_unlock(&g_snap_mu); }
+    free(p);
+}
+// DM_VK_WB_REVERT=1 (diagnostic; the flicker plan's experiment 4a): before a linear render target's write-back lands, the bytes where guest memory differs from the pass's snapshot
+// and from the GPU's result (the CPU, or the replay, wrote them since the pass began, to another value than the GPU's) are counted per channel (the texel's bytes in four groups: R G B A
+// for RGBA8) and per texture, and of them those the GPU left at the snapshot's value: the whole-level write-back put those back to the old value (DM_VK_LINWB_SNAP keeps the CPU's).
+// The first 10 write-backs with such bytes are logged, the counts every 300 frames (mtl_mem_stat). With DM_VK_LINWB_SNAP=0 the snapshot is taken for this alone (dsnap): the count is
+// then what the old write-back reverted. A pass with no snapshot (a write to its target was pending) is not compared
+static int wb_revert_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_REVERT"); v = e && atoi(e) != 0; if (v) LOG("[vk] DM_VK_WB_REVERT=1: linear write-backs are checked for bytes the CPU wrote during their pass"); } return v; }
+enum { RV_SER = 32 };
+static struct { uint64_t ser; uint32_t fmt, w, h; uint64_t wbs, events, cpu[4], rev[4]; } g_rv[RV_SER];
+static int g_nrv, g_rv_logged; static uint64_t g_rv_wbs, g_rv_events, g_rv_unchecked, g_rv_lost; static pthread_mutex_t g_rv_mu = PTHREAD_MUTEX_INITIALIZER;
+static void rv_check(const wb_t *w, const uint8_t *s) {   // the completion thread, before wb_apply(w)
+    const uint8_t *o0 = w->snap ? w->snap : w->dsnap; uint64_t cpu[4] = {0}, rev[4] = {0}; size_t r0 = 0, r1 = 0; int any = 0; unsigned bpb = w->bpb ? w->bpb : 1;
+    if (o0) for (size_t y = 0; y < w->rows; y++) {
+        const uint8_t *g = w->dst + y * w->dst_pitch, *o = o0 + y * w->row_bytes, *q = s + y * w->src_pitch;
+        if (!memcmp(g, o, w->row_bytes)) continue;
+        for (size_t i = 0; i < w->row_bytes; i++) if (g[i] != o[i] && g[i] != q[i]) { unsigned b = (unsigned)(i % bpb), ch = bpb >= 4 ? b * 4 / bpb : b; cpu[ch]++; if (q[i] == o[i]) rev[ch]++; if (!any) r0 = y; r1 = y; any = 1; }
+    }
+    pthread_mutex_lock(&g_rv_mu);
+    if (!o0) { g_rv_unchecked++; pthread_mutex_unlock(&g_rv_mu); return; }
+    g_rv_wbs++; g_rv_events += (uint64_t)any;
+    int k = 0; while (k < g_nrv && g_rv[k].ser != w->ser) k++;
+    if (k == g_nrv) { if (g_nrv < RV_SER) { memset(&g_rv[k], 0, sizeof g_rv[k]); g_rv[k].ser = w->ser; g_rv[k].fmt = w->fmt; g_rv[k].w = w->w; g_rv[k].h = w->h; g_nrv++; } else k = -1; }
+    if (k >= 0) { g_rv[k].wbs++; g_rv[k].events += (uint64_t)any; for (int c = 0; c < 4; c++) { g_rv[k].cpu[c] += cpu[c]; g_rv[k].rev[c] += rev[c]; } }
+    else if (any) g_rv_lost++;
+    int log = any && g_rv_logged < 10; g_rv_logged += log;
+    pthread_mutex_unlock(&g_rv_mu);
+    if (log) LOG("[vk] write-back revert check: s%llu %ux%u format %#x, rows %zu-%zu of %zu: bytes the CPU wrote since the pass's snapshot, not as the GPU did, %llu/%llu/%llu/%llu (by channel), of them left alone by the GPU "
+                 "(put back by a whole write-back%s) %llu/%llu/%llu/%llu", (unsigned long long)w->ser, w->w, w->h, w->fmt, r0, r1, w->rows, (unsigned long long)cpu[0], (unsigned long long)cpu[1],
+                 (unsigned long long)cpu[2], (unsigned long long)cpu[3], w->snap ? ", kept by this one" : ", as this one does", (unsigned long long)rev[0], (unsigned long long)rev[1], (unsigned long long)rev[2], (unsigned long long)rev[3]);
+}
+static void rv_stat(unsigned long long frame) {   // every 300 frames (mtl_mem_stat): the counts since the last line
+    pthread_mutex_lock(&g_rv_mu);
+    LOG("[vk] write-back revert check up to frame %llu: %llu linear write-backs compared with their pass's snapshot, %llu found bytes the CPU wrote during the pass, %llu not compared (no snapshot: a write to the target was pending)%s",
+        frame, (unsigned long long)g_rv_wbs, (unsigned long long)g_rv_events, (unsigned long long)g_rv_unchecked, g_rv_lost ? " (more textures than listed)" : "");
+    for (int k = 0; k < g_nrv; k++) if (g_rv[k].events) LOG("[vk]   s%llu %ux%u format %#x: %llu of %llu write-backs; bytes the CPU wrote by channel %llu/%llu/%llu/%llu, of them left alone by the GPU %llu/%llu/%llu/%llu",
+        (unsigned long long)g_rv[k].ser, g_rv[k].w, g_rv[k].h, g_rv[k].fmt, (unsigned long long)g_rv[k].events, (unsigned long long)g_rv[k].wbs, (unsigned long long)g_rv[k].cpu[0], (unsigned long long)g_rv[k].cpu[1],
+        (unsigned long long)g_rv[k].cpu[2], (unsigned long long)g_rv[k].cpu[3], (unsigned long long)g_rv[k].rev[0], (unsigned long long)g_rv[k].rev[1], (unsigned long long)g_rv[k].rev[2], (unsigned long long)g_rv[k].rev[3]);
+    g_nrv = 0; g_rv_wbs = g_rv_events = g_rv_unchecked = g_rv_lost = 0;
+    pthread_mutex_unlock(&g_rv_mu);
+}
+// A linear render target's own write-back is not new content for it (DM_VK_WB_ABSORB, on; =0: re-uploaded, as before). What wb_apply wrote is what the image already holds, but the
+// pages it prepared were stamped, so the next sampling re-uploaded the level: Breath of the Wild's s7928 at its first grass draw each frame (1 MB through a new staging buffer, an upload
+// sync draining the GPU, the G-buffer pass split there at 46 | 18 draws) and its small linear targets at rp_prepare and clear_color. As nvn_mtl.m pkg_absorb_note / pkg_absorb_take do:
+// right after that write-back lands, the completion thread takes a stamp, protects the storage again and keeps the texture's bytes in its edge pages, and only when guest memory then
+// equals the GPU's copy in every row (no CPU write since the snapshot survived the diff, none came before the protect) notes (serial, storage, image, stamp) in a table under g_ab_mu;
+// it never touches the vtex, which vt_destroy frees at once. vt_get, finding the texture written since its stamp, takes the note when it is still that texture's image, it was not
+// uploaded after the note, no page wholly inside it was written after the stamp and its edge bytes are unchanged: the stamp and the edge bytes become its own and the image stays
+// (ab_take). Only one level and one layer (lin 2): the write-back then covers every byte vt_upload_ reads. A newer note of a serial replaces the older; a texture made again over the
+// same storage has another serial or another image. Open, as on the Mac: the pool's Finalize racing the protect (a game finalizes after the fence, which is completed after this)
+static int wb_absorb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_ABSORB"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[vk] DM_VK_WB_ABSORB=0: a linear render target is uploaded again after its own write-back (as before)"); } return v; }
+typedef struct { uint64_t ser, img, gen; const uint8_t *store; uint8_t *edge[2]; uint32_t edge_n[2]; } ab_rec;
+enum { NAB = 64 };
+static ab_rec g_ab[NAB]; static int g_nab; static _Atomic int g_nab_n; static pthread_mutex_t g_ab_mu = PTHREAD_MUTEX_INITIALIZER;   // g_nab_n: read without the lock first (ab_take)
+static _Atomic uint64_t g_ab_noted, g_ab_differ, g_ab_taken, g_ab_refused;
+static void edge_rng(uintptr_t a, uintptr_t e, uintptr_t r[2][2], uintptr_t *ia, uintptr_t *ie) {   // [a, e)'s bytes in the host pages it shares with other data; [ia, ie): its whole pages
+    uintptr_t pg = (uintptr_t)getpagesize();
+    *ia = (a + pg - 1) & ~(pg - 1); *ie = e & ~(pg - 1);
+    if (*ie <= *ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; *ia = *ie = 0; return; }
+    r[0][0] = a; r[0][1] = *ia; r[1][0] = *ie; r[1][1] = e;
+}
+static void ab_note(const wb_t *w, const uint8_t *s) {   // the completion thread, right after w landed: before any later write of the chunk, its posts and its NVN fence
+    uint64_t st = nvn_dirty_now(); nvn_dirty_protect(w->dst, (size_t)w->tsize);   // stamp, protect, then read (as vt_upload_): a later CPU write faults and is newer than st
+    uintptr_t r[2][2], ia, ie; edge_rng((uintptr_t)w->dst, (uintptr_t)w->dst + (uintptr_t)w->tsize, r, &ia, &ie);
+    ab_rec e; memset(&e, 0, sizeof e); e.ser = w->ser; e.img = w->img; e.gen = st; e.store = w->dst;
+    for (int k = 0; k < 2; k++) if (r[k][1] > r[k][0]) { e.edge_n[k] = (uint32_t)(r[k][1] - r[k][0]); if (!(e.edge[k] = malloc(e.edge_n[k]))) goto drop; memcpy(e.edge[k], (const void *)r[k][0], e.edge_n[k]); }
+    // after the edge bytes: a CPU write to the texture's own bytes before the copy differs here; one after it differs at ab_take
+    for (size_t y = 0; y < w->rows; y++) if (memcmp(w->dst + y * w->dst_pitch, s + y * w->src_pitch, w->row_bytes)) { atomic_fetch_add(&g_ab_differ, 1); goto drop; }
+    pthread_mutex_lock(&g_ab_mu);
+    int i = 0; while (i < g_nab && g_ab[i].ser != e.ser) i++;
+    if (i == g_nab && g_nab == NAB) { i = 0; for (int k = 1; k < NAB; k++) if (g_ab[k].gen < g_ab[i].gen) i = k; }   // full: the oldest note goes (that texture is uploaded again)
+    if (i < g_nab) { free(g_ab[i].edge[0]); free(g_ab[i].edge[1]); } else g_nab++;
+    g_ab[i] = e; atomic_store(&g_nab_n, g_nab);
+    pthread_mutex_unlock(&g_ab_mu);
+    atomic_fetch_add(&g_ab_noted, 1); return;
+drop: free(e.edge[0]); free(e.edge[1]);
+}
+// → whether it wrote (and prepared) anything
+static int wb_apply(const wb_t *w, const uint8_t *s) {
+    size_t y0 = 0, y1 = w->rows;
+    if (!w->snap || !lsnap_on()) dm_guest_write_prepare(w->dst, w->dst_pitch * (w->rows ? w->rows - 1 : 0) + w->row_bytes);   // pages the dirty tracker protected become writable (and dirty) first
+    else {   // only the span from the first byte the GPU changed to the last is prepared and written (DM_VK_LINWB_SNAP); none: nothing at all
+        const size_t rb = w->row_bytes;
+        while (y0 < w->rows && !memcmp(s + y0 * w->src_pitch, w->snap + y0 * rb, rb)) y0++;
+        if (y0 == w->rows) return 0;
+        y1 = w->rows - 1; while (y1 > y0 && !memcmp(s + y1 * w->src_pitch, w->snap + y1 * rb, rb)) y1--;
+        const uint8_t *g0 = s + y0 * w->src_pitch, *o0 = w->snap + y0 * rb, *g1 = s + y1 * w->src_pitch, *o1 = w->snap + y1 * rb;
+        size_t i0 = 0, i1 = rb - 1; while (g0[i0] == o0[i0]) i0++; while (g1[i1] == o1[i1]) i1--;
+        uint8_t *a = w->dst + y0 * w->dst_pitch + i0, *e = w->dst + y1 * w->dst_pitch + i1 + 1;
+        dm_guest_write_prepare(a, (size_t)(e - a)); y1++;
+    }
+    uint64_t n = 0;
+    for (size_t y = y0; y < y1; y++) {
         uint8_t *d = w->dst + y * w->dst_pitch; const uint8_t *g = s + y * w->src_pitch;
         if (!w->snap) { memcpy(d, g, w->row_bytes); continue; }
         const uint8_t *o = w->snap + y * w->row_bytes;   // only what the GPU changed
         for (size_t i = 0; i < w->row_bytes;) {
             if (i + 8 <= w->row_bytes && !memcmp(g + i, o + i, 8)) { i += 8; continue; }
             size_t e = i; while (e < w->row_bytes && g[e] != o[e]) e++;
-            if (e > i) { memcpy(d + i, g + i, e - i); i = e; } else i++;
+            if (e > i) { memcpy(d + i, g + i, e - i); n += e - i; i = e; } else i++;
         }
     }
+    if (w->lin && w->snap) atomic_fetch_add(&g_lwb_bytes, n);
+    return 1;
 }
 static void post_apply(const post_op *o);   // with the submission code below
 static void prof_collect(chunk *c);   // gfx_vk_draw.inc
@@ -477,7 +621,12 @@ static void chunk_done(chunk *c) {
         if (!o->fill) memmove((void *)(uintptr_t)o->dst, (const void *)(uintptr_t)o->src, o->n);
         else { uint8_t *d = (uint8_t *)(uintptr_t)o->dst; for (uint64_t k = 0; k + 4 <= o->n; k += 4) memcpy(d + k, &o->value, 4); }
     }
-    for (int i = 0; i < c->nwb; i++) { const wb_t *w = &c->wb[i]; wb_apply(w, (w->st >= SP_ST ? c->sb[w->st - SP_ST].p : w->st >= 0 ? c->stg[w->st].p : c->ar[-1 - w->st].p) + w->off); free(c->wb[i].snap); }
+    for (int i = 0; i < c->nwb; i++) { const wb_t *w = &c->wb[i]; const uint8_t *s = (w->st >= SP_ST ? c->sb[w->st - SP_ST].p : w->st >= 0 ? c->stg[w->st].p : c->ar[-1 - w->st].p) + w->off;
+        if (w->lin && wb_revert_on()) rv_check(w, s);   // before it lands: guest memory still holds what the CPU wrote during the pass
+        int wrote = wb_apply(w, s);
+        if (w->lin) atomic_fetch_add(!w->snap || !lsnap_on() ? &g_lwb_whole : wrote ? &g_lwb_diff : &g_lwb_same, 1);
+        if (w->lin == 2 && wrote && wb_absorb_on()) ab_note(w, s);   // right after it: before a later write-back or post of the chunk
+        snap_give(w->snap, w->snap_cap); snap_give(w->dsnap, w->snap_cap); }   // a storage buffer's snapshot: snap_cap 0, freed
     if (c->npq) prof_collect(c);
     if (c->nq) { uint64_t r[1024]; memset(r, 0, sizeof r);
         if (vkGetQueryPoolResults(g_vk.dev, c->qp, 0, (uint32_t)c->nq, sizeof r, r, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
@@ -765,8 +914,30 @@ static _Atomic uint64_t g_mod_made, g_mod_ns, g_cpso_made, g_cpso_ns;   // shade
 static int vt_upload_(vtex *v, const tex_t *t, int track);
 // track 0: a one-time fill (tex_init_fill), with no write tracking: the pages are not protected and no dirty span is kept
 static int vt_upload(vtex *v, const tex_t *t, int track) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); int r = vt_upload_(v, t, track); atomic_fetch_add(&g_up_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); return r; }
+// The upload's sync (DM_VK_UP_RANGE, on; =0: cpu_view, as before). cpu_view waits for every pending write-back and queued copy wherever it writes, and with a linear render target
+// written back in nearly every chunk Breath of the Wild's uploads drained the GPU 2.1 to 2.65 times a frame (Ayn Odin 2: 1.49 submitted + 0.64 in flight a frame in one dump, 1.51 + 1.14
+// in another run). An upload reads only its own storage: it waits only for a pending write overlapping the bytes it reads (chunk_hits: write-backs' and queued copies' destinations),
+// the current chunk submitted and waited for, or the newest overlapping chunk in flight waited for (they complete in order). The open render pass is ended first, as the cb() below
+// would end it, so that its targets' write-backs (lin_writeback) and shadow copies are queued and seen: a dirty texture sampled while it is an attachment of the open pass was read
+// before that pass's write-back existed. Counted at the upload site (submitted / in flight); g_up_free: the uploads that waited for nothing
+static uint64_t g_up_free;
+static int up_range_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UP_RANGE"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[vk] DM_VK_UP_RANGE=0: a texture upload waits for every pending write-back (as before)"); } return v; }
+static void up_view(const vtex *v, const tex_t *t) {
+    if (!up_range_on() || vk_safe()) { g_vs = 2; cpu_view(); return; }
+    rp_end();
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); size_t n = t->L.size;
+    if (bpb && !v->conv && is_linear(t)) {   // the rows vt_upload_ reads, at the stride clamped up to the pitch: possibly past the storage size
+        size_t pitch = (size_t)((v->w + bw - 1) / bw) * bpb, rows = (v->h + bh - 1) / bh, srow = t->L.layer_size / (rows ? rows : 1); if (srow < pitch) srow = pitch;
+        size_t e = (size_t)(v->layers - 1) * t->L.layer_size + srow * (rows ? rows - 1 : 0) + pitch; if (e > n) n = e; }
+    uintptr_t lo = (uintptr_t)t->mem, hi = lo + n; uint64_t seq = 0;
+    if (C && chunk_hits(C, lo, hi, 0)) { g_vsite[2][0]++; submit_wait(); return; }
+    if (atomic_load(&g_inflight_wb) || atomic_load(&g_inflight_cop)) {
+        pthread_mutex_lock(&g_cmu); for (int f = 0; f < g_fifo_n; f++) if (chunk_hits(g_fifo[f], lo, hi, 0)) seq = g_fifo[f]->seq; pthread_mutex_unlock(&g_cmu); }
+    if (seq) { g_vsite[2][1]++; seq_wait(seq); return; }
+    g_up_free++;
+}
 static int vt_upload_(vtex *v, const tex_t *t, int track) {
-    g_vs = 2; cpu_view();
+    up_view(v, t);
     if (track) { v->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size); }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) { RED_ONCE(20, "packaged texture format %#x has no block size", t->d.format); return 0; }
@@ -847,12 +1018,7 @@ static int tex_init_fill(vtex *v, const tex_t *t) {
     return 1;
 }
 // Writes beside a texture (nvn_mtl.m pkg_edge_ranges / pkg_edges_take / pkg_edges_clean): the texture's bytes in the host pages it shares with other data
-static void edge_ranges(const tex_t *t, uintptr_t r[2][2], uintptr_t *ia, uintptr_t *ie) {
-    uintptr_t pg = (uintptr_t)getpagesize(), a = (uintptr_t)t->mem, e = a + t->L.size;
-    *ia = (a + pg - 1) & ~(pg - 1); *ie = e & ~(pg - 1);
-    if (*ie <= *ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; *ia = *ie = 0; return; }
-    r[0][0] = a; r[0][1] = *ia; r[1][0] = *ie; r[1][1] = e;
-}
+static void edge_ranges(const tex_t *t, uintptr_t r[2][2], uintptr_t *ia, uintptr_t *ie) { edge_rng((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size, r, ia, ie); }
 static void edges_take(vtex *v, const tex_t *t) {
     for (int i = 0; i < 2; i++) { free(v->edge[i]); v->edge[i] = NULL; v->edge_n[i] = 0; }
     if (!v->span) return;
@@ -868,6 +1034,24 @@ static int edges_clean(vtex *v, const tex_t *t) {
     for (int i = 0; i < 2; i++) if (v->edge_n[i] && memcmp(v->edge[i], (const void *)r[i][0], v->edge_n[i])) return 0;
     v->stamp = st; g_pkg_edge_skips++;
     return 1;
+}
+// the texture's own write-back noted by the completion thread (ab_note): 1 = adopted, the image is guest memory's content (with the replay's lock held)
+static int ab_take(vtex *v, const tex_t *t) {
+    if (!atomic_load_explicit(&g_nab_n, memory_order_relaxed)) return 0;
+    pthread_mutex_lock(&g_ab_mu);
+    int i = 0; while (i < g_nab && g_ab[i].ser != t->serial) i++;
+    if (i == g_nab) { pthread_mutex_unlock(&g_ab_mu); return 0; }
+    ab_rec e = g_ab[i]; g_ab[i] = g_ab[--g_nab]; atomic_store(&g_nab_n, g_nab);
+    pthread_mutex_unlock(&g_ab_mu);
+    uintptr_t r[2][2], ia, ie; edge_ranges(t, r, &ia, &ie);
+    // still this image, not uploaded after the note (its stamp then is newer), no page wholly inside written since, the bytes in the edge pages as the note kept them
+    int ok = e.img == (uint64_t)v->img && e.store == t->mem && e.gen >= v->stamp && v->span && v->levels == 1 && v->layers == 1
+             && !(ie > ia && nvn_dirty_since_span(v->span, (const void *)ia, ie - ia, e.gen));
+    for (int k = 0; k < 2 && ok; k++) ok = e.edge_n[k] == (r[k][1] > r[k][0] ? r[k][1] - r[k][0] : 0) && (!e.edge_n[k] || !memcmp(e.edge[k], (const void *)r[k][0], e.edge_n[k]));
+    if (ok) { v->stamp = e.gen; for (int k = 0; k < 2; k++) { free(v->edge[k]); v->edge[k] = e.edge[k]; v->edge_n[k] = e.edge_n[k]; e.edge[k] = NULL; } atomic_fetch_add(&g_ab_taken, 1); }   // a neighbour's write in an edge page is judged by them (edges_clean)
+    else atomic_fetch_add(&g_ab_refused, 1);
+    free(e.edge[0]); free(e.edge[1]);
+    return ok;
 }
 // Textures shared by storage (nvn_mtl.m g_alias): an NVN texture object is only a descriptor, and an object made again over the same storage with the same
 // description is the same texture. Games make their transient render targets on new objects every frame (Super Mario Bros. Wonder never finalizes them) and
@@ -909,7 +1093,9 @@ static vtex *vt_get(const tex_t *ct) {
         uint64_t now = nvn_dirty_now();
         int clean = v->span && (now == v->seen || !nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp));
         v->seen = now;
-        if (clean || edges_clean(v, t)) return v;
+        if (clean) return v;
+        if (wb_absorb_on() && ab_take(v, t)) return v;   // written only by its own write-back: the image holds it (ab_note)
+        if (edges_clean(v, t)) return v;
         if (vt_upload(v, t, 1)) { g_pkg_reuploads++; edges_take(v, t); }
         return v;
     }
@@ -1520,8 +1706,12 @@ void mtl_sm_stats(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = *c = 0; }
 void mtl_ubd_stats(uint64_t *a, uint64_t *b) { *a = *b = 0; }
 void mtl_ubp_stats(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = *c = 0; }
 void mtl_ubp_why(uint64_t w[5]) { memset(w, 0, 5 * sizeof *w); }
-void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] frame %llu: resident %llu MB, textures %u, uploads %llu (%llu again), %llu MB uploaded", frame, mb, g_tex.n,
-    (unsigned long long)g_pkg_uploads, (unsigned long long)g_pkg_reuploads, (unsigned long long)(g_up_bytes >> 20));
+void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] frame %llu: resident %llu MB, textures %u, uploads %llu (%llu again), %llu MB uploaded; linear render targets: snapshots %llu "
+    "(%llu not taken: a write was pending), write-backs whole %llu / changed bytes only %llu (%llu KB) / nothing changed %llu, own write-backs absorbed %llu (noted %llu, guest differed %llu, refused %llu) (cumulative)",
+    frame, mb, g_tex.n, (unsigned long long)g_pkg_uploads, (unsigned long long)g_pkg_reuploads, (unsigned long long)(g_up_bytes >> 20), (unsigned long long)g_lsnap, (unsigned long long)g_lsnap_stale,
+    (unsigned long long)atomic_load(&g_lwb_whole), (unsigned long long)atomic_load(&g_lwb_diff), (unsigned long long)(atomic_load(&g_lwb_bytes) >> 10), (unsigned long long)atomic_load(&g_lwb_same),
+    (unsigned long long)atomic_load(&g_ab_taken), (unsigned long long)atomic_load(&g_ab_noted), (unsigned long long)atomic_load(&g_ab_differ), (unsigned long long)atomic_load(&g_ab_refused));
+    if (wb_revert_on()) rv_stat(frame);
     LOG("[vk] guest reads of draws: waited for the current submission %llu, for submissions in flight %llu, no wait %llu; uniform updates and small copies: %llu / %llu / %llu; submissions %llu (cumulative)",
         (unsigned long long)g_view_cur, (unsigned long long)g_view_fly, (unsigned long long)g_view_free, (unsigned long long)g_mem_cur, (unsigned long long)g_mem_fly, (unsigned long long)g_mem_free,
         (unsigned long long)g_flushes);
@@ -1547,8 +1737,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
           frame - f0, (double)(a - a0) / nf, (double)(r - r0) / nf, (double)(sl - s0) / nf, g_sp_on > 0 ? "" : " (DM_VK_STG_POOL=0)", nb, SP_NBLK, fr, SP_BLOCK >> 20, (unsigned long long)g_sp_made, (unsigned long long)atomic_load(&g_sp_trimmed),
           SP_MAXREQ >> 20, (unsigned long long)g_sp_big, (unsigned long long)g_sp_full);
       f0 = frame; a0 = a; r0 = r; s0 = sl; }
-    LOG("[vk] syncs by site (submitted / in flight): other %llu/%llu, draw %llu/%llu, upload %llu/%llu, t2b %llu/%llu, large copy %llu/%llu, buffer texture %llu/%llu, buffer image %llu/%llu, dispatch %llu/%llu",
-        (unsigned long long)g_vsite[0][0], (unsigned long long)g_vsite[0][1], (unsigned long long)g_vsite[1][0], (unsigned long long)g_vsite[1][1], (unsigned long long)g_vsite[2][0], (unsigned long long)g_vsite[2][1],
+    LOG("[vk] syncs by site (submitted / in flight): other %llu/%llu, draw %llu/%llu, upload %llu/%llu (%llu waited for nothing), t2b %llu/%llu, large copy %llu/%llu, buffer texture %llu/%llu, buffer image %llu/%llu, dispatch %llu/%llu",
+        (unsigned long long)g_vsite[0][0], (unsigned long long)g_vsite[0][1], (unsigned long long)g_vsite[1][0], (unsigned long long)g_vsite[1][1], (unsigned long long)g_vsite[2][0], (unsigned long long)g_vsite[2][1], (unsigned long long)g_up_free,
         (unsigned long long)g_vsite[3][0], (unsigned long long)g_vsite[3][1], (unsigned long long)g_vsite[4][0], (unsigned long long)g_vsite[4][1], (unsigned long long)g_vsite[5][0], (unsigned long long)g_vsite[5][1],
         (unsigned long long)g_vsite[6][0], (unsigned long long)g_vsite[6][1], (unsigned long long)g_vsite[7][0], (unsigned long long)g_vsite[7][1]); }
 void mtl_pso_line(char *out, size_t n) { if (n) out[0] = 0; }

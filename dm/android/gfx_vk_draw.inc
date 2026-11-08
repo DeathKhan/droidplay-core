@@ -676,8 +676,9 @@ make:
 // the views (and framebuffers) of an image that goes: destroyed with it
 static nvn_hmap g_fbs;
 static void bcrt_drop(VkImage base);   // below, with the render passes
+static void lsnap_drop_img(VkImage img);   // below, with the render passes
 static void views_drop(VkImage img) {
-    bcrt_drop(img);
+    bcrt_drop(img); lsnap_drop_img(img);
     for (uint32_t i = 0; i < g_views.cap; i++) {
         if (!g_views.vals[i]) continue;
         view_key *k = (view_key *)(void *)(g_views.keys + (size_t)i * g_views.klen);
@@ -758,7 +759,8 @@ static VkRenderPass rp_get(const rp_key *k) {
     nvn_hm_put(&g_rps, k, rp);
     return rp;
 }
-static struct { int active; VkRenderPass rp; rp_key key; uint32_t w, h; VkFramebuffer fb; vtex *cv[8]; uint32_t clv[8], cly[8]; } P;
+static struct { int active; VkRenderPass rp; rp_key key; uint32_t w, h; VkFramebuffer fb; vtex *cv[8]; uint32_t clv[8], cly[8];
+                uint8_t *snap[8]; size_t snap_cap[8], snap_n[8]; uint8_t *snap_dst[8]; VkImage snap_img[8]; } P;   // snap: a linear target's guest bytes at rp_prepare (lsnap_take), until its write-back takes them
 static uint64_t g_passes;
 // DM_VK_DUMP=<frame>: every render pass of that frame (counted in presents from 1) has its colour targets copied out when it ends, written to
 // $DM_DUMP_DIR/f<frame>_p<pass>_a<attachment>_<w>x<h>_vk<format>_s<serial>.raw once the frame is presented, with a log line per draw (shaders, viewport, textures)
@@ -923,29 +925,59 @@ static void bcrt_copy(vtex *b, vtex *s, uint32_t lv, uint32_t ly, int back) {   
 // pool's memory after a fence. nvn_mtl.m makes such a texture a view on the pool's memory, so the GPU writes land there; here the image is the texture, so the level drawn
 // is copied back into guest memory (rows at the texture's stride, as vt_upload reads them) when the chunk completes, before its fence is signalled (chunk_done).
 // Breath of the Wild draws about twenty (1×1 to 512×512, CPU_CACHED | GPU_CACHED pools) and reads ground heights from them: read as zeros, every grass press got the presser's
-// world height instead of its height above the ground (about 250 instead of below 1 at Link's feet), pressed nothing, and the grass stood through Link's legs
-static void lin_writeback(vtex *v, uint32_t lv, uint32_t ly) {
-    if (!v->pkg || !v->store || v->conv || lv || v->type == VK_IMAGE_TYPE_3D || v->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(v->desc.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return;
-    if (v->pool && (((const pool_t *)v->pool)->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) return;   // the CPU cannot read it: nothing to hand over
-    int bw, bh, bpb = nvn_fmt_bpb(v->desc.format, &bw, &bh); if (!bpb) return;
+// world height instead of its height above the ground (about 250 instead of below 1 at Link's feet), pressed nothing, and the grass stood through Link's legs.
+// Only the bytes the pass changed against its snapshot are written, and the texture keeps its image after its own write-back (gfx_vk.c, linear render targets' write-backs)
+// the level of a linear render target its pass writes back (lin_writeback, lsnap_take): rows of pitch bytes at stride srow from dst; size: the storage's; 0 = none (not one, or its pool the CPU cannot read)
+static int lin_geom(const vtex *v, uint32_t lv, uint32_t ly, size_t *pitch, size_t *rows, size_t *srow, uint8_t **dst, uint64_t *size) {
+    if (!v->pkg || !v->store || v->conv || lv || v->type == VK_IMAGE_TYPE_3D || v->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(v->desc.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return 0;
+    if (v->pool && (((const pool_t *)v->pool)->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) return 0;   // the CPU cannot read it: nothing to hand over
+    int bw, bh, bpb = nvn_fmt_bpb(v->desc.format, &bw, &bh); if (!bpb) return 0;
     nvn_texlayout L; nvn_tex_layout(&v->desc, &L);
-    size_t pitch = (size_t)((v->w + bw - 1) / bw) * bpb, rows = (v->h + bh - 1) / bh, srow = L.layer_size / (rows ? rows : 1); if (srow < pitch) srow = pitch;
+    *pitch = (size_t)((v->w + bw - 1) / bw) * bpb; *rows = (v->h + bh - 1) / bh; *srow = L.layer_size / (*rows ? *rows : 1); if (*srow < *pitch) *srow = *pitch;
+    *dst = (uint8_t *)v->store + (size_t)ly * L.layer_size; *size = L.size;
+    return bpb;
+}
+static int linwb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_LINWB"); v = !e || atoi(e) != 0; } return v; }   // DM_VK_LINWB=0 (env.txt): no linear write-back, a diagnostic
+// The pass's snapshot of a linear target's guest bytes (gfx_vk.c, linear render targets' write-backs): taken at rp_prepare right after vt_get, when the image equals guest memory
+// there, unless a write-back or queued copy to those bytes is still pending (it would land after the snapshot: the pass is then written back whole). Packed at the pitch, read at
+// the texture's stride as vt_upload_ reads it; held in P until rp_end hands it to the write-back (a pooled buffer for 64 KB and up: snap_take), given back on every other path:
+// the next rp_prepare (a draw that failed after it, or none began the pass), a failed rp_prepare, a target its write-back did not take, an image that goes (views_drop)
+static void lsnap_drop(int i) { snap_give(P.snap[i], P.snap_cap[i]); P.snap[i] = NULL; P.snap_cap[i] = 0; }
+static void lsnap_drop_all(void) { for (int i = 0; i < 8; i++) if (P.snap[i]) lsnap_drop(i); }
+static void lsnap_drop_img(VkImage img) { for (int i = 0; i < 8; i++) if (P.snap[i] && P.snap_img[i] == img) lsnap_drop(i); }
+static void lsnap_take(int i, const vtex *v, uint32_t lv, uint32_t ly) {
+    if ((!lsnap_on() && !wb_revert_on()) || !linwb_on()) return;
+    size_t pitch, rows, srow, cap; uint8_t *dst; uint64_t size;
+    if (!lin_geom(v, lv, ly, &pitch, &rows, &srow, &dst, &size)) return;
+    if (wr_pending((uintptr_t)dst, (uintptr_t)dst + srow * (rows - 1) + pitch)) { g_lsnap_stale++; return; }
+    uint8_t *p = snap_take(pitch * rows, &cap); if (!p) return;
+    for (size_t r = 0; r < rows; r++) memcpy(p + r * pitch, dst + r * srow, pitch);
+    P.snap[i] = p; P.snap_cap[i] = cap; P.snap_n[i] = pitch * rows; P.snap_dst[i] = dst; P.snap_img[i] = v->img; g_lsnap++;
+}
+static void lin_writeback(int i) {   // attachment i of the pass that ends
+    vtex *v = P.cv[i]; uint32_t ly = P.cly[i]; size_t pitch, rows, srow; uint8_t *dst; uint64_t size;
+    int bpb = lin_geom(v, P.clv[i], ly, &pitch, &rows, &srow, &dst, &size); if (!bpb) return;
     stg_sl s = stg_take(pitch * rows, bpb); if (!s.p) return;
     VkBufferImageCopy r = {.bufferOffset = s.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, ly, 1}, .imageExtent = {v->w, v->h, 1}};
     cb_barrier(); vkCmdCopyImageToBuffer(C->cb, v->img, VK_IMAGE_LAYOUT_GENERAL, s.b, 1, &r); cb_barrier();
-    wb_t *w = wb_add(); if (w) *w = (wb_t){s.st, (size_t)s.off, pitch, rows, pitch, srow, (uint8_t *)v->store + (size_t)ly * L.layer_size, NULL, 0};
+    wb_t *w = wb_add();
+    if (w) { *w = (wb_t){s.st, (size_t)s.off, pitch, rows, pitch, srow, dst, NULL, 0};
+        w->lin = v->levels == 1 && v->layers == 1 && !ly && srow * (rows - 1) + pitch <= size ? 2 : 1;   // 2: it covers every byte vt_upload_ reads, inside the storage it protects (ab_note)
+        w->ser = v->serial; w->img = (uint64_t)v->img; w->fmt = v->desc.format; w->bpb = (uint32_t)bpb; w->w = v->w; w->h = v->h; w->tsize = size;
+        if (P.snap[i] && P.snap_dst[i] == dst && P.snap_n[i] == pitch * rows) { *(lsnap_on() ? &w->snap : &w->dsnap) = P.snap[i]; w->snap_cap = P.snap_cap[i]; P.snap[i] = NULL; P.snap_cap[i] = 0; } }
     static int nlog; if (nlog++ < 4) LOG("[vk] linear render target s%llu %ux%u (format %#x) written back to guest memory after its pass", (unsigned long long)v->serial, v->w, v->h, v->desc.format);
 }
 static void rp_end(void) {
     if (!P.active) return;
     occl_end(); prof_pass_end(); vkCmdEndRenderPass(C->cb); P.active = 0; if (dump_on()) dump_pass_end();
     for (int i = 0; i < 8; i++) if (g_bcrt_pend[i].sh) { bcrt_copy(g_bcrt_pend[i].base, g_bcrt_pend[i].sh, g_bcrt_pend[i].lv, g_bcrt_pend[i].ly, 1); g_bcrt_pend[i].sh = NULL; }
-    static int linwb = -1; if (linwb < 0) { const char *e = getenv("DM_VK_LINWB"); linwb = !e || atoi(e) != 0; }   // DM_VK_LINWB=0 (env.txt): no linear write-back, a diagnostic
-    if (linwb) for (int i = 0; i < 8; i++) if (P.cv[i]) lin_writeback(P.cv[i], P.clv[i], P.cly[i]);
+    if (linwb_on()) for (int i = 0; i < 8; i++) if (P.cv[i]) lin_writeback(i);
+    lsnap_drop_all();   // what no write-back took
 }
 // the render pass of the bound render targets (R.rt): images, views and framebuffer, made before the draw's textures are resolved (that may record uploads, outside a pass)
 static int rp_prepare(void) {
     if (P.active) return 1;
+    lsnap_drop_all();   // an earlier rp_prepare's that no pass used
     if (!R.has_rt) { RED_ONCE(83, "draw with no render target set"); return 0; }
     memset(P.cv, 0, sizeof P.cv); memset(g_bcrt_pend, 0, sizeof g_bcrt_pend);
     rp_key k; memset(&k, 0, sizeof k); VkImageView views[9]; memset(views, 0, sizeof views); uint32_t nv = 0, w = UINT32_MAX, h = UINT32_MAX, layers = 1; k.samples = 1;
@@ -970,6 +1002,7 @@ static int rp_prepare(void) {
         g_view_fmt = cv ? view_format(v, cv) : VK_FORMAT_UNDEFINED; VkFormat af = g_view_fmt ? g_view_fmt : v->fmt;
         g_view_slice = 1; VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, 1, VK_IMAGE_ASPECT_COLOR_BIT, NULL); g_view_slice = 0; g_view_fmt = VK_FORMAT_UNDEFINED; if (!iv) continue;
         k.color[i] = af; k.samples = v->samples; views[nv++] = iv; P.cv[i] = v; P.clv[i] = lv; P.cly[i] = ly;
+        lsnap_take((int)i, v, lv, ly);   // a linear target: its guest bytes now, which its write-back diffs against
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh;
     }
     if (R.rt.depth) {
@@ -981,13 +1014,13 @@ static int rp_prepare(void) {
             if (iv) { k.depth = v->fmt; k.samples = v->samples; views[nv++] = iv; uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh; }
         }
     }
-    if (!nv || w == UINT32_MAX) { RED_ONCE(84, "render targets without an image"); return 0; }
-    VkRenderPass rp = rp_get(&k); if (!rp) return 0;
+    if (!nv || w == UINT32_MAX) { RED_ONCE(84, "render targets without an image"); lsnap_drop_all(); return 0; }
+    VkRenderPass rp = rp_get(&k); if (!rp) { lsnap_drop_all(); return 0; }
     struct { VkImageView v[9]; uint32_t w, h, l; } fk; memset(&fk, 0, sizeof fk); memcpy(fk.v, views, sizeof views); fk.w = w; fk.h = h; fk.l = layers;
     VkFramebuffer fb = nvn_hm_get(&g_fbs, &fk);
     if (!fb) {
         VkFramebufferCreateInfo fc = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = nv, .pAttachments = views, .width = w, .height = h, .layers = layers};
-        if (vkCreateFramebuffer(g_vk.dev, &fc, NULL, &fb) != VK_SUCCESS) { RED_ONCE(85, "framebuffer %ux%u failed", w, h); return 0; }
+        if (vkCreateFramebuffer(g_vk.dev, &fc, NULL, &fb) != VK_SUCCESS) { RED_ONCE(85, "framebuffer %ux%u failed", w, h); lsnap_drop_all(); return 0; }
         nvn_hm_put(&g_fbs, &fk, fb);
     }
     P.rp = rp; P.key = k; P.w = w; P.h = h; P.fb = fb;
