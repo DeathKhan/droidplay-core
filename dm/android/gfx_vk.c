@@ -33,7 +33,7 @@
 #include "../third_party/bcdec/bcdec.h"
 
 static int vk_debug(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_DEBUG") != NULL; return v; }   // DM_VK_DEBUG=1: a log line per upload and texture-to-buffer copy
-#define RED_ONCE(id, ...) do { static int once_; if (!once_++) LOG("[RED] [vk] " __VA_ARGS__); } while (0)
+#define RED_ONCE(id, ...) do { static int once_; if (!once_) { once_ = 1; LOG("[RED] [vk] " __VA_ARGS__); } } while (0)   // a flag: a counter (!once_++) overflowed on a path taken every draw
 static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one thread's at a time: submissions, CPU reads, texture lifetimes
 
 // ---------------- The device ----------------
@@ -1301,6 +1301,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         (unsigned long long)g_view_cur, (unsigned long long)g_view_fly, (unsigned long long)g_view_free, (unsigned long long)g_mem_cur, (unsigned long long)g_mem_fly, (unsigned long long)g_mem_free,
         (unsigned long long)g_flushes);
     LOG("[vk] constant and storage buffer copies: %llu reused, %llu made (cumulative; gfx_vk_draw.inc ucopy)", (unsigned long long)g_ucopy_hit, (unsigned long long)g_ucopy_miss);
+    LOG("[vk] support buffer: %llu stages wrote it, %llu left it unwritten (no module reads binding 0) (cumulative; gfx_vk_draw.inc stage_set)", (unsigned long long)g_sup_written, (unsigned long long)g_sup_skipped);
+    if (c2_check()) LOG("[vk] c2 check: %llu handle words compared with c2_word, %llu differed (cumulative; gfx_vk_draw.inc bank_word)", (unsigned long long)g_c2_checked, (unsigned long long)g_c2_bad);
     LOG("[vk] geometry kept on the GPU: %llu index / vertex bindings from kept copies, %llu copies kept (%llu MB now), %llu copied per draw (cumulative; gfx_vk_draw.inc gc_get)",
         (unsigned long long)g_gc_hit, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy);
     { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);
