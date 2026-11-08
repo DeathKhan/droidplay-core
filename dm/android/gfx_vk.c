@@ -133,7 +133,7 @@ typedef struct { uint64_t src, dst, n; uint32_t value; int fill; } cop_t;   // a
 typedef struct chunk {
     VkCommandPool pool; VkCommandBuffer cb; VkFence fence; int open, busy, ts, ndraw, held; uint64_t seq, nvn_fence, hold;
     VkQueryPool qp; int nq; uint64_t qg[1024];   // occlusion queries begun in it: query i counts NVN samples-passed slot qg[i] (occl_* below)
-    VkQueryPool pq; int npq;   // render pass timestamps of a profiled frame (prof_* in gfx_vk_draw.inc)
+    VkQueryPool pq; int npq, pqr;   // render pass timestamps of a profiled frame (prof_* in gfx_vk_draw.inc); pqr: pq was reset when this recording began (cb())
     VkQueryPool tq; int ntq; uint64_t t_end;   // timestamps of the game's counter reports (kind 4 posts); the GPU time the chunk ended (g_tsq)   // hold: a later chunk reads this one's arena on the GPU (gfx_vk_draw.inc fwd_find): kept busy (held) until that one completes   // ndraw: draws and dispatches recorded (early submission: mtl_exec)   // ts: GPU timestamps written at its start and end (g_tsq)
     stg_t *stg; int nstg, capstg; wb_t *wb; int nwb, capwb; post_op *post; int npost, cappost; dead_t *dead; int ndead, capdead; cop_t *cop; int ncop, capcop;
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
@@ -189,13 +189,20 @@ static chunk *cur(void) {   // the chunk being recorded: a free one is taken (wa
     pthread_mutex_unlock(&g_cmu);
     return C;
 }
+// Query resets. vkCmdResetQueryPool costs the Adreno driver about 15 ns a query plus about 1.6 us a call on the recording thread (one call per query inside, building
+// packets): the four resets at every chunk begin (2 + 1024 + 256 + 512 queries, about 62 chunks a frame) were 4.8% of Breath of the Wild's render thread on an Ayn Odin 2,
+// about 1.9 ms a frame (simpleperf; the stripped driver function 409aee7a under cb()), the 512 render pass timestamps alone 1.35% (about 0.5 ms), for a pool that only a
+// frame profiled through prof_now writes. That pool is reset only by a chunk begun in a profiled frame (pqr); a chunk begun before (the frame turned profiled while it was
+// open) records no pass timestamps, since its queries were not reset. DM_VK_QRESET_USED=0 (env.txt): every pool is reset at every begin again, as before
+static int qr_used(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_QRESET_USED"); v = !(e && *e == '0'); } return v; }
+static int prof_on(void);   // gfx_vk_draw.inc
 static VkCommandBuffer cb(void) {
     if (!cur()) return VK_NULL_HANDLE;
     if (!C->open) { VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vkBeginCommandBuffer(C->cb, &bi); C->open = 1;
         if (g_tsq) { uint32_t q = 2 * (uint32_t)(C - g_ch); vkCmdResetQueryPool(C->cb, g_tsq, q, 2); vkCmdWriteTimestamp(C->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_tsq, q); C->ts = 1; }
         if (C->qp) vkCmdResetQueryPool(C->cb, C->qp, 0, 1024); C->nq = 0;
         if (C->tq) vkCmdResetQueryPool(C->cb, C->tq, 0, 256); C->ntq = 0;
-        if (C->pq) vkCmdResetQueryPool(C->cb, C->pq, 0, 512); C->npq = 0; }
+        C->pqr = C->pq && (prof_on() || !qr_used()); if (C->pqr) vkCmdResetQueryPool(C->cb, C->pq, 0, 512); C->npq = 0; }
     rp_end();   // transfers and clears run outside a draw's render pass (only the draw path records inside one, through C->cb)
     return C->cb;
 }
