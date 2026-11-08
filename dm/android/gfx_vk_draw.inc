@@ -859,10 +859,10 @@ static void lin_writeback(vtex *v, uint32_t lv, uint32_t ly) {
     int bw, bh, bpb = nvn_fmt_bpb(v->desc.format, &bw, &bh); if (!bpb) return;
     nvn_texlayout L; nvn_tex_layout(&v->desc, &L);
     size_t pitch = (size_t)((v->w + bw - 1) / bw) * bpb, rows = (v->h + bh - 1) / bh, srow = L.layer_size / (rows ? rows : 1); if (srow < pitch) srow = pitch;
-    stg_t *s = stg_take(pitch * rows); if (!s) return; int si = (int)(s - C->stg);
-    VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, ly, 1}, .imageExtent = {v->w, v->h, 1}};
-    cb_barrier(); vkCmdCopyImageToBuffer(C->cb, v->img, VK_IMAGE_LAYOUT_GENERAL, s->b, 1, &r); cb_barrier();
-    wb_t *w = wb_add(); if (w) *w = (wb_t){si, 0, pitch, rows, pitch, srow, (uint8_t *)v->store + (size_t)ly * L.layer_size, NULL, 0};
+    stg_sl s = stg_take(pitch * rows, bpb); if (!s.p) return;
+    VkBufferImageCopy r = {.bufferOffset = s.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, ly, 1}, .imageExtent = {v->w, v->h, 1}};
+    cb_barrier(); vkCmdCopyImageToBuffer(C->cb, v->img, VK_IMAGE_LAYOUT_GENERAL, s.b, 1, &r); cb_barrier();
+    wb_t *w = wb_add(); if (w) *w = (wb_t){s.st, (size_t)s.off, pitch, rows, pitch, srow, (uint8_t *)v->store + (size_t)ly * L.layer_size, NULL, 0};
     static int nlog; if (nlog++ < 4) LOG("[vk] linear render target s%llu %ux%u (format %#x) written back to guest memory after its pass", (unsigned long long)v->serial, v->w, v->h, v->desc.format);
 }
 static void rp_end(void) {
