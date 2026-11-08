@@ -424,6 +424,7 @@ static void *chunk_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-done");
     uint64_t last = 0;   // the GPU time the previous chunk ended (g_fgpu: each chunk counts its span after it)
     void dm_android_hint_thread(int32_t tid); dm_android_hint_thread(gettid());   // in the performance hint session (plat_android.c): the replay waits for its write-backs
+    void dm_android_place_thread(int done); dm_android_place_thread(1);   // the placement experiment (DM_VK_PIN_DONE, DM_VK_UCLAMP_MIN), off by default
     for (;;) {
         pthread_mutex_lock(&g_cmu); while (!g_fifo_n) pthread_cond_wait(&g_ccv, &g_cmu); chunk *c = g_fifo[0]; pthread_mutex_unlock(&g_cmu);
         VkResult fr = vkWaitForFences(g_vk.dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
@@ -1104,7 +1105,14 @@ static void hint_frame(uint64_t now, uint64_t from) {   // the present thread, b
     int k, kmin, th; uint64_t vs = nvn_fstep_hold(&k, &kmin, &th), hold = vs ? (uint64_t)(FSTEP_FIT * (k - 1 > kmin ? k - 1 : kmin) * (double)vs) : 0;
     dm_android_hint_frame(span > paced && span < 1000000000ull ? span - paced : 0, t, n, hold, th);   // a second or more since the last present (loading, the app in the background) is no frame
 }
-void mtl_sub_begin(void) { pthread_mutex_lock(&g_bk); hint_note(); }
+// DM_VK_PLACE_LOG=1: the CPUs the replay ran on, sampled at each submit and logged every 300 presents (mtl_present); the placement experiment's switches: plat_android.c
+static int place_log_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PLACE_LOG"); v = e && atoi(e); } return v; }
+static unsigned g_place_cpu[16], g_place_n;   // under g_bk
+void mtl_sub_begin(void) {
+    pthread_mutex_lock(&g_bk); hint_note();
+    static __thread int placed; if (!placed) { placed = 1; void dm_android_place_thread(int done); dm_android_place_thread(0); }
+    if (place_log_on()) { int c = sched_getcpu(); g_place_cpu[c >= 0 && c < 16 ? c : 15]++; g_place_n++; }
+}
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 // Buffer copies and fills: done on the CPU (GPU address = CPU address). A large one goes to the completion thread, in its place in the queue, so the submitting
@@ -1348,6 +1356,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (dump_on()) { if (v) LOG("[dump] frame %ld presents ser=%llu %ux%u vk%d", dump_frame(), (unsigned long long)v->serial, v->w, v->h, v->fmt); all_wait(); dump_write();
         if (v) { char p[700]; snprintf(p, sizeof p, "%s/f%ld_present.png", getenv("DM_DUMP_DIR") ? getenv("DM_DUMP_DIR") : ".", dump_frame()); shot_write(v, crop, p); } }
     shot_poll(atomic_load(&g_presents), v, crop);
+    if (place_log_on() && g_place_n && atomic_load(&g_presents) % 300 == 299) {   // the CPUs the replay's submits ran on since the last line, in percent
+        char l[256]; size_t o = 0; for (int c = 0; c < 16; c++) if (g_place_cpu[c]) o += (size_t)snprintf(l + o, sizeof l - o, " cpu%d %.0f%%", c, 100.0 * g_place_cpu[c] / g_place_n);
+        LOG("[place] replay submits up to present %llu:%s (%u submits)", (unsigned long long)atomic_load(&g_presents) + 1, l, g_place_n); memset(g_place_cpu, 0, sizeof g_place_cpu); g_place_n = 0; }
     if (v) {
         pthread_mutex_lock(&g_frame_mu);
         g_frame = (vkb_frame){v->img, v->fmt, v->w, v->h, {0, 0, (int)v->w, (int)v->h}, atomic_load(&g_presents) + 1, g_origin_ll}; g_frame_serial = v->serial;

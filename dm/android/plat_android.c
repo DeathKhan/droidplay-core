@@ -187,6 +187,36 @@ int dm_android_rt_declared(mach_port_t t, uint64_t *period_ns, uint64_t *comp_ns
     return in;
 }
 void dm_android_hint_thread(int32_t tid) { pthread_mutex_lock(&g_hint_mu); g_hint_done = tid; pthread_mutex_unlock(&g_hint_mu); }   // gfx_vk.c chunk_thread
+
+// ---- Experiment: where the replay runs (DM_VK_PIN, DM_VK_PIN_DONE, DM_VK_UCLAMP_MIN), off by default ----
+// Breath of the Wild 1.9.0 on an Ayn Odin 2: while adb's screenrecord ran, the replay thread's CPU time fell about 27% (10.8 ms a frame, fitted over 14 runs) at the same
+// draws, so the clock, the core or the memory bus the thread gets, not its work, decides about a quarter of the replay; the performance hint's full-boost requests did not get
+// it. These test which. DM_VK_PIN=<hex CPU mask>: each thread that replays is pinned there (sched_setaffinity; the Odin 2's Cortex-X3 is cpu7, 0x80), DM_VK_PIN_DONE=<mask>
+// the completion thread; DM_VK_UCLAMP_MIN=<0..1024>: their util clamp minimum (sched_setattr with SCHED_FLAG_UTIL_CLAMP_MIN, policy, priority and nice kept), which under
+// EAS/WALT raises the clock the thread is given and the capacity of the core it is placed on. Each result is logged once per thread; a refusal (EPERM, EINVAL) changes nothing
+#include <sched.h>
+#include <sys/syscall.h>
+#include <sys/resource.h>
+struct dm_sched_attr { uint32_t size, policy; uint64_t flags; int32_t nice; uint32_t prio; uint64_t runtime, deadline, period; uint32_t util_min, util_max; };   // uapi sched_attr, SCHED_ATTR_SIZE_VER1
+void dm_android_place_thread(int done) {   // gfx_vk.c, once per thread: done = the replay's completion thread
+    int32_t tid = gettid(); const char *who = done ? "completion" : "replay";
+    const char *pm = getenv(done ? "DM_VK_PIN_DONE" : "DM_VK_PIN");
+    if (pm && *pm) {
+        unsigned long m = strtoul(pm, NULL, 16); cpu_set_t cs; CPU_ZERO(&cs);
+        for (int c = 0; c < (int)(8 * sizeof m) && c < CPU_SETSIZE; c++) if (m >> c & 1) CPU_SET(c, &cs);
+        int r = m ? sched_setaffinity(tid, sizeof cs, &cs) : -1;
+        LOG("[place] %s thread %d: CPU mask 0x%lx %s", who, tid, m, !m ? "is empty, not pinned" : r ? strerror(errno) : "set");
+    }
+    const char *um = getenv("DM_VK_UCLAMP_MIN");
+    if (um && *um) {
+        struct dm_sched_attr a; memset(&a, 0, sizeof a); a.size = sizeof a;
+        a.flags = 0x08 | 0x10 | 0x20;   // SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP_MIN
+        errno = 0; int nv = getpriority(PRIO_PROCESS, (id_t)tid); a.nice = errno ? 0 : nv;   // the permission check compares the nice given with the thread's: give its own
+        int v = atoi(um); a.util_min = (uint32_t)(v < 0 ? 0 : v > 1024 ? 1024 : v); a.util_max = 1024;
+        long r = syscall(SYS_sched_setattr, tid, &a, 0);
+        LOG("[place] %s thread %d: util clamp minimum %u %s (nice %d)", who, tid, a.util_min, r ? strerror(errno) : "set", a.nice);
+    }
+}
 int dm_thermal_now(void);
 // gfx_vk.c hint_frame, on the present thread once per present: the frame's work (0 = none to report), the other threads that acquired or replayed it, the frame step's target
 // (0 = it does not decide the hold) and whether its thermal cap holds 30 fps
