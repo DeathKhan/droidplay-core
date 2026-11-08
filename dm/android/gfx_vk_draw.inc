@@ -1460,6 +1460,7 @@ static void stage_textures(vshader *s) {
 // each, mostly the same from draw to draw; copying them again for every draw was the largest cost of its render thread on an Adreno 619 (memcpy, 15%)
 typedef struct { const void *src; size_t n; uint64_t seq; VkBuffer b; VkDeviceSize off; uint8_t *shadow; size_t cap; } ucopy_t;
 static int support_skip(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SUPPORT_SKIP"); v = !(e && *e == '0'); } return v; }   // stage_set
+static int desc_scratch(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DESC_SCRATCH"); v = !(e && *e == '0'); } return v; }   // stage_set
 static uint64_t g_sup_written, g_sup_skipped;   // stages that wrote the support buffer / left it unwritten (stage_set)
 static ucopy_t g_ucopy[1024]; static uint64_t g_ucopy_hit, g_ucopy_miss;
 static int ucopy(const void *src, size_t n, size_t al, VkBuffer *b, VkDeviceSize *off) {   // src NULL: al zero bytes (not cached)
@@ -1543,11 +1544,13 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
     // the texture and image descriptors' infos in a scratch kept from call to call, grown to nel + 1 here, before any pointer into it is in wr[], and never in the middle: a malloc
     // and a free of each per stage cost Breath of the Wild 1.6 ms a frame on the Odin 2 (30,000 calls, mostly scudo's lock atomics). One scratch serves because stage_set is
     // the replay's alone: its callers (vk_draw, tf_capture, vk_dispatch) run only in mtl_exec, between mtl_sub_begin and mtl_sub_commit under g_bk, nothing it calls reaches
-    // them again, and Vulkan reads pImageInfo / pTexelBufferView only during vkUpdateDescriptorSets (as the static support buffer p above, and C)
-    static VkDescriptorImageInfo *g_ii; static VkBufferView *g_bvs; static size_t g_icap;
-    if (nel + 1 > g_icap) { size_t c = nel + 1 > 64 ? nel + 1 : 64; VkDescriptorImageInfo *ni = realloc(g_ii, c * sizeof *ni); if (!ni) return 0; g_ii = ni;
-        VkBufferView *nb = realloc(g_bvs, c * sizeof *nb); if (!nb) return 0; g_bvs = nb; g_icap = c; }
-    ii = g_ii; bvs = g_bvs;   // (no early return past here)
+    // them again, and Vulkan reads pImageInfo / pTexelBufferView only during vkUpdateDescriptorSets (as the static support buffer p above, and C).
+    // DM_VK_DESC_SCRATCH=0 (env.txt): a malloc and a free of each per stage, as before (the A/B of this alone)
+    static VkDescriptorImageInfo *g_ii; static VkBufferView *g_bvs; static size_t g_icap; int own = !desc_scratch();
+    if (own) { ii = malloc((nel + 1) * sizeof *ii); bvs = malloc((nel + 1) * sizeof *bvs); if (!ii || !bvs) { free(ii); free(bvs); return 0; } }
+    else { if (nel + 1 > g_icap) { size_t c = nel + 1 > 64 ? nel + 1 : 64; VkDescriptorImageInfo *ni = realloc(g_ii, c * sizeof *ni); if (!ni) return 0; g_ii = ni;
+               VkBufferView *nb = realloc(g_bvs, c * sizeof *nb); if (!nb) return 0; g_bvs = nb; g_icap = c; }
+           ii = g_ii; bvs = g_bvs; }   // (no early return past here)
     pthread_mutex_lock(&g_reg_mu);
     for (int i = 0; i < s->ntx; i++) {
         const rb_tex *t = &s->tx[i]; int cnt = t->array > 1 ? (t->array > 1024 ? 1024 : t->array) : 1;
@@ -1611,6 +1614,7 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
     }
     pthread_mutex_unlock(&g_reg_mu);
     vkUpdateDescriptorSets(g_vk.dev, nw, wr, 0, NULL);
+    if (own) { free(ii); free(bvs); }
     return 1;
 }
 
