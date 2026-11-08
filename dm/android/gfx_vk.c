@@ -348,6 +348,7 @@ static _Atomic uint64_t g_fence, g_done, g_presents;
 static pthread_mutex_t g_fmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_fcv = PTHREAD_COND_INITIALIZER;
 static void *chunk_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-done");
+    void dm_android_hint_thread(int32_t tid); dm_android_hint_thread(gettid());   // in the performance hint session (plat_android.c): the replay waits for its write-backs
     for (;;) {
         pthread_mutex_lock(&g_cmu); while (!g_fifo_n) pthread_cond_wait(&g_ccv, &g_cmu); chunk *c = g_fifo[0]; pthread_mutex_unlock(&g_cmu);
         vkWaitForFences(g_vk.dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
@@ -989,7 +990,32 @@ static void post(post_op o) {   // done when the current chunk completes, after 
     if (C->npost == C->cappost) { C->cappost = C->cappost ? 2 * C->cappost : 64; C->post = realloc(C->post, C->cappost * sizeof *C->post); }
     C->post[C->npost++] = o;
 }
-void mtl_sub_begin(void) { pthread_mutex_lock(&g_bk); }
+// ---------------- The frame's work, for the performance hint (plat_android.c dm_android_hint_frame) ----------------
+// Present to present, from the end of the last present's pacing sleep to the start of this one's, less the acquires' pacing waits in between (hle_nvn.c dm_acquire_paced):
+// the frame step's cost (fstep_tick: the time between frame starts less the acquire's wait) with mtl_present's own sleep left out as well. That sleep counted as work,
+// so at hold 3 the cost was 3 vsyncs whatever the work (Breath of the Wild on an Ayn Odin 2: about 43 ms of work and about 7 ms asleep in present per 50 ms frame);
+// reported to the hint, it would have asked for full boost at any load. Wall clock, as the hint's contract asks: the replay's waits for the GPU (about 5 ms a
+// frame there) are part of the frame. The threads that acquired or replayed since the last present go with it, so the session follows the threads doing the work
+static _Atomic uint64_t g_hint_paced, g_hint_gen = 1;   // the acquires' pacing since the last present; presents so far (+ 1), for hint_note
+static pthread_mutex_t g_hint_mu = PTHREAD_MUTEX_INITIALIZER; static int32_t g_hint_tid[3]; static int g_hint_ntid;
+static void hint_note(void) {   // the calling thread works on this frame (once per thread and frame)
+    static __thread uint64_t seen; uint64_t g = atomic_load_explicit(&g_hint_gen, memory_order_relaxed);
+    if (seen == g) return;
+    seen = g; int32_t t = gettid();
+    pthread_mutex_lock(&g_hint_mu);
+    int i = 0; while (i < g_hint_ntid && g_hint_tid[i] != t) i++;
+    if (i == g_hint_ntid && i < 3) g_hint_tid[g_hint_ntid++] = t;
+    pthread_mutex_unlock(&g_hint_mu);
+}
+void dm_acquire_paced(uint64_t ns) { atomic_fetch_add_explicit(&g_hint_paced, ns, memory_order_relaxed); hint_note(); }
+static void hint_frame(uint64_t now, uint64_t from) {   // the present thread, before its pacing sleep; from: when the last one ended (0 = no present yet)
+    void dm_android_hint_frame(uint64_t work_ns, const int32_t *tids, int n);
+    int32_t t[3]; pthread_mutex_lock(&g_hint_mu); int n = g_hint_ntid; memcpy(t, g_hint_tid, sizeof t); g_hint_ntid = 0; pthread_mutex_unlock(&g_hint_mu);
+    atomic_fetch_add_explicit(&g_hint_gen, 1, memory_order_relaxed);
+    uint64_t paced = atomic_exchange_explicit(&g_hint_paced, 0, memory_order_relaxed), span = from && now > from ? now - from : 0;
+    dm_android_hint_frame(span > paced && span < 1000000000ull ? span - paced : 0, t, n);   // a second or more since the last present (loading, the app in the background) is no frame
+}
+void mtl_sub_begin(void) { pthread_mutex_lock(&g_bk); hint_note(); }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 // Buffer copies and fills: done on the CPU (GPU address = CPU address). A large one goes to the completion thread, in its place in the queue, so the submitting
@@ -1213,7 +1239,7 @@ int vkb_frame_lock(vkb_frame *f) { pthread_mutex_lock(&g_frame_mu); if (!g_frame
 void vkb_frame_unlock(void) { pthread_mutex_unlock(&g_frame_mu); }
 void vkb_frame_forget(uint64_t serial) { pthread_mutex_lock(&g_frame_mu); if (g_frame_serial == serial) { memset(&g_frame, 0, sizeof g_frame); g_frame_serial = 0; } pthread_mutex_unlock(&g_frame_mu); }
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
-    static uint64_t next;
+    static uint64_t next, slept;   // slept: when the last present's pacing sleep ended, where the next frame's work starts (hint_frame)
     pthread_mutex_lock(&g_bk);
     vtex *v = vt_get(t); flush();
     dump_poll(atomic_load(&g_presents)); prof_poll(atomic_load(&g_presents)); mid_poll(atomic_load(&g_presents));
@@ -1230,8 +1256,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     pthread_mutex_unlock(&g_bk);
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), per = period_s > 0 ? (uint64_t)(period_s * 1e9) : 16666667ull;
+    hint_frame(now, slept);
     if (next > now && next - now < 1000000000ull) mach_wait_until(next); else next = now;
-    next += per;
+    next += per; slept = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     void front_android_present(const tex_t *t, const int crop[4]); front_android_present(t, crop);
     return atomic_fetch_add(&g_presents, 1) + 1;
 }
