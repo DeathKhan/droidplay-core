@@ -1788,9 +1788,11 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     if (g_ds_stats) { static unsigned long long f0; static uint64_t h0, r0, m0, k0; uint64_t h = g_ds_got, r = g_ds_reused, m = g_ds_made, k = g_ds_calls;   // DM_VK_SET_STATS=1
         if (frame > f0) { double nf = (double)(frame - f0);
             LOG("[vk] descriptor sets a frame over the last %llu frames: %.0f handed out, %.0f of them recycled; %.0f made in %.0f vkAllocateDescriptorSets calls; held by the chunks %d %d %d %d in %d %d %d %d pools, "
-                "%llu full pool resets, %llu of %llu stage_set calls did not write each descriptor of their layout (cumulative; DM_VK_SET_RECYCLE=%d, gfx_vk_draw.inc ds_get)", frame - f0,
+                "%llu full pool resets, %llu of %llu stage_set calls did not write each descriptor of their layout, %llu draws, captures or dispatches taken again after a sync inside "
+                "stage_set closed their sets' chunk and %llu / %llu / %llu dropped when it closed again (cumulative; DM_VK_SET_RECYCLE=%d, gfx_vk_draw.inc ds_get, ds_moved)", frame - f0,
                 (double)(h - h0) / nf, (double)(r - r0) / nf, (double)(m - m0) / nf, (double)(k - k0) / nf, g_ch[0].nds, g_ch[1].nds, g_ch[2].nds, g_ch[3].nds, g_ch[0].ndp, g_ch[1].ndp, g_ch[2].ndp, g_ch[3].ndp,
-                (unsigned long long)atomic_load(&g_ds_resets), (unsigned long long)g_ds_short, (unsigned long long)g_ds_checked, g_ds_on > 0); }
+                (unsigned long long)atomic_load(&g_ds_resets), (unsigned long long)g_ds_short, (unsigned long long)g_ds_checked, (unsigned long long)g_ds_again,
+                (unsigned long long)g_ds_lost[0], (unsigned long long)g_ds_lost[1], (unsigned long long)g_ds_lost[2], g_ds_on > 0); }
         f0 = frame; h0 = h; r0 = r; m0 = m; k0 = k; }
     if (c2_check()) LOG("[vk] c2 check: %llu handle words compared with c2_word, %llu differed (cumulative; gfx_vk_draw.inc bank_word)", (unsigned long long)g_c2_checked, (unsigned long long)g_c2_bad);
     if (memo_log()) LOG("[vk] memo programs: %llu draws found their shaders, %llu resolved and kept, %llu with a program of serial 0 resolved; program changes %llu (cumulative; gfx_vk_draw.inc prog_memo, DM_VK_PROG_MEMO %d)",
