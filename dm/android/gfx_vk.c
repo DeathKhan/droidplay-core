@@ -39,6 +39,11 @@ static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one 
 // ---------------- The device ----------------
 static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
 static vkb_ctx g_vk; static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT; static int g_vk_ok;
+// Query resets (the chunks' query pools, "Query resets" below). DM_VK_QRESET_USED=0 (env.txt): every pool is reset whole in the command buffer at every chunk begin, as before
+// (no host resets either); DM_VK_HOST_QRESET=0: VK_EXT_host_query_reset is not enabled, and the used queries are reset in the command buffer at the chunk's next begin
+static int qr_used(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_QRESET_USED"); v = !(e && *e == '0'); } return v; }
+static int qr_host_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_HOST_QRESET"); v = !(e && *e == '0') && qr_used(); } return v; }
+static PFN_vkResetQueryPoolEXT g_qreset;   // vkResetQueryPoolEXT, through vkGetDeviceProcAddr (the instance is Vulkan 1.1, and the android-29 libvulkan.so stub has no vkResetQueryPool); NULL: no host resets
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
 static void vk_create(void) {
     pthread_mutex_init(&g_vk.qmu, NULL);
@@ -61,10 +66,11 @@ static void vk_create(void) {
     if (g_vk.qf == nq) { LOG("[RED] [vk] no graphics queue"); return; }
     uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, NULL);
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
-    const char *dext[2]; uint32_t nde = 0;
+    const char *dext[3]; uint32_t nde = 0;
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
     int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
+    int hqr = qr_host_env() && has_ext(de, nd, "VK_EXT_host_query_reset");   // the completion thread resets the queries a chunk used (Query resets below); core only from Vulkan 1.2
     free(de);
     VkPhysicalDeviceFeatures want = {.textureCompressionBC = f.textureCompressionBC, .textureCompressionASTC_LDR = f.textureCompressionASTC_LDR,
                                      .textureCompressionETC2 = f.textureCompressionETC2, .independentBlend = f.independentBlend, .geometryShader = f.geometryShader,
@@ -79,17 +85,24 @@ static void vk_create(void) {
     float pri = 1; VkDeviceQueueCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qf, .queueCount = 1, .pQueuePriorities = &pri};
     // translated shaders declare DrawParameters (Ryujinx's base instance / vertex): a Vulkan 1.1 feature of its own
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
-    VkPhysicalDeviceShaderDrawParametersFeatures dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = divisor ? &dv : NULL};
+    VkPhysicalDeviceHostQueryResetFeaturesEXT hq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, .pNext = divisor ? &dv : NULL};
+    VkPhysicalDeviceShaderDrawParametersFeatures dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hq : divisor ? (void *)&dv : NULL};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &dp};
     if (VK_API_VERSION_MINOR(g_vk.props.apiVersion) >= 1 || VK_API_VERSION_MAJOR(g_vk.props.apiVersion) > 1) vkGetPhysicalDeviceFeatures2(g_vk.pd, &f2);
+    hqr = hqr && hq.hostQueryReset;
+    if (hqr) dext[nde++] = "VK_EXT_host_query_reset";
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dve = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, .vertexAttributeInstanceRateDivisor = dv.vertexAttributeInstanceRateDivisor};
-    VkPhysicalDeviceShaderDrawParametersFeatures dpe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = divisor ? &dve : NULL, .shaderDrawParameters = dp.shaderDrawParameters};
+    VkPhysicalDeviceHostQueryResetFeaturesEXT hqe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, .pNext = divisor ? &dve : NULL, .hostQueryReset = VK_TRUE};
+    VkPhysicalDeviceShaderDrawParametersFeatures dpe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hqe : divisor ? (void *)&dve : NULL, .shaderDrawParameters = dp.shaderDrawParameters};
     g_divisor = divisor && dv.vertexAttributeInstanceRateDivisor;
     if (!dp.shaderDrawParameters) LOG("[RED] [vk] no shaderDrawParameters: translated vertex shaders declare DrawParameters");
     VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &dpe, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qc, .enabledExtensionCount = nde, .ppEnabledExtensionNames = dext,
                              .pEnabledFeatures = &want};
     if (vkCreateDevice(g_vk.pd, &dc, NULL, &g_vk.dev) != VK_SUCCESS) { LOG("[RED] [vk] no Vulkan device"); return; }
     vkGetDeviceQueue(g_vk.dev, g_vk.qf, 0, &g_vk.q);
+    if (hqr && !(g_qreset = (PFN_vkResetQueryPoolEXT)vkGetDeviceProcAddr(g_vk.dev, "vkResetQueryPoolEXT"))) LOG("[RED] [vk] VK_EXT_host_query_reset is enabled but vkResetQueryPoolEXT was not found");
+    LOG("[vk] query resets: %s", g_qreset ? "on the host, the queries each chunk used, once read (VK_EXT_host_query_reset)" : qr_used() ? "in the command buffer, the queries the chunk used last time"
+                                                                                                                                     : "in the command buffer, every pool at every chunk begin (DM_VK_QRESET_USED=0)");
     LOG("[vk] descriptor sets bound at once: %u, subgroup size / ops / stages: see vulkan probe", g_vk.props.limits.maxBoundDescriptorSets);
     LOG("[vk] %s (Vulkan %u.%u.%u): BC %s, ASTC %s", g_vk.props.deviceName, VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion),
         VK_API_VERSION_PATCH(g_vk.props.apiVersion), g_vk.has_bc ? "native" : "decoded on the CPU", g_vk.has_astc ? "native" : "missing");
@@ -132,8 +145,9 @@ typedef struct { int kind; uint64_t h; } dead_t;
 typedef struct { uint64_t src, dst, n; uint32_t value; int fill; } cop_t;   // a large buffer copy or fill, done by the completion thread in its place in the queue   // kind 1 image view, 2 framebuffer, 3 image, 4 device memory
 typedef struct chunk {
     VkCommandPool pool; VkCommandBuffer cb; VkFence fence; int open, busy, ts, ndraw, held; uint64_t seq, nvn_fence, hold;
+    int qd, td, pd, sd;   // queries of qp / tq / pq written since their last reset, [0, n): reset in the command buffer when the chunk next begins; sd: its two g_tsq slots (Query resets below)
     VkQueryPool qp; int nq; uint64_t qg[1024];   // occlusion queries begun in it: query i counts NVN samples-passed slot qg[i] (occl_* below)
-    VkQueryPool pq; int npq, pqr;   // render pass timestamps of a profiled frame (prof_* in gfx_vk_draw.inc); pqr: pq was reset when this recording began (cb())
+    VkQueryPool pq; int npq;   // render pass timestamps of a profiled frame (prof_* in gfx_vk_draw.inc)
     VkQueryPool tq; int ntq; uint64_t t_end;   // timestamps of the game's counter reports (kind 4 posts); the GPU time the chunk ended (g_tsq)   // hold: a later chunk reads this one's arena on the GPU (gfx_vk_draw.inc fwd_find): kept busy (held) until that one completes   // ndraw: draws and dispatches recorded (early submission: mtl_exec)   // ts: GPU timestamps written at its start and end (g_tsq)
     stg_t *stg; int nstg, capstg; wb_t *wb; int nwb, capwb; post_op *post; int npost, cappost; dead_t *dead; int ndead, capdead; cop_t *cop; int ncop, capcop;
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
@@ -154,7 +168,7 @@ static void *chunk_thread(void *arg);
 enum { QRES = 1 << 16 };
 static uint64_t g_qres[QRES], g_qslot;   // results by slot (a ring), the next slot
 static int g_q_on = 0, g_q_act = -1; static uint64_t g_q_win;   // counting since a reset; the query open in the current pass (chunk-local index); the window's first slot
-static uint64_t g_q_reports, g_q_queries, g_ts_reports;
+static uint64_t g_q_reports, g_q_queries, g_ts_reports, g_qr_cmd; static _Atomic uint64_t g_qr_host;   // g_qr_*: queries reset in command buffers / on the host (Query resets below)
 static int chunk_make(chunk *c) {
     VkCommandPoolCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_vk.qf};   // one pool per chunk: reset by the completion thread
     if (vkCreateCommandPool(g_vk.dev, &pc, NULL, &c->pool) != VK_SUCCESS) return 0;
@@ -165,6 +179,9 @@ static int chunk_make(chunk *c) {
     VkQueryPoolCreateInfo tc = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 256};
     if (!g_vk.props.limits.timestampComputeAndGraphics || vkCreateQueryPool(g_vk.dev, &tc, NULL, &c->tq) != VK_SUCCESS) c->tq = VK_NULL_HANDLE;
     tc.queryCount = 512; if (!g_vk.props.limits.timestampComputeAndGraphics || vkCreateQueryPool(g_vk.dev, &tc, NULL, &c->pq) != VK_SUCCESS) c->pq = VK_NULL_HANDLE;
+    if (g_qreset) { if (c->qp) g_qreset(g_vk.dev, c->qp, 0, 1024); if (c->tq) g_qreset(g_vk.dev, c->tq, 0, 256); if (c->pq) g_qreset(g_vk.dev, c->pq, 0, 512); }   // a new query's state is undefined
+    else { c->qd = 1024; c->td = 256; c->pd = 512; }   // reset whole by the first begin
+    c->sd = !g_qreset;   // g_tsq: reset whole on the host in chunks_init
     return vkAllocateCommandBuffers(g_vk.dev, &ca, &c->cb) == VK_SUCCESS && vkCreateFence(g_vk.dev, &fc, NULL, &c->fence) == VK_SUCCESS;
 }
 // GPU time: each chunk's command buffer writes a timestamp at its start and its end; the completion thread adds up the differences (the chunks run one after
@@ -174,7 +191,7 @@ static int chunks_init(void) {
     static int ok = -1; if (ok >= 0) return ok;
     ok = 0; if (!vkb()) return 0;
     if (g_vk.props.limits.timestampComputeAndGraphics) { VkQueryPoolCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * NCHUNK};
-        if (vkCreateQueryPool(g_vk.dev, &qc, NULL, &g_tsq) != VK_SUCCESS) g_tsq = VK_NULL_HANDLE; }
+        if (vkCreateQueryPool(g_vk.dev, &qc, NULL, &g_tsq) != VK_SUCCESS) g_tsq = VK_NULL_HANDLE; else if (g_qreset) g_qreset(g_vk.dev, g_tsq, 0, 2 * NCHUNK); }
     for (int i = 0; i < NCHUNK; i++) if (!chunk_make(&g_ch[i])) { LOG("[RED] [vk] command buffers could not be made"); return 0; }
     pthread_t th; if (pthread_create(&th, NULL, chunk_thread, NULL)) return 0;
     pthread_detach(th);
@@ -189,20 +206,43 @@ static chunk *cur(void) {   // the chunk being recorded: a free one is taken (wa
     pthread_mutex_unlock(&g_cmu);
     return C;
 }
-// Query resets. vkCmdResetQueryPool costs the Adreno driver about 15 ns a query plus about 1.6 us a call on the recording thread (one call per query inside, building
-// packets): the four resets at every chunk begin (2 + 1024 + 256 + 512 queries, about 62 chunks a frame) were 4.8% of Breath of the Wild's render thread on an Ayn Odin 2,
-// about 1.9 ms a frame (simpleperf; the stripped driver function 409aee7a under cb()), the 512 render pass timestamps alone 1.35% (about 0.5 ms), for a pool that only a
-// frame profiled through prof_now writes. That pool is reset only by a chunk begun in a profiled frame (pqr); a chunk begun before (the frame turned profiled while it was
-// open) records no pass timestamps, since its queries were not reset. DM_VK_QRESET_USED=0 (env.txt): every pool is reset at every begin again, as before
-static int qr_used(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_QRESET_USED"); v = !(e && *e == '0'); } return v; }
-static int prof_on(void);   // gfx_vk_draw.inc
+// ---------------- Query resets ----------------
+// A query is reset before each use. Every chunk begin used to reset all of its pools in the command buffer (g_tsq's 2 slots, qp 1024, tq 256, pq 512), and
+// vkCmdResetQueryPool costs the Adreno driver about 15 ns a query plus about 1.6 us a call on the recording thread (a call per query inside, building packets): 4.8% of
+// Breath of the Wild's render thread on an Ayn Odin 2, about 1.9 ms a frame at about 62 chunks a frame (simpleperf: the stripped driver function 409aee7a under cb(); qp 2.6%,
+// pq 1.35%, tq 0.7%, g_tsq 0.25%), and about 111k query resets a frame for the GPU, inside the chunks' timed spans (not measured apart). The game uses about 3 occlusion
+// queries a chunk, about 4 counter timestamps a frame, and pq only in a frame profiled through prof_now. Every query is used from 0 up by its own counter (nq, ntq, npq; a chunk's two
+// g_tsq slots), so "every query not written since its last reset is still reset" holds once each pool is reset whole at creation, and only [0, used) needs a reset again:
+//   - VK_EXT_host_query_reset (g_qreset): qr_done resets those ranges on the host, on the completion thread. Nothing is recorded in cb() at all
+//   - otherwise (or DM_VK_HOST_QRESET=0): cb() resets in the command buffer only what the chunk's previous recording used (qd, td, pd, sd; whole pools once, at creation)
+// Why a host reset cannot touch a query the GPU still writes or the host has not read yet: qr_done runs on vk-done after vkWaitForFences on the chunk's own fence (all of its
+// commands, the queries' last writes among them, have completed) and after every read of them: g_tsq's pair in chunk_thread (it gives t_end, the kind 4 back-projection's
+// reference), qp into g_qres (the samples-passed sums post_apply adds up) and tq for the kind 4 counter timestamps in chunk_done, pq in prof_collect; a skipped or failed read
+// is reset too. qp, tq and pq belong to one chunk, and g_tsq's slots 2i and 2i+1 are written only by chunk i's command buffer: chunks in flight write other slots, which
+// vkResetQueryPool allows (only the range reset must be idle, and vkGetQueryPoolResults / vkResetQueryPool run on vk-done alone). It runs before busy = 0 under g_cmu, and cur()
+// takes a chunk only with busy == 0 under g_cmu: the reset happens before the chunk's next recording and submission. A failed fence wait leaves the ranges to cb() instead
+static void qr_done(chunk *c, int fence_ok, int ts, int nq, int ntq, int npq) {   // the completion thread, before the chunk is free again: the queries it used, all read
+    if (!qr_used()) { c->qd = 1024; c->td = 256; c->pd = 512; c->sd = 1; return; }
+    if (g_qreset && fence_ok) {
+        if (ts) g_qreset(g_vk.dev, g_tsq, 2 * (uint32_t)(c - g_ch), 2);
+        if (nq) g_qreset(g_vk.dev, c->qp, 0, (uint32_t)nq);
+        if (ntq) g_qreset(g_vk.dev, c->tq, 0, (uint32_t)ntq);
+        if (npq) g_qreset(g_vk.dev, c->pq, 0, (uint32_t)npq);
+        atomic_fetch_add(&g_qr_host, (uint64_t)(2 * !!ts + nq + ntq + npq)); return; }
+    if (ts) c->sd = 1;
+    if (nq > c->qd) c->qd = nq;
+    if (ntq > c->td) c->td = ntq;
+    if (npq > c->pd) c->pd = npq;
+}
 static VkCommandBuffer cb(void) {
     if (!cur()) return VK_NULL_HANDLE;
     if (!C->open) { VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vkBeginCommandBuffer(C->cb, &bi); C->open = 1;
-        if (g_tsq) { uint32_t q = 2 * (uint32_t)(C - g_ch); vkCmdResetQueryPool(C->cb, g_tsq, q, 2); vkCmdWriteTimestamp(C->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_tsq, q); C->ts = 1; }
-        if (C->qp) vkCmdResetQueryPool(C->cb, C->qp, 0, 1024); C->nq = 0;
-        if (C->tq) vkCmdResetQueryPool(C->cb, C->tq, 0, 256); C->ntq = 0;
-        C->pqr = C->pq && (prof_on() || !qr_used()); if (C->pqr) vkCmdResetQueryPool(C->cb, C->pq, 0, 512); C->npq = 0; }
+        if (g_tsq) { uint32_t q = 2 * (uint32_t)(C - g_ch); if (C->sd) { vkCmdResetQueryPool(C->cb, g_tsq, q, 2); g_qr_cmd += 2; } C->sd = 0;
+            vkCmdWriteTimestamp(C->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_tsq, q); C->ts = 1; }
+        if (C->qp && C->qd) { vkCmdResetQueryPool(C->cb, C->qp, 0, (uint32_t)C->qd); g_qr_cmd += (uint64_t)C->qd; }   // the queries the last recording used (Query resets above)
+        if (C->tq && C->td) { vkCmdResetQueryPool(C->cb, C->tq, 0, (uint32_t)C->td); g_qr_cmd += (uint64_t)C->td; }
+        if (C->pq && C->pd) { vkCmdResetQueryPool(C->cb, C->pq, 0, (uint32_t)C->pd); g_qr_cmd += (uint64_t)C->pd; }
+        C->qd = C->td = C->pd = 0; C->nq = C->ntq = C->npq = 0; }
     rp_end();   // transfers and clears run outside a draw's render pass (only the draw path records inside one, through C->cb)
     return C->cb;
 }
@@ -357,7 +397,8 @@ static void *chunk_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-done");
     for (;;) {
         pthread_mutex_lock(&g_cmu); while (!g_fifo_n) pthread_cond_wait(&g_ccv, &g_cmu); chunk *c = g_fifo[0]; pthread_mutex_unlock(&g_cmu);
-        vkWaitForFences(g_vk.dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
+        VkResult fr = vkWaitForFences(g_vk.dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
+        int ts = c->ts, nq = c->nq, ntq = c->ntq, npq = c->npq;   // the queries it used, reset once read (qr_done): the counts are zeroed on the way
         c->t_end = 0;
         if (c->ts) { uint64_t t[2]; c->ts = 0;
             if (vkGetQueryPoolResults(g_vk.dev, g_tsq, 2 * (uint32_t)(c - g_ch), 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
@@ -365,6 +406,7 @@ static void *chunk_thread(void *arg) {
         int had_wb = c->nwb != 0, had_cop = c->ncop != 0;
         chunk_done(c); c->nwb = c->ncop = 0;
         if (c->nvn_fence) { pthread_mutex_lock(&g_fmu); if (atomic_load(&g_done) < c->nvn_fence) atomic_store(&g_done, c->nvn_fence); pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu); }
+        qr_done(c, fr == VK_SUCCESS, ts, nq, ntq, npq);   // after every read of them, after the NVN fence (the game waits on it), before busy = 0
         pthread_mutex_lock(&g_cmu);
         memmove(g_fifo, g_fifo + 1, --g_fifo_n * sizeof *g_fifo);
         if (had_wb) atomic_fetch_sub(&g_inflight_wb, 1);
@@ -1313,7 +1355,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);
       if (frame > f0) LOG("[vk] GPU busy %.2f ms per frame over the last %llu frames (%llu command buffers in all)", (double)(g - g0) / 1e6 / (double)(frame - f0), frame - f0, (unsigned long long)atomic_load(&g_gpu_chunks));
       f0 = frame; g0 = g; }
-    LOG("[vk] occlusion queries %llu, samples-passed reports %llu, timestamp reports %llu, graphics pipelines made %llu (%.0f ms), compute pipelines %llu (%.0f ms), shader modules %llu (%.0f ms) (cumulative)", (unsigned long long)g_q_queries, (unsigned long long)g_q_reports, (unsigned long long)g_ts_reports,
+    LOG("[vk] occlusion queries %llu, samples-passed reports %llu, timestamp reports %llu, queries reset on the host %llu / in command buffers %llu, graphics pipelines made %llu (%.0f ms), compute pipelines %llu (%.0f ms), shader modules %llu (%.0f ms) (cumulative)",
+        (unsigned long long)g_q_queries, (unsigned long long)g_q_reports, (unsigned long long)g_ts_reports, (unsigned long long)atomic_load(&g_qr_host), (unsigned long long)g_qr_cmd,
         (unsigned long long)atomic_load(&g_pso_made), atomic_load(&g_pso_ns) / 1e6, (unsigned long long)atomic_load(&g_cpso_made), atomic_load(&g_cpso_ns) / 1e6, (unsigned long long)atomic_load(&g_mod_made), atomic_load(&g_mod_ns) / 1e6);
     LOG("[vk] draws not made: shader missing %llu, targets %llu, pipeline %llu, descriptors %llu, invalid binding %llu, pass %llu, vertex buffers %llu; dropped in all %llu (cumulative)", (unsigned long long)g_drop[0], (unsigned long long)g_drop[1], (unsigned long long)g_drop[2], (unsigned long long)g_drop[3], (unsigned long long)g_drop[4], (unsigned long long)g_drop[5], (unsigned long long)g_drop[6], (unsigned long long)g_draws_dropped);
     LOG("[vk] vertex streams read on the GPU from a dispatch's storage buffer: %llu (cumulative)", (unsigned long long)g_fwd);
