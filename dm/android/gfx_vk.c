@@ -1212,6 +1212,17 @@ static pthread_mutex_t g_frame_mu = PTHREAD_MUTEX_INITIALIZER; static vkb_frame 
 int vkb_frame_lock(vkb_frame *f) { pthread_mutex_lock(&g_frame_mu); if (!g_frame.img) { pthread_mutex_unlock(&g_frame_mu); return 0; } *f = g_frame; return 1; }
 void vkb_frame_unlock(void) { pthread_mutex_unlock(&g_frame_mu); }
 void vkb_frame_forget(uint64_t serial) { pthread_mutex_lock(&g_frame_mu); if (g_frame_serial == serial) { memset(&g_frame, 0, sizeof g_frame); g_frame_serial = 0; } pthread_mutex_unlock(&g_frame_mu); }
+// The last present's sleep to its vsync grid (mtl_present, presenting thread): its length (0 = it did not sleep) and when it ended, on CLOCK_MONOTONIC (the host's now_ns)
+static uint64_t g_psleep_ns, g_psleep_end;
+// For the frame step (hle_nvn.c fstep_tick): that sleep is pacing, as the acquire's wait is, not the frame's work. Counted as work it made the cost the hold whatever the work, so the
+// hold could never come down: Breath of the Wild on an Ayn Odin 2 held 3 vsyncs for good with about 43 ms of work a frame (p50) and 7 ms asleep here (NVN submit+present p50 49.7 ms).
+// DM_VK_FSTEP_SLEEP=0 counts it as work again (the old accounting, for A/B)
+uint64_t mtl_present_slept_ns(uint64_t *end_ns) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_VK_FSTEP_SLEEP"); on = !(e && !strcmp(e, "0")); if (!on) LOG("[vk] DM_VK_FSTEP_SLEEP=0: the frame step counts the present's sleep to its vsync grid as the frame's work"); }
+    if (end_ns) *end_ns = on ? g_psleep_end : 0;
+    return on ? g_psleep_ns : 0;
+}
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     static uint64_t next;
     pthread_mutex_lock(&g_bk);
@@ -1230,7 +1241,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     pthread_mutex_unlock(&g_bk);
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), per = period_s > 0 ? (uint64_t)(period_s * 1e9) : 16666667ull;
-    if (next > now && next - now < 1000000000ull) mach_wait_until(next); else next = now;
+    if (next > now && next - now < 1000000000ull) { mach_wait_until(next); g_psleep_end = clock_gettime_nsec_np(CLOCK_MONOTONIC); g_psleep_ns = g_psleep_end - now; } else { next = now; g_psleep_ns = 0; }
     next += per;
     void front_android_present(const tex_t *t, const int crop[4]); front_android_present(t, crop);
     return atomic_fetch_add(&g_presents, 1) + 1;
