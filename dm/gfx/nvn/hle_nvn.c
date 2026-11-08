@@ -1694,6 +1694,16 @@ static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
     int kmin = 60 / c;
     return present_itv(o) > kmin ? (uint64_t)kmin * 1000000000ull / (uint64_t)g_hz : period;
 }
+// The frame step's hold, for a platform whose frame deadline is a target the system holds the frame's measured work against (Android's performance hint session, gfx_vk.c
+// hint_frame, which follows the hold with it; nothing on Apple calls it): returns the vsync in ns and sets the hold in force and kmin in vsyncs, or returns 0 while the host does
+// not decide the hold (no frame step cap, the game's own step, uncapped presents), where the deadline stays the declared period (rt_period_ns). *thermal: the thermal cap holds 30 fps
+uint64_t nvn_fstep_hold(int *k, int *kmin, int *thermal) {
+    int c = fps_step_cap(), h = atomic_load(&g_fs_k);
+    *thermal = c && thermal_capped(); *k = *kmin = 0;
+    if (!c || g_hz <= 0 || __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED)) return 0;
+    *kmin = 60 / c; *k = h > *kmin ? h : *kmin;
+    return 1000000000ull / (uint64_t)g_hz;
+}
 // Whether the CPU runs below its speed for reasons other than heat (nvn_fstep_next's slow, which allows probes): under 30% of the process's CPU time on performance cores in
 // each of the last two windows of 30 presents, on a system with two core types, at thermal state nominal or fair, Low Power Mode off. A game that waits out a long hold is parked
 // on the efficiency cores (TOTK on an iPhone: 6% on performance cores at 1.6 GHz, thermal 0), where the cost the frame step measures never fits k − 1 again; one window alone

@@ -25,6 +25,7 @@
 #include "nvn_fmt_mtl.h"
 #include "gfx_vk.h"
 #include "spv_readonly.h"
+#include "nvn_fstep.h"   // FSTEP_FIT: the performance hint's target (hint_frame)
 #include <stdatomic.h>
 #include <math.h>
 #define BCDEC_IMPLEMENTATION
@@ -1008,12 +1009,21 @@ static void hint_note(void) {   // the calling thread works on this frame (once 
     pthread_mutex_unlock(&g_hint_mu);
 }
 void dm_acquire_paced(uint64_t ns) { atomic_fetch_add_explicit(&g_hint_paced, ns, memory_order_relaxed); hint_note(); }
+// The frame's deadline, the target that work is held against, follows the frame step's hold (hle_nvn.c nvn_fstep_hold, read here after fstep_tick decided this frame's): the cost
+// its fit trial needs to try the next hold down, FSTEP_FIT × (k − 1) vsyncs, and at kmin the same share of kmin, the margin that keeps it. The declared period (rt_period_ns) is
+// kmin's whatever the hold: at Breath of the Wild's hold 3 on the Odin 2 it put 16.7 ms against about 43 ms of work, every frame about 2.6 times over, which holds a session at
+// full boost for as long as the hold is raised, at any load and through thermal mitigation: its answer no longer depends on the work. Aimed at k − 1 it asks for what the next hold
+// takes (28.3 ms at hold 3, 14.2 ms at holds 2 and 1 at a 60 fps cap; 28.3 ms at a 30 cap), so it eases off once the work fits it, and with the full k − 1 instead the work
+// would settle just above what the fit trial accepts and stay boosted at hold k. The frame step sees that cost once its own cost leaves the present's sleep out (plan A1).
+// Without the frame step (no cap, the game's own step) the target is the declared period. *thermal: the thermal cap holds 30 fps (plat_android.c closes the session then)
 static void hint_frame(uint64_t now, uint64_t from) {   // the present thread, before its pacing sleep; from: when the last one ended (0 = no present yet)
-    void dm_android_hint_frame(uint64_t work_ns, const int32_t *tids, int n);
+    void dm_android_hint_frame(uint64_t work_ns, const int32_t *tids, int n, uint64_t hold_ns, int thermal);
+    uint64_t nvn_fstep_hold(int *k, int *kmin, int *thermal);
     int32_t t[3]; pthread_mutex_lock(&g_hint_mu); int n = g_hint_ntid; memcpy(t, g_hint_tid, sizeof t); g_hint_ntid = 0; pthread_mutex_unlock(&g_hint_mu);
     atomic_fetch_add_explicit(&g_hint_gen, 1, memory_order_relaxed);
     uint64_t paced = atomic_exchange_explicit(&g_hint_paced, 0, memory_order_relaxed), span = from && now > from ? now - from : 0;
-    dm_android_hint_frame(span > paced && span < 1000000000ull ? span - paced : 0, t, n);   // a second or more since the last present (loading, the app in the background) is no frame
+    int k, kmin, th; uint64_t vs = nvn_fstep_hold(&k, &kmin, &th), hold = vs ? (uint64_t)(FSTEP_FIT * (k - 1 > kmin ? k - 1 : kmin) * (double)vs) : 0;
+    dm_android_hint_frame(span > paced && span < 1000000000ull ? span - paced : 0, t, n, hold, th);   // a second or more since the last present (loading, the app in the background) is no frame
 }
 void mtl_sub_begin(void) { pthread_mutex_lock(&g_bk); hint_note(); }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }

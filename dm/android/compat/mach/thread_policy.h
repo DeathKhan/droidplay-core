@@ -1,7 +1,8 @@
 // Android stand-in for <mach/thread_policy.h>: Mach's time-constraint (real-time) policy has no counterpart an app may set on Android
 // (SCHED_FIFO needs a privilege apps lack). What the declaration tells the system, the frame's period, goes to an Android Performance Hint
-// session instead (plat_android.c dm_android_rt_declare, API 33): setting it succeeds while a session holds that period, and fails as before
-// where there is none (an older Android, a power HAL without hint sessions, DM_VK_ADPF=0), so the callers keep the thread's ordinary priority
+// session instead (plat_android.c dm_android_rt_declare, API 33), as its target unless the frame step's hold sets one (gfx_vk.c hint_frame):
+// setting it succeeds while there is a session (or one closed for heat), and fails as before where there is none (an older Android, a power HAL
+// without hint sessions, DM_VK_ADPF=0), so the callers keep the thread's ordinary priority
 #pragma once
 #include "dm_android.h"
 typedef int *thread_policy_t;
