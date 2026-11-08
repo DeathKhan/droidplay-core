@@ -1440,6 +1440,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     if (c2_check()) LOG("[vk] c2 check: %llu handle words compared with c2_word, %llu differed (cumulative; gfx_vk_draw.inc bank_word)", (unsigned long long)g_c2_checked, (unsigned long long)g_c2_bad);
     if (memo_log()) LOG("[vk] memo programs: %llu draws found their shaders, %llu resolved and kept, %llu with a program of serial 0 resolved; program changes %llu (cumulative; gfx_vk_draw.inc prog_memo, DM_VK_PROG_MEMO %d)",
         (unsigned long long)g_pmemo_hit, (unsigned long long)g_pmemo_miss, (unsigned long long)g_pmemo_ser0, (unsigned long long)(atomic_load(&g_prog_gen) - 1), prog_memo_on());
+    if (memo_log()) LOG("[vk] memo pipelines: %llu draws had the draw before's, %llu built their key; state changes %llu; checked %llu, differed %llu (cumulative; gfx_vk_draw.inc pso_memo, DM_VK_PSO_MEMO %d, DM_VK_PSO_CHECK %d)",
+        (unsigned long long)g_pso_hit, (unsigned long long)g_pso_miss, (unsigned long long)(g_pso_gen - 1), (unsigned long long)g_pso_checked, (unsigned long long)g_pso_bad, pso_memo_on(), pso_check());
     LOG("[vk] geometry kept on the GPU: %llu index / vertex bindings from kept copies, %llu copies kept (%llu MB now), %llu copied per draw (cumulative; gfx_vk_draw.inc gc_get)",
         (unsigned long long)g_gc_hit, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy);
     { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);

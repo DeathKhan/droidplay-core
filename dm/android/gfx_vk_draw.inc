@@ -488,8 +488,19 @@ static struct {
     p_tf_bind tf[4]; uint64_t tf_off[4]; int tf_on, rast_discard;
 } D;
 static int g_d_init;
+// The pipeline key's state (vk_draw_) as the key takes it from D: the fields a blend or depth / stencil object sets, over zeroed bits (the bits they leave over are whatever
+// the game's object held). o is zeroed by the caller
+static void blend_k(blend_st *o, const blend_st *b) { o->target = b->target; o->src_rgb = b->src_rgb; o->dst_rgb = b->dst_rgb; o->src_a = b->src_a;
+    o->dst_a = b->dst_a; o->eq_rgb = b->eq_rgb; o->eq_a = b->eq_a; o->adv = b->adv; o->adv_npm = b->adv_npm; o->adv_ovl = b->adv_ovl; }
+static void ds_k(ds_st *o, const ds_st *d) { o->dt = d->dt; o->dw = d->dw; o->df = d->df; o->st = d->st; o->sf_f = d->sf_f; o->sf_b = d->sf_b;
+    o->fail_f = d->fail_f; o->zfail_f = d->zfail_f; o->zpass_f = d->zpass_f; o->fail_b = d->fail_b; o->zfail_b = d->zfail_b; o->zpass_b = d->zpass_b; }
+// g_pso_gen: bumped when a value the pipeline key takes from D really changes (draw_state_op compares before it stores; a state object sent again with the same
+// fields leaves it), so a draw with the generation, shaders, pass, primitive and origin of the draw before has its pipeline without building and hashing the key
+// (vk_draw_ pso_memo). Any new input of the key read from D must bump it here (or join pso_memo's key)
+static int pso_memo_on(void);
+static uint64_t g_pso_gen = 1;
 static void draw_state_reset(void) {
-    memset(&D, 0, sizeof D); g_d_init = 1;
+    memset(&D, 0, sizeof D); g_d_init = 1; g_pso_gen++;
     for (int i = 0; i < 8; i++) D.blend[i] = (blend_st){(uint64_t)i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
     D.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; D.chmask.mask = 0xffffffffu;
     D.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
@@ -532,13 +543,29 @@ static int draw_state_op(uint32_t op, const void *a) {
     switch (op) {
         case OP_BIND_PROGRAM: { const p_bind_program *b = a; for (int st = 0; st < 5; st++) if (b->stages >> st & 1) D.bst[st] = b->prog; if (b->stages & 0x20) D.cprog = b->prog; return 1; }
         case OP_BIND_STATE: { const p_bind_state *b = a; blend_st bs;
+            if (pso_memo_on() && b->kind >= 0 && b->kind <= 5) {   // g_pso_gen: the fields the key takes (vk_draw_), before they are stored (colour's alpha test and multisample's
+                int ch = 0;                                         // fields but alpha-to-coverage are not in the key)
+                switch (b->kind) {
+                    case 0: { blend_st n, o; memcpy(&bs, b->bytes, sizeof bs); memset(&n, 0, sizeof n); memset(&o, 0, sizeof o); blend_k(&n, &bs); blend_k(&o, &D.blend[bs.target & 7]); ch = memcmp(&n, &o, sizeof n) != 0; break; }
+                    case 1: { color_st c; memcpy(&c, b->bytes, sizeof c); ch = c.blend_en != D.color.blend_en || c.logic_op != D.color.logic_op; break; }
+                    case 2: ch = memcmp(&D.chmask, b->bytes, sizeof D.chmask) != 0; break;
+                    case 3: { ms_st m; memcpy(&m, b->bytes, sizeof m); ch = m.a2c != D.ms.a2c; break; }
+                    case 4: { poly_st p; memcpy(&p, b->bytes, sizeof p); ch = p.cull != D.poly.cull || p.front != D.poly.front || p.mode != D.poly.mode || p.offset_en != D.poly.offset_en; break; }
+                    case 5: { ds_st d, n, o; memcpy(&d, b->bytes, sizeof d); memset(&n, 0, sizeof n); memset(&o, 0, sizeof o); ds_k(&n, &d); ds_k(&o, &D.ds); ch = memcmp(&n, &o, sizeof n) != 0; break; }
+                }
+                if (ch) g_pso_gen++;
+            }
             switch (b->kind) { case 0: memcpy(&bs, b->bytes, sizeof bs); D.blend[bs.target & 7] = bs; break; case 1: memcpy(&D.color, b->bytes, sizeof D.color); break;
                 case 2: memcpy(&D.chmask, b->bytes, sizeof D.chmask); break; case 3: memcpy(&D.ms, b->bytes, sizeof D.ms); break;
                 case 4: memcpy(&D.poly, b->bytes, sizeof D.poly); break; case 5: memcpy(&D.ds, b->bytes, sizeof D.ds); break; }
             return 1; }
         // the whole attribute / stream state is replaced (as nvn_mtl.m state_op): a slot past the count is unused, never a stale one read from a freed buffer
-        case OP_BIND_VATTR: { const p_bind_vattr *b = a; int n = b->n < 0 ? 0 : b->n > 16 ? 16 : b->n; memset(D.attr, 0, sizeof D.attr); memcpy(D.attr, b->st, 4 * (size_t)n); D.nattr = n; return 1; }
-        case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; int n = b->n < 0 ? 0 : b->n > 16 ? 16 : b->n; memset(D.stream, 0, sizeof D.stream); memcpy(D.stream, b->st, sizeof *b->st * (size_t)n); D.nstream = n; return 1; }
+        case OP_BIND_VATTR: { const p_bind_vattr *b = a; int n = b->n < 0 ? 0 : b->n > 16 ? 16 : b->n;
+            if (pso_memo_on()) { uint32_t na[16]; memset(na, 0, sizeof na); memcpy(na, b->st, 4 * (size_t)n); if (memcmp(na, D.attr, sizeof na)) g_pso_gen++; }
+            memset(D.attr, 0, sizeof D.attr); memcpy(D.attr, b->st, 4 * (size_t)n); D.nattr = n; return 1; }
+        case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; int n = b->n < 0 ? 0 : b->n > 16 ? 16 : b->n;
+            if (pso_memo_on()) { vs_st ns[16]; memset(ns, 0, sizeof ns); memcpy(ns, b->st, sizeof *b->st * (size_t)n); if (memcmp(ns, D.stream, sizeof ns)) g_pso_gen++; }
+            memset(D.stream, 0, sizeof D.stream); memcpy(D.stream, b->st, sizeof *b->st * (size_t)n); D.nstream = n; return 1; }
         case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tmp; const p_bind_vbuf *b = vbuf_rec(op, a, &tmp); for (int i = 0; i < b->n && b->first + i < 16; i++) D.vbuf[b->first + i] = b->r[i]; return 1; }
         case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tmp; const p_bind_buf *b = bind_buf_rec(op, a, &tmp); if (b->stage < 6 && b->index < 16) D.ubo[b->stage][b->index] = *b; return 1; }
         case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index < 16) D.ssbo[b->stage][b->index] = *b; return 1; }
@@ -554,9 +581,9 @@ static int draw_state_op(uint32_t op, const void *a) {
         case OP_POLY_OFFSET: D.po = *(const p_poly_offset *)a; return 1;
         case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) memcpy(D.vp[b->first + i], b->v[i], sizeof D.vp[0]); D.has_vp = 1; return 1; }
         case OP_DEPTH_RANGE: { const p_depth_range *b = a; D.dr[0] = b->n; D.dr[1] = b->f; return 1; }
-        case OP_DEPTH_CLAMP: D.depth_clamp = ((const p_depth_clamp *)a)->on; return 1;
+        case OP_DEPTH_CLAMP: if (D.depth_clamp != ((const p_depth_clamp *)a)->on) g_pso_gen++; D.depth_clamp = ((const p_depth_clamp *)a)->on; return 1;
         case OP_BLEND_COLOR: memcpy(D.blend_color, ((const p_blend_color *)a)->rgba, 16); return 1;
-        case OP_PRIM_RESTART: D.restart = *(const p_prim_restart *)a; return 1;
+        case OP_PRIM_RESTART: if (D.restart.on != ((const p_prim_restart *)a)->on) g_pso_gen++; D.restart = *(const p_prim_restart *)a; return 1;   // the key takes .on (the index is the type's all-ones)
         case OP_TF_BIND: { const p_tf_bind *b = a; if (b->index >= 0 && b->index < 4) D.tf[b->index] = *b; return 1; }
         case OP_TF_STATE: { const p_tf_state *b = a;   // Begin writes from the start of each buffer; Pause / Resume keep the offsets (nvn_mtl.m: the game's control buffer is not used)
             if (b->what == 0) { D.tf_on = 1; memset(D.tf_off, 0, sizeof D.tf_off); } else D.tf_on = b->what == 3; return 1; }
@@ -1054,6 +1081,12 @@ typedef struct {
     uint32_t attr[16]; vs_st stream[16]; uint8_t topo, restart, depth_clamp, ll;
     color_st color; chmask_st chmask; blend_st blend[8]; ms_st ms; poly_st poly; ds_st ds;
 } pipe_key;
+// the key's fields by name, for the logs that say which fields set two keys apart (pipe_get, pso_memo_note); the shaders and the pass are compared apart
+static const struct { const char *n; size_t o, s; } PK_F[] = {{"z", offsetof(pipe_key, z), sizeof(int)}, {"tf", offsetof(pipe_key, tf), sizeof(int)}, {"rk", offsetof(pipe_key, rk), sizeof(rp_key)},
+    {"ncolor", offsetof(pipe_key, ncolor), 4}, {"attr", offsetof(pipe_key, attr), sizeof(((pipe_key *)0)->attr)}, {"stream", offsetof(pipe_key, stream), sizeof(((pipe_key *)0)->stream)},
+    {"topo", offsetof(pipe_key, topo), 1}, {"restart", offsetof(pipe_key, restart), 1}, {"depth_clamp", offsetof(pipe_key, depth_clamp), 1}, {"ll", offsetof(pipe_key, ll), 1},
+    {"color", offsetof(pipe_key, color), sizeof(color_st)}, {"chmask", offsetof(pipe_key, chmask), sizeof(chmask_st)}, {"blend", offsetof(pipe_key, blend), sizeof(((pipe_key *)0)->blend)},
+    {"ms", offsetof(pipe_key, ms), sizeof(ms_st)}, {"poly", offsetof(pipe_key, poly), sizeof(poly_st)}, {"ds", offsetof(pipe_key, ds), sizeof(ds_st)}};
 typedef struct { VkPipeline p; VkPipelineLayout pl; } pipe_t;
 static nvn_hmap g_pipes = {.klen = sizeof(pipe_key)};
 // ---- Pipelines made again at start ----
@@ -1240,12 +1273,7 @@ static pipe_t *pipe_get(const pipe_key *k) {
         static struct { vshader *a, *b; VkRenderPass rp; pipe_key k; } last[64]; static int nlog;
         unsigned h = (unsigned)(((uintptr_t)k->sh[0] >> 4) ^ ((uintptr_t)k->sh[1] >> 6) ^ ((uintptr_t)k->rp >> 3)) % 64;
         if (last[h].a == k->sh[0] && last[h].b == k->sh[1] && last[h].rp == k->rp && nlog < 40) {
-            static const struct { const char *n; size_t o, s; } F[] = {{"z", offsetof(pipe_key, z), sizeof(int)}, {"tf", offsetof(pipe_key, tf), sizeof(int)}, {"rk", offsetof(pipe_key, rk), sizeof(rp_key)},
-                {"ncolor", offsetof(pipe_key, ncolor), 4}, {"attr", offsetof(pipe_key, attr), sizeof(((pipe_key *)0)->attr)}, {"stream", offsetof(pipe_key, stream), sizeof(((pipe_key *)0)->stream)},
-                {"topo", offsetof(pipe_key, topo), 1}, {"restart", offsetof(pipe_key, restart), 1}, {"depth_clamp", offsetof(pipe_key, depth_clamp), 1}, {"ll", offsetof(pipe_key, ll), 1},
-                {"color", offsetof(pipe_key, color), sizeof(color_st)}, {"chmask", offsetof(pipe_key, chmask), sizeof(chmask_st)}, {"blend", offsetof(pipe_key, blend), sizeof(((pipe_key *)0)->blend)},
-                {"ms", offsetof(pipe_key, ms), sizeof(ms_st)}, {"poly", offsetof(pipe_key, poly), sizeof(poly_st)}, {"ds", offsetof(pipe_key, ds), sizeof(ds_st)}};
-            char d[300] = ""; for (size_t i = 0; i < sizeof F / sizeof *F; i++) if (memcmp((const uint8_t *)k + F[i].o, (const uint8_t *)&last[h].k + F[i].o, F[i].s)) { size_t l = strlen(d); snprintf(d + l, sizeof d - l, " %s", F[i].n); }
+            char d[300] = ""; for (size_t i = 0; i < sizeof PK_F / sizeof *PK_F; i++) if (memcmp((const uint8_t *)k + PK_F[i].o, (const uint8_t *)&last[h].k + PK_F[i].o, PK_F[i].s)) { size_t l = strlen(d); snprintf(d + l, sizeof d - l, " %s", PK_F[i].n); }
             uint32_t c0, c1, p0, p1; memcpy(&c0, &last[h].k.color, 4); memcpy(&c1, &k->color, 4); memcpy(&p0, &last[h].k.poly, 4); memcpy(&p1, &k->poly, 4);
             nlog++; LOG("[vk] pipeline %s %s again with other:%s (colour %#x -> %#x, polygon %#x -> %#x, %u targets)", k->sh[0] ? k->sh[0]->key : "-", k->sh[1] ? k->sh[1]->key : "-", d[0] ? d : " (padding only)",
                 c0, c1, p0, p1, k->ncolor); }
@@ -1839,6 +1867,67 @@ static int vk_draw(const p_draw *dw, const p_draw_idx *di) {
         i2.base_vertex = (int32_t)a[3]; i2.base_instance = (int32_t)a[4]; di = &i2; if (!a[0] || !a[1]) return 1; }
     return vk_draw__(dw, di);
 }
+// ---- The pipeline-key memo (vk_draw_) ----
+// A draw whose pipeline key has every input of the draw before's has its pipeline: the bound state the key takes (D, through g_pso_gen: draw_state_op bumps it only when
+// one of those values really changes), the shaders (the program memo's or resolved), the pass (P.rp and its key), the primitive, the depth mode (g_depth_zero) and the
+// origin flip (g_origin_ll ^ g_queue_ll). The rest the key reads is fixed per shader (io_in, modz) or device (logicOp). Building the key (about 400 bytes, field by field and
+// masked), its 49-word hash and its compare in pipe_get cost Breath of the Wild on the Odin 2 about 2.35% of the replay thread (pipe_get 1.72%, the build 0.63%), for 82% of
+// draws that repeat the draw before's state (attributes included). Pipelines are never freed (g_pipes keeps every pipe_t; prewarm_thread only adds), so the memo keeps a
+// pointer. Only a made pipeline is kept; a dump frame builds every key (its log reads the key's fields). DM_VK_PSO_MEMO=0 (env.txt): every draw builds its key, as before;
+// DM_VK_PSO_CHECK=1 (a diagnostic, off by default): a draw the memo answers builds the key anyway and takes the full key's pipeline; a key or pipeline other than the
+// memo's is a [RED] line (the first 16) naming the fields that differ, and the counts are in the periodic statistics (DM_VK_MEMO_LOG=1)
+static int pso_memo_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PSO_MEMO"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_PSO_MEMO=0: every draw builds its pipeline key"); } return v; }
+static int pso_check(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PSO_CHECK"); v = e && *e && *e != '0'; if (v) LOG("[vk] DM_VK_PSO_CHECK=1: the pipeline memo's answers are checked against full keys"); } return v; }
+static struct { uint64_t gen; vshader *sh[4]; VkRenderPass rp; rp_key rk; int prim, z; uint8_t ll; pipe_t *pp; pipe_key k; } g_pso_m;   // k: kept for DM_VK_PSO_CHECK only
+static uint64_t g_pso_hit, g_pso_miss, g_pso_checked, g_pso_bad;
+static pipe_t *pso_memo_find(vshader *const sh[4], int prim) {
+    if (!pso_memo_on() || dump_on() || !g_pso_m.pp || g_pso_m.gen != g_pso_gen || memcmp(g_pso_m.sh, sh, sizeof g_pso_m.sh) || g_pso_m.rp != P.rp || memcmp(&g_pso_m.rk, &P.key, sizeof P.key)
+        || g_pso_m.prim != prim || g_pso_m.z != !g_depth_zero || g_pso_m.ll != (uint8_t)(g_origin_ll ^ g_queue_ll)) return NULL;
+    g_pso_hit++; return g_pso_m.pp;
+}
+static void pso_memo_note(const pipe_key *k, int prim, pipe_t *pp, pipe_t *pm) {   // the key built, its pipeline pp; pm: the memo's answer (DM_VK_PSO_CHECK), compared
+    if (!pso_memo_on()) return;
+    if (pm) { g_pso_checked++; if (pp == pm && !memcmp(k, &g_pso_m.k, sizeof *k)) return;
+        if (g_pso_bad++ < 16) { char d[300] = ""; for (size_t i = 0; i < sizeof PK_F / sizeof *PK_F; i++) if (memcmp((const uint8_t *)k + PK_F[i].o, (const uint8_t *)&g_pso_m.k + PK_F[i].o, PK_F[i].s)) { size_t l = strlen(d); snprintf(d + l, sizeof d - l, " %s", PK_F[i].n); }
+            LOG("[RED] [vk] pipeline memo check: shaders %s %s, the memo's key differs in:%s%s", k->sh[0] ? k->sh[0]->key : "-", k->sh[1] ? k->sh[1]->key : "-", d[0] ? d : " (padding only)", pp != pm ? " (another pipeline)" : ""); } }
+    else g_pso_miss++;
+    g_pso_m.gen = g_pso_gen; memcpy(g_pso_m.sh, k->sh, sizeof g_pso_m.sh); g_pso_m.rp = P.rp; g_pso_m.rk = P.key; g_pso_m.prim = prim; g_pso_m.z = !g_depth_zero;
+    g_pso_m.ll = (uint8_t)(g_origin_ll ^ g_queue_ll); g_pso_m.pp = pp;
+    if (pso_check()) g_pso_m.k = *k;
+}
+// the pipeline key of the draw being made, over k's zeroed bits with its shaders set: the bound state (D), the pass (P), the primitive and the origin
+static void pipe_key_build(pipe_key *k, int prim) {
+    k->z = !g_depth_zero; k->rp = P.rp; k->rk = P.key; k->ncolor = P.key.ncolor; k->ll = (uint8_t)(g_origin_ll ^ g_queue_ll);
+    memcpy(k->attr, D.attr, sizeof k->attr); memcpy(k->stream, D.stream, sizeof k->stream);
+    k->topo = (uint8_t)topo_of(prim); k->restart = (uint8_t)D.restart.on; k->depth_clamp = (uint8_t)D.depth_clamp;
+    // the state objects field by field over zeroed bits: bind_state copies the game's objects whole, and the bits the fields leave over (16 of colour's 32, 24 of polygon's,
+    // 18 of each blend's 64, 25 of depth / stencil's) are whatever the game's object held (on its stack, without SetDefaults): each value made a new pipeline key
+    k->color.blend_en = D.color.blend_en; k->color.logic_op = D.color.logic_op; k->color.alpha_func = D.color.alpha_func;
+    k->chmask = D.chmask; k->ms = D.ms;
+    k->poly.cull = D.poly.cull; k->poly.front = D.poly.front; k->poly.mode = D.poly.mode; k->poly.offset_en = D.poly.offset_en;
+    for (int i = 0; i < 8; i++) blend_k(&k->blend[i], &D.blend[i]);
+    ds_k(&k->ds, &D.ds);
+    if (!P.key.depth) { k->ds.dt = 0; k->ds.st = 0; }
+    // only what the pipeline uses goes in its key: state left over from other draws (attributes the shader does not read, streams no read attribute uses, blend of
+    // targets that are not there or not blended, write masks of absent targets, depth / stencil functions while their test is off, primitive restart of a list topology,
+    // multisample and alpha-test fields the pipeline does not take) made a new pipeline of the same one again and again: 54,164 pipelines listed in a session of
+    // Super Mario Bros. Wonder, a creation (about 2 ms on the Adreno) every few frames
+    { uint32_t vin = k->sh[0]->io_in, streams = 0;
+      for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &k->attr[i], 4); if (!(vin >> i & 1)) k->attr[i] = 0; else if (a.fmt) streams |= 1u << a.stream; }
+      for (int s = 0; s < 16; s++) if (!(streams >> s & 1)) k->stream[s] = (vs_st){0, 0};
+      for (uint32_t i = 0; i < 8; i++) if (i >= k->ncolor || !(k->color.blend_en >> i & 1)) memset(&k->blend[i], 0, sizeof k->blend[i]);
+      if (k->ncolor < 8) k->chmask.mask &= (1u << (4 * k->ncolor)) - 1;
+      k->color.alpha_func = 0;
+      if (k->ncolor < 8) k->color.blend_en &= (1u << k->ncolor) - 1;   // enables of targets the pass does not have, and which of the three polygon offsets is on (the pipeline
+      k->poly.offset_en = k->poly.offset_en != 0;                       // takes one depth-bias switch): 186,825 keys listed after a few sessions of Super Mario Bros. Wonder
+      if (k->color.logic_op != NVN_LOGIC_OP_COPY && !g_vk_feat.logicOp) k->color.logic_op = NVN_LOGIC_OP_COPY;   // drawn as copy anyway (pipe_make)
+      if (!k->ds.dt) { k->ds.df = 0; k->ds.dw = 0; }
+      if (!k->ds.st) { k->ds.sf_f = k->ds.sf_b = 0; k->ds.fail_f = k->ds.zfail_f = k->ds.zpass_f = k->ds.fail_b = k->ds.zfail_b = k->ds.zpass_b = 0; }
+      VkPrimitiveTopology tp = (VkPrimitiveTopology)k->topo;
+      if (!(tp == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || tp == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY)) k->restart = 0;
+      ms_st m; memset(&m, 0, sizeof m); m.a2c = k->ms.a2c; k->ms = m;
+      if (!k->sh[0]->modz) k->z = 0; }
+}
 static uint64_t g_drop[8];   // draws not made, by reason: 0 shader missing, 1 targets, 2 pipeline, 3 descriptors, 4 an invalid binding, 5 pass, 6 vertex buffers
 static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!g_d_init) draw_state_reset();
@@ -1882,39 +1971,9 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     for (int i = 0; i < 4; i++) if (k.sh[i]) stage_textures(k.sh[i]);
     if (!rp_prepare()) { g_drop[1]++; return 0; }
     g_drawing = 1;   // from here no chunk is closed (chunk_submit reports one)
-    k.z = !g_depth_zero; k.rp = P.rp; k.rk = P.key; k.ncolor = P.key.ncolor; k.ll = (uint8_t)(g_origin_ll ^ g_queue_ll);
-    memcpy(k.attr, D.attr, sizeof k.attr); memcpy(k.stream, D.stream, sizeof k.stream);
-    int prim = dw ? dw->prim : di->prim; k.topo = (uint8_t)topo_of(prim); k.restart = (uint8_t)D.restart.on; k.depth_clamp = (uint8_t)D.depth_clamp;
-    // the state objects field by field over zeroed bits: bind_state copies the game's objects whole, and the bits the fields leave over (16 of colour's 32, 24 of polygon's,
-    // 18 of each blend's 64, 25 of depth / stencil's) are whatever the game's object held (on its stack, without SetDefaults): each value made a new pipeline key
-    k.color.blend_en = D.color.blend_en; k.color.logic_op = D.color.logic_op; k.color.alpha_func = D.color.alpha_func;
-    k.chmask = D.chmask; k.ms = D.ms;
-    k.poly.cull = D.poly.cull; k.poly.front = D.poly.front; k.poly.mode = D.poly.mode; k.poly.offset_en = D.poly.offset_en;
-    for (int i = 0; i < 8; i++) { const blend_st *b = &D.blend[i]; blend_st *o = &k.blend[i]; o->target = b->target; o->src_rgb = b->src_rgb; o->dst_rgb = b->dst_rgb; o->src_a = b->src_a;
-        o->dst_a = b->dst_a; o->eq_rgb = b->eq_rgb; o->eq_a = b->eq_a; o->adv = b->adv; o->adv_npm = b->adv_npm; o->adv_ovl = b->adv_ovl; }
-    { const ds_st *d = &D.ds; ds_st *o = &k.ds; o->dt = d->dt; o->dw = d->dw; o->df = d->df; o->st = d->st; o->sf_f = d->sf_f; o->sf_b = d->sf_b;
-      o->fail_f = d->fail_f; o->zfail_f = d->zfail_f; o->zpass_f = d->zpass_f; o->fail_b = d->fail_b; o->zfail_b = d->zfail_b; o->zpass_b = d->zpass_b; }
-    if (!P.key.depth) { k.ds.dt = 0; k.ds.st = 0; }
-    // only what the pipeline uses goes in its key: state left over from other draws (attributes the shader does not read, streams no read attribute uses, blend of
-    // targets that are not there or not blended, write masks of absent targets, depth / stencil functions while their test is off, primitive restart of a list topology,
-    // multisample and alpha-test fields the pipeline does not take) made a new pipeline of the same one again and again: 54,164 pipelines listed in a session of
-    // Super Mario Bros. Wonder, a creation (about 2 ms on the Adreno) every few frames
-    { uint32_t vin = k.sh[0]->io_in, streams = 0;
-      for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &k.attr[i], 4); if (!(vin >> i & 1)) k.attr[i] = 0; else if (a.fmt) streams |= 1u << a.stream; }
-      for (int s = 0; s < 16; s++) if (!(streams >> s & 1)) k.stream[s] = (vs_st){0, 0};
-      for (uint32_t i = 0; i < 8; i++) if (i >= k.ncolor || !(k.color.blend_en >> i & 1)) memset(&k.blend[i], 0, sizeof k.blend[i]);
-      if (k.ncolor < 8) k.chmask.mask &= (1u << (4 * k.ncolor)) - 1;
-      k.color.alpha_func = 0;
-      if (k.ncolor < 8) k.color.blend_en &= (1u << k.ncolor) - 1;   // enables of targets the pass does not have, and which of the three polygon offsets is on (the pipeline
-      k.poly.offset_en = k.poly.offset_en != 0;                       // takes one depth-bias switch): 186,825 keys listed after a few sessions of Super Mario Bros. Wonder
-      if (k.color.logic_op != NVN_LOGIC_OP_COPY && !g_vk_feat.logicOp) k.color.logic_op = NVN_LOGIC_OP_COPY;   // drawn as copy anyway (pipe_make)
-      if (!k.ds.dt) { k.ds.df = 0; k.ds.dw = 0; }
-      if (!k.ds.st) { k.ds.sf_f = k.ds.sf_b = 0; k.ds.fail_f = k.ds.zfail_f = k.ds.zpass_f = k.ds.fail_b = k.ds.zfail_b = k.ds.zpass_b = 0; }
-      VkPrimitiveTopology tp = (VkPrimitiveTopology)k.topo;
-      if (!(tp == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || tp == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY)) k.restart = 0;
-      ms_st m; memset(&m, 0, sizeof m); m.a2c = k.ms.a2c; k.ms = m;
-      if (!k.sh[0]->modz) k.z = 0; }
-    pipe_t *pp = pipe_get(&k); if (!pp) { g_drop[2]++; return 0; }
+    int prim = dw ? dw->prim : di->prim;
+    pipe_t *pm = pso_memo_find(k.sh, prim), *pp = pm;   // the draw before's pipeline when nothing its key takes has changed (pso_memo_find); NULL: the key is built
+    if (!pm || pso_check()) { pipe_key_build(&k, prim); pp = pipe_get(&k); if (!pp) { g_drop[2]++; return 0; } pso_memo_note(&k, prim, pp, pm); }
     uint32_t base_inst = (uint32_t)(dw ? dw->base_instance : di->base_instance);
     VkDescriptorSet sets[4] = {0};
     g_bind_bad = 0;
