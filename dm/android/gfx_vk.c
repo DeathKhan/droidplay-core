@@ -1778,6 +1778,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     pthread_mutex_unlock(&g_bk);
     g_pace_per = period_s > 0 ? (uint64_t)(period_s * 1e9) : 16666667ull; g_pace_due = 1;
     void front_android_present(const tex_t *t, const int crop[4]); front_android_present(t, crop);
+    // DM_HITCH_DUMP (hle_thread.c) times stalls from this; only nvn_mtl.m's present set it, so on Android the dump never fired
+    extern _Atomic uint64_t dm_present_ns; atomic_store(&dm_present_ns, now_ns());
     return atomic_fetch_add(&g_presents, 1) + 1;
 }
 // The present's sleep to its vsync grid, after the replay has let g_sub_mu go (nvn_obj.h)
