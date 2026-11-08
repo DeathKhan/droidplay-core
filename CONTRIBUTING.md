@@ -2,6 +2,29 @@
 
 Issues and pull requests are welcome. This page says how a change gets in; what the code does and where things are is in [AGENTS.md](AGENTS.md) and [docs/development.md](docs/development.md).
 
+## droidnative
+
+droidnative is nxnative with an Android port ([README](README.md#droidnative)). The rest of this page is nxnative's and holds here too; this section adds what is
+particular to the port.
+
+- **Where a change goes.** Android code lives in `dm/android`: the Vulkan replay of NVN (`gfx_vk.c`, `gfx_vk_draw.inc`), the front end and Java app, the Darwin
+  stand-ins (`compat/`), the shader post-processing and packing tools (`tools/`), and `scripts/build_android_from_nsp.py`. A shared file (`dm/host`, `dm/gfx`,
+  `scripts/build_ipa_from_nsp.py`) changes only through a small hook: a weak symbol, `#ifdef __ANDROID__` / `DM_ANDROID`, a function the replay implements. Every
+  line changed there is a line that can conflict at the next merge from nxnative.
+- **A fix for the Mac or the iPhone** goes to [seedds/nxnative](https://github.com/seedds/nxnative) first and reaches droidnative with the next merge.
+- **Staying in step with nxnative.** Its `main` is merged into droidnative's `main` often (weekly or sooner: it moves fast), never rebased:
+  `git remote add upstream https://github.com/seedds/nxnative.git`, `git fetch upstream`, `git merge upstream/main`. Conflicts are resolved keeping the Android
+  behaviour, and what git cannot see is followed by hand: a new or changed NVN record (`dm/gfx/nvn/nvn_obj.h`) needs the Vulkan replay's handling (compare
+  `nvn_mtl.m`), a new `mtl_*` function in the replay interface needs one in `gfx_vk.c` and `gfx_null.c`, and new host code with Apple-only calls needs a stand-in
+  in `dm/android/compat` or an `#ifdef`. The merge commit lists what was resolved and how.
+- **Checks before a pull request**, besides nxnative's that apply:
+  - the Android host builds: `cmake -G Ninja -S dm/android -B <build dir> -DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a
+    -DANDROID_PLATFORM=android-29 -DGAME=<title ID>`, then `ninja -C <build dir> dmhost_app` (the Android CI job does this);
+  - `python -m unittest test_android_cli test_romfs_image test_spv_cb_extents` in `dm/tools/tests`;
+  - on a device: which games you ran, for how long, with what result (frame times from the log's `timing up to frame` lines), and the device, its GPU and
+    Android version. Say what you did not run.
+- **Commits** follow nxnative's form (below), with an `Android:` subject for a change to the port.
+
 ## Reporting a problem
 
 Open an issue with the bug report form. It asks for what a problem is traced with: the nxnative commit, the shader chain version, the game's title ID and version, the device and OS, how the game was built and run, environment overrides, and the whole log of the run. [Playing](docs/playing.md) says where the iPhone app's log is; a Mac app writes `~/Library/Logs/nxnative/<title ID>.log`.

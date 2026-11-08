@@ -30,7 +30,7 @@ body:
   - type: input
     id: commit
     attributes:
-      label: nxnative commit
+      label: droidnative commit
       description: "`git rev-parse --short HEAD` in the checkout you built from (or the date you downloaded it)."
       placeholder: 4639c511
     validations:
@@ -48,6 +48,8 @@ body:
     attributes:
       label: How it was built and run
       options:
+        - Android game app (DroidPlay Build Game App, or build_android_from_nsp.py --game-apk)
+        - Android launcher app (DroidPlay Install on Android, the desktop app, or build_android_from_nsp.py)
         - Mac, the host from a terminal (--platform mac)
         - Mac app (--platform mac-app)
         - iPhone or iPad, unsigned IPA from build_ipa_from_nsp.py
@@ -60,8 +62,8 @@ body:
     id: device
     attributes:
       label: Device and OS
-      description: The Mac or iPhone model with its chip, and the macOS or iOS version (Apple menu > About This Mac, or Settings > General > About).
-      placeholder: MacBook Pro M2 Max, macOS 26.1
+      description: The Android device, its GPU and Android version (Settings > About, or `adb shell getprop ro.product.model`); or the Mac or iPhone model and its OS for a problem on the Apple side.
+      placeholder: Ayn Odin 2 (Adreno 740), Android 13
     validations:
       required: true
   - type: textarea

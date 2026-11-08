@@ -1,31 +1,55 @@
-# nxnative-android
+# droidnative
 
-**Nintendo Switch games running natively on Android phones: not an emulator.** The game's own ARM64 code runs directly on the phone's CPU, and its NVN
-graphics are replayed on the phone's GPU through Vulkan. Super Mario Bros. Wonder plays at about 30 fps (render scale 0.8) on a mid-range Snapdragon 695 phone.
+**Nintendo Switch and Switch 2 games running natively on Android: not an emulator.** The game's own ARM64 code runs directly on the device's CPU, and its NVN
+graphics are replayed on the GPU through Vulkan. Pokémon Brilliant Diamond plays at 60 fps on an Ayn Odin 2, Animal Crossing: New Horizons at 30.
 
-- **Native, not emulated.** A Switch and an Android phone both run ARM64 code: the game's code is rewritten only where the host needs it (system calls,
+- **Native, not emulated.** A Switch and an Android device both run ARM64 code: the game's code is rewritten only where the host needs it (system calls,
   thread registers), and a host answers the Switch's system calls and SDK services. There is no CPU emulation.
-- **One app for every game.** An Android launcher lists your games, with per-game settings (console mode, language, render scale, frame-rate counter, touch
-  controls or a controller) and a button back to the launcher in game.
-- **A desktop app that does the packing.** Pick the folder with your game's files; it extracts the game, rewrites its code, translates its shaders and
-  installs it on your phone over USB or Wi-Fi.
+- **A game is an app of its own**, with its name, icon and saves, installable on any arm64 device with Vulkan, or every game in one launcher app.
+- **Packed on your computer** from your own dump: NSP / XCI files, or a Switch 2 game's `.nup` or dump folder. [DroidPlay](https://github.com/enjoyerofslop/droidplay),
+  a Mac app, does it with a click; the command line works on any computer.
 
-This repository is a fork of [seedds/nxnative](https://github.com/seedds/nxnative), which runs Switch games natively on the iPhone, the iPad and the Mac, and
-is built on [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) and Ryujinx's shader translator ([Acknowledgements](#acknowledgements)). This fork adds
-**Android**. Everything below the line further down is the original project's README (the iPhone and Mac side), kept as it is apart from a pointer to Android.
+droidnative is [seedds/nxnative](https://github.com/seedds/nxnative) (Switch games natively on the iPhone, the iPad and the Mac) with an Android port. The port began
+as [RogelioLB/nxnative-android](https://github.com/RogelioLB/nxnative-android) (the Vulkan replay of NVN, the Android front end, the packing script); droidnative
+carries it on and follows nxnative's `main`, merged in regularly, so its games, fixes and Switch 2 work reach Android too. nxnative itself stays Apple-only by its
+maintainer's choice: Android work belongs here, not there. Everything below the line further down is nxnative's own README (the iPhone and Mac side).
 
 > [!IMPORTANT]
 > **Bring your own game.** Nothing from any game is in this repository, and no packed game is distributed: you dump the game and the keys from **your own**
-> Switch, and the app you build for your phone is for you only. Do not share APKs packed with a game (they carry its code and files), keys or firmware, and do
-> not ask for them in issues. The project is not affiliated with Nintendo or any game publisher.
+> Switch, and the app you build is for you only. Do not share APKs packed with a game (they carry its code and files), keys or firmware, and do not ask for them
+> in issues. The project is not affiliated with Nintendo or any game publisher.
 
-## Quick start
+## Ways to play
 
-1. Dump your game (NSP files of the base game and its update) and your `prod.keys` from your Switch ([What you need](#what-you-need)).
-2. Turn on USB or wireless debugging on the phone.
-3. On the computer: `pip install lz4 capstone fonttools backports.zstd PySide6`, then `python scripts/nxnative_android.py`. Its **Settings** page checks the
-   rest (Android SDK and NDK, .NET, a JDK) and says how to get what is missing.
-4. **+ Build game**, pick the game's folder, then **Build and install**. Open **nxnative** on the phone and pick the game.
+- **DroidPlay on a Mac:** add your games folder, then **Install on Android** (one launcher app holding every game, over adb) or **Build Game App** (an APK, or an
+  XAPK for an installer app). See [DroidPlay](https://github.com/enjoyerofslop/droidplay).
+- **The command line, any computer:** [Packing from the command line](#packing-from-the-command-line). `--game-apk` makes a game app; without it the game goes into
+  the launcher app on a connected device.
+- **The desktop app** (`python scripts/nxnative_android.py`, Windows, macOS or Linux): the launcher-app flow with a window ([below](#the-desktop-app)).
+
+## Status
+
+| Game | Device | State |
+|---|---|---|
+| Pokémon Brilliant Diamond 1.3.0 | Ayn Odin 2 (Adreno 740) | Playable: 60 fps in the overworld, past the introduction and name entry |
+| Animal Crossing: New Horizons 3.0.3 | Ayn Odin 2 | Reaches the title screen at 30 fps (its RomFS from the game app's OBB) |
+| The Legend of Zelda: Breath of the Wild 1.9.0 | Ayn Odin 2 | Runs with a correct picture at about 20 fps (CPU-bound in the Vulkan replay) † |
+| Super Mario Bros. Wonder 1.2.1 | POCO X5 5G (Adreno 619) | Playable: about 30 fps at render scale 0.8 † |
+| Super Mario 3D World + Bowser's Fury 1.2.2 | POCO X5 5G | Bowser's Fury runs with correct colours; one launch stopped at a black loading screen † |
+| Danganronpa V3 Anniversary Edition 1.0.2, The Binding of Isaac: Afterbirth+ 1.7.9b | POCO X5 5G | Run from provisional profiles; not played through † |
+| **Mario Kart World 1.8.0 (Switch 2)** | Ayn Odin 2 | **Boots and draws:** the world map at about 55 fps, the attract drive at about 3.4 fps. Open: sparse textures (the terrain is untextured), virtual memory pools, constant-buffer copies in the replay, no mesh shaders on the device |
+
+† Tested before droidnative merged nxnative's `main` (2026-11-08); not run since.
+
+Every other game in the [games table](dm/games/README.md#games) has a profile and can be packed the same way, but has not been run on Android. A game without a
+profile can still be packed as an *experimental build*: most likely it does not boot, but it is the starting point for porting it.
+
+## Testing and reporting
+
+Testers and contributors are welcome. Useful reports name the device and its GPU (Settings, or `adb shell getprop ro.product.model`), Android version, the game,
+its title ID and version, how it was packed (DroidPlay, the command line, game app or launcher), and attach the log: `adb logcat -s nxnative`, or `log.txt` in the
+app's folder (`Android/data/<package>/files/`). A screenshot and the first `[RED]` lines help most. Never attach game files or keys. How changes get in, and how
+droidnative stays in step with nxnative: [CONTRIBUTING.md](CONTRIBUTING.md#droidnative).
 
 ## How it fits together
 
@@ -47,21 +71,6 @@ is built on [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) and Ryujinx
 
 One app holds every game: each game you build adds its host to a library on your computer, and every APK is packed from the whole library, so building a second
 game keeps the first one in the app. Game files (code, shaders, RomFS, icon) live in the app's folder on the phone; saves stay in the app's internal storage.
-
-## Status
-
-Tested on a **POCO X5 5G** (Snapdragon 695, Adreno 619 GPU, Android 14); Pokémon Brilliant Diamond also on an **Ayn Odin 2** (Snapdragon 8 Gen 2, Adreno 740 GPU, Android 13). Other phones and GPUs have not been tried.
-
-| Game | State on Android |
-|---|---|
-| Super Mario Bros. Wonder 1.2.1 | Playable: about 30 fps in levels and on the world map at render scale 0.8 |
-| Super Mario 3D World + Bowser's Fury 1.2.2 | Bowser's Fury runs with correct colours; one launch stopped at a black loading screen (open, see the game's note) |
-| Danganronpa V3: Killing Harmony Anniversary Edition 1.0.2 | Runs from a provisional (guessed) profile: its menus, its in-game movies and the start of the story; not played through |
-| The Binding of Isaac: Afterbirth+ 1.7.9b with Repentance | Runs from a provisional profile, with its Repentance DLC; it compiles its shaders at run time, captured on the phone (58 so far, below) |
-| Pokémon Brilliant Diamond 1.3.0 | Playable on the Ayn Odin 2: 60 fps in the overworld, past the introduction and name entry |
-
-Every other game in the [games table](dm/games/README.md#games) has a profile and can be packed the same way, but has not been run on Android. A game without a
-profile can still be packed as an *experimental build* (below): most likely it does not boot, but it is the starting point for porting it.
 
 ## What you need
 
@@ -106,7 +115,9 @@ copied to the phone again when the phone already holds the same one.
 
 ```
 python scripts/build_android_from_nsp.py "<folder with your NSP / XCI files>" -k "<your prod.keys>"    build, install, copy the game
-    -p v0                pack the base game instead of the newest version in the folder
+                         (a Switch 2 game: the folder with its .nup or dump, or the .nup itself; no keys needed)
+    --game-apk [--xapk]  the game as an app of its own (<name>.apk, plus <name>.romfs for a game over 2 GB, or one .xapk); no device needed
+    -p v0                pack the base game instead of the newest version in the folder (a version the profile does not register is packed from a derived profile)
     -l es-419            the default game language (a code or a name)
     --serial <device>    the adb device, when more than one is connected
     --no-push            build the APK only (a game without a profile is first built this way)
@@ -221,7 +232,7 @@ The IPA appears in the game's folder. The first build takes 30–60 minutes and 
 
 To play on the Mac instead, add `--platform mac-app`: you get a Mac app of the game to open from Finder. All options: [The packing script in detail](docs/development.md#the-packing-script-in-detail).
 
-**Android.** To play on an Android phone instead, see [the top of this page](#nxnative-android): a desktop app packs the game and installs it on the phone.
+**Android.** To play on an Android phone instead, see [the top of this page](#droidnative): a desktop app packs the game and installs it on the phone.
 
 ### Install
 

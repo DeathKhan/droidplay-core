@@ -1,0 +1,53 @@
+# droidnative's own check: the Android host builds with the NDK, and the Android packing and RomFS image tests pass. nxnative's workflows that need its macOS
+# runners with Xcode 27 (tests, lint-c) or its labels (issue-areas, pr-areas, triage-report) are switched off in this repository's Actions settings; their files
+# stay as nxnative has them, so merges from it do not conflict. Device tests stay manual: say what you ran on a device in the pull request (CONTRIBUTING.md).
+name: android
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NDK_VERSION: 28.2.13676358   # build_android_from_nsp.py check()'s
+  CMAKE_VERSION: 3.22.1
+  GAME: 0100000011D90000   # Pokémon Brilliant Diamond: the profile the host is built for (any profile does; the job checks code, not a game)
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  host:
+    name: Android host build and packing tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      - name: Python modules the packing script imports
+        run: python -m pip install lz4 capstone fonttools
+      - name: NDK and CMake
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" > /dev/null
+      - name: Build the Android host (the game library, the command-line host and the loader)
+        run: |
+          CM="$ANDROID_HOME/cmake/$CMAKE_VERSION/bin"
+          "$CM/cmake" -G Ninja -S dm/android -B build -DCMAKE_MAKE_PROGRAM="$CM/ninja" \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DGAME="$GAME" -DPython3_EXECUTABLE="$(command -v python)"
+          "$CM/ninja" -C build dmhost_app dmhost_cli nxloader
+      - name: Packing and RomFS image tests
+        working-directory: dm/tools/tests
+        run: python -m unittest -v test_android_cli test_romfs_image
