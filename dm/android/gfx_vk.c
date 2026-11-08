@@ -403,7 +403,8 @@ static void mem_view(uint64_t rd, uint64_t rn, uint64_t wr, uint64_t wn) {
 // The narrowing holds for every write-back with a snapshot (storage buffers' too): only the span written is prepared
 static int lsnap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_LINWB_SNAP"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[vk] DM_VK_LINWB_SNAP=0: linear render targets are written back whole, every page prepared (as before)"); } return v; }
 static uint64_t g_lsnap, g_lsnap_stale;   // passes' snapshots taken; not taken: a write to the target was pending (gfx_vk_draw.inc lsnap_take)
-static _Atomic uint64_t g_lwb_whole, g_lwb_diff, g_lwb_same, g_lwb_bytes;   // linear write-backs landed whole / as their changed bytes / with nothing changed; the bytes the latter two wrote
+static _Atomic uint64_t g_lwb_whole, g_lwb_diff, g_lwb_same, g_lwb_bytes, g_lwb_ns;   // linear write-backs landed whole / as their changed bytes / with nothing changed; the bytes the latter two wrote;
+                                                                                   // the completion thread's time landing them and noting them (ab_note), before the chunk's fence
 // Snapshot buffers: one of 64 KB or more comes from a few kept for reuse (on Android a 1 MB malloc is an mmap and 256 first-touch faults, every pass), smaller ones are malloc'd
 enum { SNAP_POOL_MIN = 64 << 10, SNAP_KEEP = 8, SNAP_KEEP_BYTES = 32 << 20 };
 static struct { uint8_t *p; size_t cap; } g_snapf[SNAP_KEEP]; static int g_nsnapf; static size_t g_snapf_bytes; static pthread_mutex_t g_snap_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -430,8 +431,10 @@ static void snap_give(uint8_t *p, size_t cap) {   // either thread; cap 0: free
 // DM_VK_WB_REVERT=1 (diagnostic; the flicker plan's experiment 4a): before a linear render target's write-back lands, the bytes where guest memory differs from the pass's snapshot
 // and from the GPU's result (the CPU, or the replay, wrote them since the pass began, to another value than the GPU's) are counted per channel (the texel's bytes in four groups: R G B A
 // for RGBA8) and per texture, and of them those the GPU left at the snapshot's value: the whole-level write-back put those back to the old value (DM_VK_LINWB_SNAP keeps the CPU's).
-// The first 10 write-backs with such bytes are logged, the counts every 300 frames (mtl_mem_stat). With DM_VK_LINWB_SNAP=0 the snapshot is taken for this alone (dsnap): the count is
-// then what the old write-back reverted. A pass with no snapshot (a write to its target was pending) is not compared
+// The first 10 write-backs with such bytes are logged, the counts every 300 frames (mtl_mem_stat). With DM_VK_LINWB_SNAP=0 the snapshot is taken for this alone (dsnap) and the
+// write-back is whole, but that alone is not the base: DM_VK_WB_ABSORB and DM_VK_UP_RANGE, still on, change the uploads and their syncs and so each pass's window from rp_prepare to
+// its write-back landing, which the count samples. The base plus the count (and the count's own snapshot copy and compare) is DM_VK_LINWB_SNAP=0 DM_VK_WB_ABSORB=0 DM_VK_UP_RANGE=0
+// DM_VK_WB_REVERT=1. A pass with no snapshot (a write to its target was pending) is not compared
 static int wb_revert_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_REVERT"); v = e && atoi(e) != 0; if (v) LOG("[vk] DM_VK_WB_REVERT=1: linear write-backs are checked for bytes the CPU wrote during their pass"); } return v; }
 enum { RV_SER = 32 };
 static struct { uint64_t ser; uint32_t fmt, w, h; uint64_t wbs, events, cpu[4], rev[4]; } g_rv[RV_SER];
@@ -468,13 +471,15 @@ static void rv_stat(unsigned long long frame) {   // every 300 frames (mtl_mem_s
 }
 // A linear render target's own write-back is not new content for it (DM_VK_WB_ABSORB, on; =0: re-uploaded, as before). What wb_apply wrote is what the image already holds, but the
 // pages it prepared were stamped, so the next sampling re-uploaded the level: Breath of the Wild's s7928 at its first grass draw each frame (1 MB through a new staging buffer, an upload
-// sync draining the GPU, the G-buffer pass split there at 46 | 18 draws) and its small linear targets at rp_prepare and clear_color. As nvn_mtl.m pkg_absorb_note / pkg_absorb_take do:
-// right after that write-back lands, the completion thread takes a stamp, protects the storage again and keeps the texture's bytes in its edge pages, and only when guest memory then
-// equals the GPU's copy in every row (no CPU write since the snapshot survived the diff, none came before the protect) notes (serial, storage, image, stamp) in a table under g_ab_mu;
-// it never touches the vtex, which vt_destroy frees at once. vt_get, finding the texture written since its stamp, takes the note when it is still that texture's image, it was not
-// uploaded after the note, no page wholly inside it was written after the stamp and its edge bytes are unchanged: the stamp and the edge bytes become its own and the image stays
-// (ab_take). Only one level and one layer (lin 2): the write-back then covers every byte vt_upload_ reads. A newer note of a serial replaces the older; a texture made again over the
-// same storage has another serial or another image. Open, as on the Mac: the pool's Finalize racing the protect (a game finalizes after the fence, which is completed after this)
+// sync draining the GPU, the G-buffer pass split there at 46 | 18 draws) and its small linear targets at rp_prepare and clear_color. Right after that write-back lands, the completion
+// thread takes a stamp, protects the storage again and keeps the texture's bytes in its edge pages, and notes (serial, storage, image, stamp) in a table under g_ab_mu only when guest
+// memory then equals the GPU's copy in every row: a CPU write the diff kept (made since the snapshot) or one made before the protect is not in the image, and the texture is uploaded
+// again. It never touches the vtex, which vt_destroy frees at once. vt_get, finding the texture written since its stamp, takes the note when it is still that texture's image, it was
+// not uploaded after the note, no page wholly inside it was written after the stamp and its edge bytes are unchanged: the stamp and the edge bytes become its own and the image stays
+// (ab_take), and the next lookup checks the pages again (an edge page a neighbour unprotected goes through edges_clean). Only one level and one layer (lin 2): the write-back then
+// covers every byte vt_upload_ reads. A newer note of a serial replaces the older; a texture made again over the same storage has another serial or another image. The scheme is
+// upstream nxnative's for storage-backed render targets on Metal (#604, not in this fork's nvn_mtl.m), which notes without comparing guest memory with the readback. Open: the
+// pool's Finalize racing the protect (a game finalizes after the fence, which is completed after this)
 static int wb_absorb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_ABSORB"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[vk] DM_VK_WB_ABSORB=0: a linear render target is uploaded again after its own write-back (as before)"); } return v; }
 typedef struct { uint64_t ser, img, gen; const uint8_t *store; uint8_t *edge[2]; uint32_t edge_n[2]; } ab_rec;
 enum { NAB = 64 };
@@ -502,6 +507,25 @@ static void ab_note(const wb_t *w, const uint8_t *s) {   // the completion threa
     atomic_fetch_add(&g_ab_noted, 1); return;
 drop: free(e.edge[0]); free(e.edge[1]);
 }
+// A row's bytes the GPU changed against the snapshot (DM_VK_LINWB_SNAP; =0: wb_apply's byte loop, as before), compared a word at a time: a word all changed is stored whole, one
+// partly changed byte by byte. Never a merge of the word over the bytes left alone ((d & same) | (g & ~same)): its store would put back the value read just before it, losing a CPU
+// write landing in between, the bytes the snapshot keeps. The byte loop made a memcpy call per run of changed bytes, a call and two word compares a texel when each texel keeps a
+// channel (512x512 RGBA8 on an M-series Mac: alpha kept 0.99 ms, 0.30 ms this way; B alone changed 0.97 against 0.14), on the completion thread before the chunk's fence. → bytes written
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "wb_row_diff: byte k of a word loaded from memory is its bits 8k..8k+7");
+static size_t wb_row_diff(uint8_t *d, const uint8_t *g, const uint8_t *o, size_t rb) {
+    if (!memcmp(g, o, rb)) return 0;
+    size_t n = 0, i = 0;
+    for (; i + 8 <= rb; i += 8) {
+        uint64_t a, b; memcpy(&a, g + i, 8); memcpy(&b, o + i, 8); uint64_t x = a ^ b;
+        if (!x) continue;
+        uint64_t m = (((x & 0x7f7f7f7f7f7f7f7full) + 0x7f7f7f7f7f7f7f7full) | x) & 0x8080808080808080ull;   // bit 8k+7: byte k changed (no carry crosses a byte)
+        if (m == 0x8080808080808080ull) { memcpy(d + i, &a, 8); n += 8; continue; }
+        n += (size_t)__builtin_popcountll(m);
+        for (; m; m &= m - 1) { unsigned k = (unsigned)__builtin_ctzll(m) >> 3; d[i + k] = (uint8_t)(a >> 8 * k); }
+    }
+    for (; i < rb; i++) if (g[i] != o[i]) { d[i] = g[i]; n++; }
+    return n;
+}
 // → whether it wrote (and prepared) anything
 static int wb_apply(const wb_t *w, const uint8_t *s) {
     size_t y0 = 0, y1 = w->rows;
@@ -521,6 +545,7 @@ static int wb_apply(const wb_t *w, const uint8_t *s) {
         uint8_t *d = w->dst + y * w->dst_pitch; const uint8_t *g = s + y * w->src_pitch;
         if (!w->snap) { memcpy(d, g, w->row_bytes); continue; }
         const uint8_t *o = w->snap + y * w->row_bytes;   // only what the GPU changed
+        if (lsnap_on()) { n += wb_row_diff(d, g, o, w->row_bytes); continue; }
         for (size_t i = 0; i < w->row_bytes;) {
             if (i + 8 <= w->row_bytes && !memcmp(g + i, o + i, 8)) { i += 8; continue; }
             size_t e = i; while (e < w->row_bytes && g[e] != o[e]) e++;
@@ -540,9 +565,10 @@ static void chunk_done(chunk *c) {
     }
     for (int i = 0; i < c->nwb; i++) { const wb_t *w = &c->wb[i]; const uint8_t *s = (w->st >= 0 ? c->stg[w->st].p : c->ar[-1 - w->st].p) + w->off;
         if (w->lin && wb_revert_on()) rv_check(w, s);   // before it lands: guest memory still holds what the CPU wrote during the pass
-        int wrote = wb_apply(w, s);
+        uint64_t t0 = w->lin ? clock_gettime_nsec_np(CLOCK_MONOTONIC) : 0; int wrote = wb_apply(w, s);
         if (w->lin) atomic_fetch_add(!w->snap || !lsnap_on() ? &g_lwb_whole : wrote ? &g_lwb_diff : &g_lwb_same, 1);
         if (w->lin == 2 && wrote && wb_absorb_on()) ab_note(w, s);   // right after it: before a later write-back or post of the chunk
+        if (w->lin) atomic_fetch_add(&g_lwb_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0);
         snap_give(w->snap, w->snap_cap); snap_give(w->dsnap, w->snap_cap); }   // a storage buffer's snapshot: snap_cap 0, freed
     if (c->npq) prof_collect(c);
     if (c->nq) { uint64_t r[1024]; memset(r, 0, sizeof r);
@@ -963,7 +989,11 @@ static int ab_take(vtex *v, const tex_t *t) {
     int ok = e.img == (uint64_t)v->img && e.store == t->mem && e.gen >= v->stamp && v->span && v->levels == 1 && v->layers == 1
              && !(ie > ia && nvn_dirty_since_span(v->span, (const void *)ia, ie - ia, e.gen));
     for (int k = 0; k < 2 && ok; k++) ok = e.edge_n[k] == (r[k][1] > r[k][0] ? r[k][1] - r[k][0] : 0) && (!e.edge_n[k] || !memcmp(e.edge[k], (const void *)r[k][0], e.edge_n[k]));
-    if (ok) { v->stamp = e.gen; for (int k = 0; k < 2; k++) { free(v->edge[k]); v->edge[k] = e.edge[k]; v->edge_n[k] = e.edge_n[k]; e.edge[k] = NULL; } atomic_fetch_add(&g_ab_taken, 1); }   // a neighbour's write in an edge page is judged by them (edges_clean)
+    // seen too, not only the stamp (as upstream's take, #604): an edge page a neighbour's write unprotected after e.gen passed the compare but stays writable, so a later write to the
+    // texture's bytes there neither faults nor moves the clock, and vt_get's now == seen shortcut (sound only while every page is protected) would keep a stale image. With seen = e.gen
+    // the shortcut holds only while the clock is still e.gen (no page unprotected since ab_note's protect); otherwise the next lookup checks the pages, finds that one newer than the
+    // stamp and goes to edges_clean, which protects before it compares: the protect is left to the lookup that meets such a page
+    if (ok) { v->stamp = v->seen = e.gen; for (int k = 0; k < 2; k++) { free(v->edge[k]); v->edge[k] = e.edge[k]; v->edge_n[k] = e.edge_n[k]; e.edge[k] = NULL; } atomic_fetch_add(&g_ab_taken, 1); }   // a neighbour's write in an edge page is judged by them (edges_clean)
     else atomic_fetch_add(&g_ab_refused, 1);
     free(e.edge[0]); free(e.edge[1]);
     return ok;
@@ -1614,10 +1644,10 @@ void mtl_ubd_stats(uint64_t *a, uint64_t *b) { *a = *b = 0; }
 void mtl_ubp_stats(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = *c = 0; }
 void mtl_ubp_why(uint64_t w[5]) { memset(w, 0, 5 * sizeof *w); }
 void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] frame %llu: resident %llu MB, textures %u, uploads %llu (%llu again), %llu MB uploaded; linear render targets: snapshots %llu "
-    "(%llu not taken: a write was pending), write-backs whole %llu / changed bytes only %llu (%llu KB) / nothing changed %llu, own write-backs absorbed %llu (noted %llu, guest differed %llu, refused %llu) (cumulative)",
+    "(%llu not taken: a write was pending), write-backs whole %llu / changed bytes only %llu (%llu KB) / nothing changed %llu (%.1f ms landing and noting them), own write-backs absorbed %llu (noted %llu, guest differed %llu, refused %llu) (cumulative)",
     frame, mb, g_tex.n, (unsigned long long)g_pkg_uploads, (unsigned long long)g_pkg_reuploads, (unsigned long long)(g_up_bytes >> 20), (unsigned long long)g_lsnap, (unsigned long long)g_lsnap_stale,
     (unsigned long long)atomic_load(&g_lwb_whole), (unsigned long long)atomic_load(&g_lwb_diff), (unsigned long long)(atomic_load(&g_lwb_bytes) >> 10), (unsigned long long)atomic_load(&g_lwb_same),
-    (unsigned long long)atomic_load(&g_ab_taken), (unsigned long long)atomic_load(&g_ab_noted), (unsigned long long)atomic_load(&g_ab_differ), (unsigned long long)atomic_load(&g_ab_refused));
+    atomic_load(&g_lwb_ns) / 1e6, (unsigned long long)atomic_load(&g_ab_taken), (unsigned long long)atomic_load(&g_ab_noted), (unsigned long long)atomic_load(&g_ab_differ), (unsigned long long)atomic_load(&g_ab_refused));
     if (wb_revert_on()) rv_stat(frame);
     LOG("[vk] guest reads of draws: waited for the current submission %llu, for submissions in flight %llu, no wait %llu; uniform updates and small copies: %llu / %llu / %llu; submissions %llu (cumulative)",
         (unsigned long long)g_view_cur, (unsigned long long)g_view_fly, (unsigned long long)g_view_free, (unsigned long long)g_mem_cur, (unsigned long long)g_mem_fly, (unsigned long long)g_mem_free,
