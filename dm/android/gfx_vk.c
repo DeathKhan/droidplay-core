@@ -490,14 +490,16 @@ static void mem_view(uint64_t rd, uint64_t rn, uint64_t wr, uint64_t wn) {
 //   - a byte the CPU wrote between the pass's upload and the write-back landing (the first 3 to 6 ms of each replay) was put back to its old value, which the GPU never saw: the grass
 //     flicker's leading suspect (the revert check below counts it)
 //   - all 256 pages were stamped, so the next sampling re-uploaded the level: about 4 re-uploads (1 MB) and 2.1 to 2.65 upload syncs a frame, and a G-buffer split before the first grass draw
-// DM_VK_LINWB_SNAP (on; =0: written back whole, every page prepared, as before): the pass snapshots the target's guest bytes at rp_prepare, after vt_get made the image equal to them
+// Off by default, with DM_VK_WB_ABSORB and DM_VK_UP_RANGE below: with the three on, Breath of the Wild's tall grass collapsed in single frames on a period of about 10 frames on an Ayn
+// Odin 2 (4 of 4 captures, 0 of 3 with them off, draws unchanged), and which of them causes it is not found yet. =1 turns each on for that bisection and for measurements.
+// DM_VK_LINWB_SNAP (=1; off: written back whole, every page prepared): the pass snapshots the target's guest bytes at rp_prepare, after vt_get made the image equal to them
 // (gfx_vk_draw.inc lsnap_take), and the write-back writes only the bytes the GPU changed against it, preparing only the span from the first of them to the last (none changed: nothing
 // prepared, no page stamped, no re-upload). A write still pending to those bytes at rp_prepare (an earlier pass's write-back, a queued copy) lands after the snapshot, and a byte this
 // pass leaves at (or sets back to) the snapshot's value would then keep that write's value: such a pass takes no snapshot and is written back whole, as before. Two differences from
 // the hardware remain, races a game would have anyway: a byte the CPU wrote between vt_get's upload and the snapshot is still put back; one the CPU wrote and the GPU set to the
 // snapshot's value keeps the CPU's.
 // The narrowing holds for every write-back with a snapshot (storage buffers' too): only the span written is prepared
-static int lsnap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_LINWB_SNAP"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[vk] DM_VK_LINWB_SNAP=0: linear render targets are written back whole, every page prepared (as before)"); } return v; }
+static int lsnap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_LINWB_SNAP"); v = e && !strcmp(e, "1"); if (v) LOG("[vk] DM_VK_LINWB_SNAP=1: linear render targets are written back as the bytes their pass changed (off by default: the grass flicker)"); } return v; }
 static uint64_t g_lsnap, g_lsnap_stale;   // passes' snapshots taken; not taken: a write to the target was pending (gfx_vk_draw.inc lsnap_take)
 static _Atomic uint64_t g_lwb_whole, g_lwb_diff, g_lwb_same, g_lwb_bytes, g_lwb_ns;   // linear write-backs landed whole / as their changed bytes / with nothing changed; the bytes the latter two wrote;
                                                                                    // the completion thread's time landing them and noting them (ab_note), before the chunk's fence
@@ -527,10 +529,9 @@ static void snap_give(uint8_t *p, size_t cap) {   // either thread; cap 0: free
 // DM_VK_WB_REVERT=1 (diagnostic; the flicker plan's experiment 4a): before a linear render target's write-back lands, the bytes where guest memory differs from the pass's snapshot
 // and from the GPU's result (the CPU, or the replay, wrote them since the pass began, to another value than the GPU's) are counted per channel (the texel's bytes in four groups: R G B A
 // for RGBA8) and per texture, and of them those the GPU left at the snapshot's value: the whole-level write-back put those back to the old value (DM_VK_LINWB_SNAP keeps the CPU's).
-// The first 10 write-backs with such bytes are logged, the counts every 300 frames (mtl_mem_stat). With DM_VK_LINWB_SNAP=0 the snapshot is taken for this alone (dsnap) and the
-// write-back is whole, but that alone is not the base: DM_VK_WB_ABSORB and DM_VK_UP_RANGE, still on, change the uploads and their syncs and so each pass's window from rp_prepare to
-// its write-back landing, which the count samples. The base plus the count (and the count's own snapshot copy and compare) is DM_VK_LINWB_SNAP=0 DM_VK_WB_ABSORB=0 DM_VK_UP_RANGE=0
-// DM_VK_WB_REVERT=1. A pass with no snapshot (a write to its target was pending) is not compared
+// The first 10 write-backs with such bytes are logged, the counts every 300 frames (mtl_mem_stat). Without DM_VK_LINWB_SNAP the snapshot is taken for this alone (dsnap) and the
+// write-back is whole; DM_VK_WB_ABSORB=1 and DM_VK_UP_RANGE=1 change the uploads and their syncs and so each pass's window from rp_prepare to its write-back landing, which the count
+// samples. The default plus the count is DM_VK_WB_REVERT=1 alone. A pass with no snapshot (a write to its target was pending) is not compared
 static int wb_revert_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_REVERT"); v = e && atoi(e) != 0; if (v) LOG("[vk] DM_VK_WB_REVERT=1: linear write-backs are checked for bytes the CPU wrote during their pass"); } return v; }
 enum { RV_SER = 32 };
 static struct { uint64_t ser; uint32_t fmt, w, h; uint64_t wbs, events, cpu[4], rev[4]; } g_rv[RV_SER];
@@ -565,7 +566,7 @@ static void rv_stat(unsigned long long frame) {   // every 300 frames (mtl_mem_s
     g_nrv = 0; g_rv_wbs = g_rv_events = g_rv_unchecked = g_rv_lost = 0;
     pthread_mutex_unlock(&g_rv_mu);
 }
-// A linear render target's own write-back is not new content for it (DM_VK_WB_ABSORB, on; =0: re-uploaded, as before). What wb_apply wrote is what the image already holds, but the
+// A linear render target's own write-back is not new content for it (DM_VK_WB_ABSORB=1; off by default, see DM_VK_LINWB_SNAP: re-uploaded). What wb_apply wrote is what the image already holds, but the
 // pages it prepared were stamped, so the next sampling re-uploaded the level: Breath of the Wild's s7928 at its first grass draw each frame (1 MB through a new staging buffer, an upload
 // sync draining the GPU, the G-buffer pass split there at 46 | 18 draws) and its small linear targets at rp_prepare and clear_color. Right after that write-back lands, the completion
 // thread takes a stamp, protects the storage again and keeps the texture's bytes in its edge pages, and notes (serial, storage, image, stamp) in a table under g_ab_mu only when guest
@@ -576,7 +577,7 @@ static void rv_stat(unsigned long long frame) {   // every 300 frames (mtl_mem_s
 // covers every byte vt_upload_ reads. A newer note of a serial replaces the older; a texture made again over the same storage has another serial or another image. The scheme is
 // upstream nxnative's for storage-backed render targets on Metal (#604, not in this fork's nvn_mtl.m), which notes without comparing guest memory with the readback. Open: the
 // pool's Finalize racing the protect (a game finalizes after the fence, which is completed after this)
-static int wb_absorb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_ABSORB"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[vk] DM_VK_WB_ABSORB=0: a linear render target is uploaded again after its own write-back (as before)"); } return v; }
+static int wb_absorb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_ABSORB"); v = e && !strcmp(e, "1"); if (v) LOG("[vk] DM_VK_WB_ABSORB=1: a linear render target keeps its image after its own write-back (off by default: the grass flicker)"); } return v; }
 typedef struct { uint64_t ser, img, gen; const uint8_t *store; uint8_t *edge[2]; uint32_t edge_n[2]; } ab_rec;
 enum { NAB = 64 };
 static ab_rec g_ab[NAB]; static int g_nab; static _Atomic int g_nab_n; static pthread_mutex_t g_ab_mu = PTHREAD_MUTEX_INITIALIZER;   // g_nab_n: read without the lock first (ab_take)
@@ -978,14 +979,14 @@ static _Atomic uint64_t g_mod_made, g_mod_ns, g_cpso_made, g_cpso_ns;   // shade
 static int vt_upload_(vtex *v, const tex_t *t, int track);
 // track 0: a one-time fill (tex_init_fill), with no write tracking: the pages are not protected and no dirty span is kept
 static int vt_upload(vtex *v, const tex_t *t, int track) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); int r = vt_upload_(v, t, track); atomic_fetch_add(&g_up_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); return r; }
-// The upload's sync (DM_VK_UP_RANGE, on; =0: cpu_view, as before). cpu_view waits for every pending write-back and queued copy wherever it writes, and with a linear render target
+// The upload's sync (DM_VK_UP_RANGE=1; off by default, see DM_VK_LINWB_SNAP: cpu_view). cpu_view waits for every pending write-back and queued copy wherever it writes, and with a linear render target
 // written back in nearly every chunk Breath of the Wild's uploads drained the GPU 2.1 to 2.65 times a frame (Ayn Odin 2: 1.49 submitted + 0.64 in flight a frame in one dump, 1.51 + 1.14
 // in another run). An upload reads only its own storage: it waits only for a pending write overlapping the bytes it reads (chunk_hits: write-backs' and queued copies' destinations),
 // the current chunk submitted and waited for, or the newest overlapping chunk in flight waited for (they complete in order). The open render pass is ended first, as the cb() below
 // would end it, so that its targets' write-backs (lin_writeback) and shadow copies are queued and seen: a dirty texture sampled while it is an attachment of the open pass was read
 // before that pass's write-back existed. Counted at the upload site (submitted / in flight); g_up_free: the uploads that waited for nothing
 static uint64_t g_up_free;
-static int up_range_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UP_RANGE"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[vk] DM_VK_UP_RANGE=0: a texture upload waits for every pending write-back (as before)"); } return v; }
+static int up_range_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UP_RANGE"); v = e && !strcmp(e, "1"); if (v) LOG("[vk] DM_VK_UP_RANGE=1: a texture upload waits only for pending writes it reads (off by default: the grass flicker, see DM_VK_LINWB_SNAP)"); } return v; }
 static void up_view(const vtex *v, const tex_t *t) {
     if (!up_range_on() || vk_safe()) { g_vs = 2; cpu_view(); return; }
     rp_end();
