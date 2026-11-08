@@ -84,7 +84,7 @@ void vkb_pipeline_cache_save(void) {
 }
 
 // ---------------- Shaders ----------------
-typedef struct { int binding, slot; uint32_t ext; } rb_cbuf;   // ext: bytes the shader reads of it (spv_cb_ext; 0 = all)
+typedef struct { int binding, slot; uint32_t ext; } rb_cbuf;   // ext: bytes the shader reads of it (cb_ext_pick: res.json's or spv_cb_ext2's; 0 = all)
 typedef struct { int binding, slot, cb_slot, cb_off, flags; } rb_sbuf;
 typedef struct { int binding, type, cbuf_slot, handle, array, separate, flags; VkFormat fmt; int samp_slot; } rb_tex;   // fmt: an image's declared format (0: Unknown); cbuf_slot / samp_slot: the banks of the texture and sampler handles (rb_tex_read)
 enum { SH_VS, SH_PS, SH_GS, SH_TS, SH_CS };
@@ -196,6 +196,77 @@ static void spv_cb_ext(const uint32_t *w, size_t n, const rb_cbuf *cb, int ncb, 
         i += len; }
     for (int k = 0; k < ncb; k++) ext[k] = full[k] || mx[k] < 0 ? 0 : (uint32_t)((mx[k] + 1) * 16 > 0x10000 ? 0x10000 : (mx[k] + 1) * 16);
     free(bind); free(cval); free(isc);
+}
+// spv_cb_ext by operand, not by word (sh_get; res.json's extent goes over it where it has one, cb_ext_pick). The word match took any word equal to the variable's id for
+// a use that keeps the whole buffer: an OpConstant's literal (%int_23 and %int_25 in Breath of the Wild's 753d0169ae3ce4f0), OpMemberDecorate's Offset value 35, an extended
+// instruction's number, a composite index. On the Odin 2 4,215 of a frame's 19,633 constant buffer bindings were copied whole (2,336 bytes where 304 are read): its dumped
+// frame read 26.2 MB of constant buffers, 21.0 MB with this. Here a use is an id operand (spv_lit) of an instruction in a function body, or a global variable's initializer;
+// the buffer's variable is the one decorated with its binding, and its layout must be the translator's (member 0 at offset 0, an array of 4-component 32-bit vectors at
+// stride 16) for an element index to count 16 bytes. An access chain from member 0 with a constant element takes it; one with a computed element takes the declared array
+// (the whole buffer at 4096 vec4); any other use, a layout not recognized, decoration groups or pointer arithmetic (OpPtrAccessChain) keep the whole buffer. A binding no
+// instruction reads gets 16 bytes (a descriptor's range cannot be 0). Over the game's 19,592 shaders it bounds 59,263 of 63,480 bindings, the word match 41,837, and gives the
+// same extent wherever the word match bounds one. DM_VK_CB_EXT2=0 (env.txt): spv_cb_ext, as before
+static int cb_ext2_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_CB_EXT2"); v = !(e && *e == '0'); } return v; }
+static int cb_index(const rb_cbuf *cb, int ncb, int32_t binding) { int k = 0; while (k < ncb && cb[k].binding != binding) k++; return k; }   // ncb: none
+static void spv_cb_ext2(const uint32_t *w, size_t n, const rb_cbuf *cb, int ncb, uint32_t *ext) {
+    for (int i = 0; i < ncb; i++) ext[i] = 0;
+    if (n < 5 || !w[3]) return;
+    typedef struct { int64_t c; int32_t bind; uint32_t op, a, b, stride; uint8_t isc, off_nz; } spv_id;   // a, b: a type's / variable's operands (below)
+    uint32_t bound = w[3]; spv_id *t = calloc(bound, sizeof *t); if (!t) return;
+    for (uint32_t i = 0; i < bound; i++) t[i].bind = -1;
+    int give_up = 0;
+    for (size_t i = 5; i < n; ) { uint32_t len = w[i] >> 16, op = w[i] & 0xffff; if (!len || i + len > n) { give_up = 1; break; }
+        if (op == 71 && len >= 4 && w[i + 1] < bound) { if (w[i + 2] == 33) t[w[i + 1]].bind = (int32_t)w[i + 3]; else if (w[i + 2] == 6) t[w[i + 1]].stride = w[i + 3]; }   // OpDecorate Binding / ArrayStride
+        else if (op == 72 && len >= 5 && w[i + 1] < bound && w[i + 2] == 0 && w[i + 3] == 35 && w[i + 4]) t[w[i + 1]].off_nz = 1;   // OpMemberDecorate struct 0 Offset (not 0)
+        else if (op == 43 && len == 4 && w[i + 2] < bound) { t[w[i + 2]].isc = 1; t[w[i + 2]].c = w[i + 3]; }   // OpConstant (32-bit: an index is taken unsigned)
+        else if ((op == 21 || op == 22) && len >= 3 && w[i + 1] < bound) { t[w[i + 1]].op = op; t[w[i + 1]].a = w[i + 2]; }   // OpTypeInt / OpTypeFloat width
+        else if ((op == 23 || op == 28) && len >= 4 && w[i + 1] < bound) { t[w[i + 1]].op = op; t[w[i + 1]].a = w[i + 2]; t[w[i + 1]].b = w[i + 3]; }   // OpTypeVector comp count, OpTypeArray elem length
+        else if (op == 30 && len >= 3 && w[i + 1] < bound) { t[w[i + 1]].op = op; t[w[i + 1]].a = w[i + 2]; }   // OpTypeStruct member 0
+        else if (op == 32 && len >= 4 && w[i + 1] < bound) { t[w[i + 1]].op = op; t[w[i + 1]].a = w[i + 2]; t[w[i + 1]].b = w[i + 3]; }   // OpTypePointer storage pointee
+        else if (op == 59 && len >= 4 && w[i + 2] < bound) { t[w[i + 2]].op = op; t[w[i + 2]].a = w[i + 1]; t[w[i + 2]].b = w[i + 3]; }   // OpVariable type (result) class
+        else if ((op >= 73 && op <= 75) || op == 67 || op == 70) give_up = 1;   // decoration groups, OpPtrAccessChain / OpInBoundsPtrAccessChain
+        i += len; }
+    int64_t mx[18]; int full[18]; uint32_t alen[18]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = give_up; alen[k] = 0; }
+    for (uint32_t v = 0; v < bound && !give_up; v++) {   // each buffer's variables: Uniform, vec4[L] at stride 16 as member 0 at offset 0
+        if (t[v].op != 59 || t[v].bind < 0) continue;
+        int k = cb_index(cb, ncb, t[v].bind); if (k == ncb) continue;
+        uint32_t p = t[v].a, s = p < bound && t[p].op == 32 ? t[p].b : 0, a = s < bound && t[s].op == 30 && !t[s].off_nz ? t[s].a : 0;
+        uint32_t e = a && a < bound && t[a].op == 28 && t[a].stride == 16 ? t[a].a : 0, len = a && a < bound && t[a].b < bound && t[t[a].b].isc ? (uint32_t)t[t[a].b].c : 0;
+        uint32_t ct = e && e < bound && t[e].op == 23 && t[e].b == 4 ? t[e].a : 0;
+        if (t[v].b != 2 || !len || !ct || ct >= bound || (t[ct].op != 21 && t[ct].op != 22) || t[ct].a != 32) full[k] = 1;
+        else if (!alen[k] || len < alen[k]) alen[k] = len;
+    }
+    for (size_t i = 5, fn = 0; i < n && !give_up; ) { uint32_t len = w[i] >> 16, op = w[i] & 0xffff;
+        if (op == 54) fn = 1;   // the functions come after every global declaration
+        if (!fn) { if (op == 59 && len >= 5 && w[i + 4] < bound && t[w[i + 4]].op == 59 && t[w[i + 4]].bind >= 0) { int k = cb_index(cb, ncb, t[w[i + 4]].bind); if (k < ncb) full[k] = 1; } }   // an initializer
+        else for (uint32_t q = 1; q < len; q++) { uint32_t id = w[i + q]; if (id >= bound || t[id].op != 59 || t[id].bind < 0 || spv_lit(op, q) || (op == 59 && q == 2)) continue;
+            int k = cb_index(cb, ncb, t[id].bind); if (k == ncb) continue;
+            uint32_t m = len >= 6 ? w[i + 4] : 0, el = len >= 6 ? w[i + 5] : 0;
+            if ((op == 65 || op == 66) && q == 3 && len >= 6 && m < bound && t[m].isc && t[m].c == 0 && el < bound && alen[k]) {   // OpAccessChain type result var 0 element...
+                int64_t x = t[el].isc ? t[el].c : (int64_t)alen[k] - 1;   // a computed element: any of the declared array
+                if (x >= alen[k]) full[k] = 1; else if (x > mx[k]) mx[k] = x;
+            } else full[k] = 1;
+        }
+        i += len; }
+    for (int k = 0; k < ncb; k++) ext[k] = full[k] || (mx[k] + 1) * 16 >= 0x10000 ? 0 : (uint32_t)(mx[k] < 0 ? 16 : (mx[k] + 1) * 16);
+    free(t);
+}
+// The extents a shader's constant buffers are copied with. res.json's (tools/spv_android.py cb_extents, written when the shader is translated) also bound an element
+// computed at run time: the translator's integer registers run along every path with small sets of known values, a loop with a known trip count unrolled. Breath of the
+// Wild's vertex shader 5ee9a682fff60855 indexes c3 with a do-while counter (2, then 1) whose exit test is a bool set in the body and branched on in the latch: the scan keeps
+// all 64 KB of c3, res.json gives 400 bytes; its 222 draws a frame on the Odin 2 copied 64 KB each into the arena and again into ucopy's shadow, 29 MB a frame (memcpy at
+// about 1.2 ms of the replay), and the dumped frame's constant buffer reads go from 21.0 MB (spv_cb_ext2) to 6.6 MB. res.json's extent is taken when it has one (0 or none:
+// whole) and it is not below the scan's (a stale or wrong one: the larger, and a red line). DM_VK_RES_EXT=0 (env.txt): res.json's extents ignored, the scan's alone
+static int res_ext_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RES_EXT"); v = !(e && *e == '0'); } return v; }
+static uint64_t g_cbx[4];   // the loaded shaders' constant buffer bindings: extent from res.json, res.json's below the scan's (scan kept), extent from the scan, whole
+static void cb_ext_pick(vshader *s, const uint32_t *scan, const uint32_t *rext) {
+    for (int i = 0; i < s->ncb; i++) {
+        uint32_t e = scan[i], r = res_ext_on() && rext[i] <= 0x10000 && !(rext[i] & 15) ? rext[i] : 0;
+        if (r && e > r) { RED_ONCE(120, "shader %s: res.json gives constant buffer binding %d %u bytes, its SPIR-V reads %u: the larger is copied (a res.json of another translation?)", s->key, s->cb[i].binding, r, e); g_cbx[1]++; }
+        else if (r) { e = r; g_cbx[0]++; }
+        else g_cbx[e ? 2 : 3]++;
+        s->cb[i].ext = e;
+    }
 }
 // the Private pointer type to pointee t: an existing one, else a new id (listed in np to be declared)
 static uint32_t priv_ptr(uint32_t t, uint32_t bound, const uint32_t *pst, const uint32_t *ppt, uint32_t *privp, uint32_t *nb, uint32_t np[][2], int *nnp) {
@@ -328,8 +399,8 @@ static vshader *sh_get(const char *key) {
     s->stage = !strcmp(sn, "ps") ? SH_PS : !strcmp(sn, "gs") ? SH_GS : !strcmp(sn, "cs") ? SH_CS : !strcmp(sn, "vs") ? SH_VS : SH_TS;
     s->vkstage = s->stage == SH_PS ? VK_SHADER_STAGE_FRAGMENT_BIT : s->stage == SH_GS ? VK_SHADER_STAGE_GEOMETRY_BIT : s->stage == SH_CS ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_VERTEX_BIT;
     s->set = js_int(&r, "set", s->stage == SH_PS ? 1 : s->stage == SH_GS ? 2 : 0);
-    const jv *a = js_get(&r, "cbufs");
-    for (int i = 0; a && i < a->n && s->ncb < 18; i++) s->cb[s->ncb++] = (rb_cbuf){js_int(&a->kid[i], "binding", 0), js_int(&a->kid[i], "slot", 0), 0};
+    const jv *a = js_get(&r, "cbufs"); uint32_t rext[18] = {0};   // rext: res.json's extents (cb_ext_pick)
+    for (int i = 0; a && i < a->n && s->ncb < 18; i++) { rext[s->ncb] = (uint32_t)js_int(&a->kid[i], "ext", 0); s->cb[s->ncb++] = (rb_cbuf){js_int(&a->kid[i], "binding", 0), js_int(&a->kid[i], "slot", 0), 0}; }
     a = js_get(&r, "sbufs");
     for (int i = 0; a && i < a->n && s->nsb < 16; i++) { const jv *o = &a->kid[i]; s->sb[s->nsb++] = (rb_sbuf){js_int(o, "binding", 0), js_int(o, "slot", 0), js_int(o, "cb_slot", 0), js_int(o, "cb_offset", 0), js_int(o, "flags", 0)}; }
     rb_tex_read(js_get(&r, "textures"), s->tx, &s->ntx, 64); rb_tex_read(js_get(&r, "images"), s->im, &s->nim, 16);
@@ -341,7 +412,7 @@ static vshader *sh_get(const char *key) {
     js_free(&r);
     snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key); s->mod = sh_module(p, &s->b0);
     { size_t nw = 0; uint32_t *w = spv_read(p, &nw);
-      if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); uint32_t ext[18]; spv_cb_ext(w, nw, s->cb, s->ncb, ext); for (int i = 0; i < s->ncb; i++) s->cb[i].ext = ext[i]; free(w); } }
+      if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); uint32_t ext[18]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
     if (s->stage == SH_VS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p, &s->b0); }
     if (s->tf_stride[0] | s->tf_stride[1] | s->tf_stride[2] | s->tf_stride[3]) { snprintf(p, sizeof p, "%s/%s.tf.spv", g_spv_dir, s->key); s->modtf = sh_module(p, &s->b0); }
     if (!s->mod) return NULL;
@@ -1462,15 +1533,20 @@ static void stage_textures(vshader *s) {
 typedef struct { const void *src; size_t n; uint64_t seq; VkBuffer b; VkDeviceSize off; uint8_t *shadow; size_t cap; } ucopy_t;
 static int support_skip(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SUPPORT_SKIP"); v = !(e && *e == '0'); } return v; }   // stage_set
 static int desc_scratch(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DESC_SCRATCH"); v = !(e && *e == '0'); } return v; }   // stage_set
+// DM_VK_EXT_CHECK=1 (env.txt; a diagnostic, off by default): a constant buffer the shader is said to read less of than is bound (cb_ext_pick) is copied whole, the bytes past
+// the extent replaced by NaN (0x7fc00000 words), and bound whole: an extent too small, which would corrupt the shader's constants, shows as a broken picture (compare a capture
+// with the switch off). Not cached (ucopy), so slower
+static uint64_t g_ext_checked;   // bindings copied so (stage_set)
+static int ext_check(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_EXT_CHECK"); v = e && *e && *e != '0'; if (v) LOG("[vk] DM_VK_EXT_CHECK: constant buffers read NaN past their extents"); } return v; }
 static uint64_t g_sup_written, g_sup_skipped;   // stages that wrote the support buffer / left it unwritten (stage_set)
-static ucopy_t g_ucopy[1024]; static uint64_t g_ucopy_hit, g_ucopy_miss;
+static ucopy_t g_ucopy[1024]; static uint64_t g_ucopy_hit, g_ucopy_miss, g_ucopy_bytes;   // g_ucopy_bytes: copied by the misses
 static int ucopy(const void *src, size_t n, size_t al, VkBuffer *b, VkDeviceSize *off) {   // src NULL: al zero bytes (not cached)
     if (!src) { uint8_t *d = ar_alloc(al, b, off); if (!d) return 0; memset(d, 0, al); return 1; }
     uintptr_t h = ((uintptr_t)src >> 4) ^ ((uintptr_t)src >> 14) ^ n * 0x9e37u; ucopy_t *e = &g_ucopy[h & 1023];
     if (C && e->src == src && e->n == n && e->seq == C->seq && !memcmp(src, e->shadow, n)) { *b = e->b; *off = e->off; g_ucopy_hit++; return 1; }
     uint8_t *d = ar_alloc(al, b, off); if (!d) return 0;
     memcpy(d, src, n); if (al > n) memset(d + n, 0, al - n);
-    g_ucopy_miss++;
+    g_ucopy_miss++; g_ucopy_bytes += n;
     if (!C) return 1;
     if (e->cap < n) { free(e->shadow); e->shadow = malloc(n); e->cap = e->shadow ? n : 0; }
     if (e->shadow) { memcpy(e->shadow, src, n); e->src = src; e->n = n; e->seq = C->seq; e->b = *b; e->off = *off; } else e->src = NULL;
@@ -1507,13 +1583,20 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
                 size_t rd = s->cb[i].ext && n > s->cb[i].ext ? s->cb[i].ext : n;   // in a memory pool still, as storage buffers below (else it reads 0)
                 if (!mtl_addr(u->addr, rd, NULL, NULL)) { RED_ONCE(119, "uniform buffer slot %d of shader %s at %#llx is in no memory pool: it reads 0", slot - 3, s->key, (unsigned long long)u->addr); src = NULL; n = 16; } }
             else { static int nlog; if (nlog < 8) { nlog++; LOG("[RED] [vk] shader %s reads uniform slot %d, which has no buffer bound: it reads 0", s->key, slot - 3); } } }
-        if (s->cb[i].ext && n > s->cb[i].ext) n = s->cb[i].ext;   // only what the shader reads (spv_cb_ext)
+        size_t nall = n;   // (ext_check)
+        if (s->cb[i].ext && n > s->cb[i].ext) n = s->cb[i].ext;   // only what the shader reads (cb_ext_pick)
         if (dump_on() && slot != 0 && slot != 2) {   // the draw's constant buffers in the dump's log: c1 (the shader's own segment) and the game's uniform buffers, the first 8 vec4
             char vb[700]; int q = 0; const float *fv = src; size_t nf = src ? n / 4 : 0; if (nf > 32) nf = 32;
             for (size_t j = 0; j < nf && q < (int)sizeof vb - 20; j++) q += snprintf(vb + q, sizeof vb - q, "%s%g", j % 4 ? " " : j ? ") (" : "(", fv[j]);
             LOG("[dump]   %s c%d: %s %zu bytes %s%s", s->key, slot, src ? "read" : "no source,", n, vb, nf ? ")" : "");
         }
-        size_t al = (n + 15) & ~(size_t)15; if (!ucopy(src, n, al, &b, &off)) return 0;
+        size_t al = (n + 15) & ~(size_t)15;
+        if (nall > n && ext_check()) {   // the whole range bound, NaN past the extent: a shader reading past it draws wrong
+            size_t aa = (nall + 15) & ~(size_t)15, q = (n + 3) & ~(size_t)3; uint8_t *d = ar_alloc(aa, &b, &off); const uint32_t nan = 0x7fc00000u; if (!d) return 0;
+            if (src) memcpy(d, src, n); else memset(d, 0, n);
+            memset(d + n, 0, q - n); for (; q + 4 <= aa; q += 4) memcpy(d + q, &nan, 4);
+            al = aa; g_ext_checked++;
+        } else if (!ucopy(src, n, al, &b, &off)) return 0;
         bi[nbi] = (VkDescriptorBufferInfo){b, off, al}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)s->cb[i].binding, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, &bi[nbi++], NULL};
     }
     for (int i = 0; i < s->nsb; i++) {   // the address in c0 at the translator's offset names one of the bound storage buffers
