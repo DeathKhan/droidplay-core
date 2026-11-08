@@ -1571,6 +1571,7 @@ void mtl_exec(const uint8_t *p) {
                 if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
                 { p_draw_idx t; if (!vk_draw(NULL, draw_idx_rec(a, h.size, &t))) g_draws_dropped++; break; }
             case OP_DISPATCH: if (!vk_dispatch((const p_dispatch *)a)) g_draws_dropped++; break;
+            case OP_BARRIER: case OP_VP_SWIZZLE: case OP_BEGIN: break;   // the replay's own syncs stand for barriers; viewport swizzles are not replayed (as before the unhandled-op line)
             default: if (!draw_state_op(h.op, a) && h.op < 64 && !(g_op_warned & 1ull << h.op)) { g_op_warned |= 1ull << h.op; LOG("[RED] [vk] command op %u is not replayed on Vulkan: skipped", h.op); }
                 break;   // state for draws (programs, bindings, render state)
         }
@@ -1891,7 +1892,9 @@ void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path
 // Submissions are copied when the game submits them and replayed in order on the scheduler's thread, "NVN queue replay", a continuation at a time (a submission is cut at each
 // event signal and wait). The copies hold snapshots of the programs and textures their records name (nvn_capture.c cap_rec_fields), freed once the job is replayed.
 uint64_t mtl_completed_fence(void) { return atomic_load(&g_done); }
-void mtl_prepare(void) {}   // the prewarm starts at the 30th present (mtl_present)
+// Called by the game's thread as it submits (nvn_queue_submit) and by the replay thread before each continuation: both join this frame's performance hint session
+// (hint_note), as the game's render thread did when it replayed its own submissions. The prewarm starts at the 30th present (mtl_present)
+void mtl_prepare(void) { hint_note(); }
 // One replay state for every NVN queue, as before the scheduler (nvn_mtl.m keeps one per queue): a game's second queue (Fire Emblem: Three Houses) sees the first's bindings
 void mtl_queue_activate(uint64_t serial) { static uint64_t last; if (last && serial != last) RED_ONCE(130, "a second NVN queue submits: the Vulkan replay shares one state between queues"); last = serial; }
 void mtl_queue_forget(uint64_t serial) { (void)serial; }
