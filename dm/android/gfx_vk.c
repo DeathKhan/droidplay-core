@@ -116,7 +116,8 @@ uint32_t vkb_mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
 }
 
 // ---------------- Staging buffers ----------------
-typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize n; } stg_t;
+typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize n, used; } stg_t;   // used: a pool block's bytes cut so far (stg_take)
+static _Atomic uint64_t g_stg_allocs, g_stg_frees; static uint32_t g_stg_mt = UINT32_MAX;   // staging vkAllocateMemory / vkFreeMemory calls (DM_VK_STG_STAT); the memory type the last one took
 static int stg_new(stg_t *s, VkDeviceSize n) {
     memset(s, 0, sizeof *s); if (!n) n = 16;
     VkBufferCreateInfo bc = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -126,11 +127,12 @@ static int stg_new(stg_t *s, VkDeviceSize n) {
     if (mt == UINT32_MAX) mt = vkb_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt};
     if (mt == UINT32_MAX || vkAllocateMemory(g_vk.dev, &ma, NULL, &s->m) != VK_SUCCESS) { vkDestroyBuffer(g_vk.dev, s->b, NULL); return 0; }
+    atomic_fetch_add(&g_stg_allocs, 1); g_stg_mt = mt;
     vkBindBufferMemory(g_vk.dev, s->b, s->m, 0);
-    if (vkMapMemory(g_vk.dev, s->m, 0, n, 0, (void **)&s->p) != VK_SUCCESS) { vkDestroyBuffer(g_vk.dev, s->b, NULL); vkFreeMemory(g_vk.dev, s->m, NULL); return 0; }
+    if (vkMapMemory(g_vk.dev, s->m, 0, n, 0, (void **)&s->p) != VK_SUCCESS) { vkDestroyBuffer(g_vk.dev, s->b, NULL); vkFreeMemory(g_vk.dev, s->m, NULL); atomic_fetch_add(&g_stg_frees, 1); return 0; }
     s->n = n; return 1;
 }
-static void stg_free(stg_t *s) { if (s->b) { vkDestroyBuffer(g_vk.dev, s->b, NULL); vkFreeMemory(g_vk.dev, s->m, NULL); } memset(s, 0, sizeof *s); }
+static void stg_free(stg_t *s) { if (s->b) { vkDestroyBuffer(g_vk.dev, s->b, NULL); vkFreeMemory(g_vk.dev, s->m, NULL); atomic_fetch_add(&g_stg_frees, 1); } memset(s, 0, sizeof *s); }
 
 // ---------------- Submissions: chunks ----------------
 // The commands go to the GPU in chunks: a command buffer with everything the GPU reads through it (staging buffers, the draws' arena, descriptor pools, texel
@@ -139,7 +141,7 @@ static void stg_free(stg_t *s) { if (s->b) { vkDestroyBuffer(g_vk.dev, s->b, NUL
 // posts, completes the NVN fence and recycles the chunk. Write-backs come before posts: a game waiting on an event reads what the GPU wrote.
 // A write-back with a snapshot (the guest bytes when the GPU took its copy) writes only the bytes that differ from it: the CPU may have written the others since.
 // Before the replay reads guest memory on the CPU (an upload, a draw's data, a buffer copy), pending write-backs land first (cpu_view).
-typedef struct { int st; size_t off, row_bytes, rows, src_pitch, dst_pitch; uint8_t *dst, *snap; int fwd; } wb_t;   // st < 0: the chunk's arena block -1 - st; fwd: a dispatch wrote it (later draws may read it on the GPU: gfx_vk_draw.inc fwd_find)
+typedef struct { int st; size_t off, row_bytes, rows, src_pitch, dst_pitch; uint8_t *dst, *snap; int fwd; } wb_t;   // st < 0: the chunk's arena block -1 - st; st >= SP_ST: its staging pool block st - SP_ST (stg_take); otherwise its staging buffer st; fwd: a dispatch wrote it (later draws may read it on the GPU: gfx_vk_draw.inc fwd_find)
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize n, used; } arena_blk;
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; uint64_t q0, q1; } post_op;   // kind 1 event, 2 counter, 3 samples passed (occlusion queries q0..q1)
 typedef struct { int kind; uint64_t h; } dead_t;
@@ -152,6 +154,7 @@ typedef struct chunk {
     VkQueryPool tq; int ntq; uint64_t t_end;   // timestamps of the game's counter reports (kind 4 posts); the GPU time the chunk ended (g_tsq)   // hold: a later chunk reads this one's arena on the GPU (gfx_vk_draw.inc fwd_find): kept busy (held) until that one completes   // ndraw: draws and dispatches recorded (early submission: mtl_exec)   // ts: GPU timestamps written at its start and end (g_tsq)
     uint64_t gf; int gtag;   // gtag: its GPU time counts toward frame gf's (g_fgpu, mtl_gpu_ms)
     stg_t *stg; int nstg, capstg; wb_t *wb; int nwb, capwb; post_op *post; int npost, cappost; dead_t *dead; int ndead, capdead; cop_t *cop; int ncop, capcop;
+    stg_t *sb; int nsb, csb;   // the staging pool blocks it took while recorded, the last one being cut (stg_take); back to the free list in chunk_done
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
     VkDescriptorPool *dp; int ndp, cdp, dp_cur; VkBufferView *bv; int nbv, cbv;
 } chunk;
@@ -161,7 +164,7 @@ static chunk *g_fifo[NCHUNK]; static int g_fifo_n;   // submitted, oldest first
 static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
 static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c);   // gfx_vk_draw.inc
-static void *chunk_thread(void *arg);
+static void *chunk_thread(void *arg); static int stg_pool_on(void);
 // ---------------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------------
 // NVN's samples passed is a counter on the queue: ResetCounter zeroes it, every draw after adds its samples, ReportCounter writes the sum at that point when the GPU gets
 // there. Here, as nvn_mtl.m does with visibility buffers: while counting, draws are inside an occlusion query, one per render pass stretch (a query cannot outlive its
@@ -215,7 +218,7 @@ static void fgpu_done(uint64_t f, uint64_t ns) {   // under g_cmu (completion th
 static int chunks_init(void) {
     static int ok = -1; if (ok >= 0) return ok;
     ok = 0; if (!vkb()) return 0;
-    fgpu_on();
+    fgpu_on(); stg_pool_on();   // read before the completion thread starts (sp_done reads g_sp_on)
     if (g_vk.props.limits.timestampComputeAndGraphics) { VkQueryPoolCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * NCHUNK};
         if (vkCreateQueryPool(g_vk.dev, &qc, NULL, &g_tsq) != VK_SUCCESS) g_tsq = VK_NULL_HANDLE; else if (g_qreset) g_qreset(g_vk.dev, g_tsq, 0, 2 * NCHUNK); }
     for (int i = 0; i < NCHUNK; i++) if (!chunk_make(&g_ch[i])) { LOG("[RED] [vk] command buffers could not be made"); return 0; }
@@ -279,11 +282,91 @@ static void cb_barrier(void) {
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
-static stg_t *stg_take(VkDeviceSize n) {   // a staging buffer that lives until its chunk completes
-    if (!cur()) return NULL;
+// ---------------- Staging: slices of pooled blocks ----------------
+// A transfer's staging lives until its chunk completes: an upload's bytes are read by the GPU in the chunk's command buffer, a readback's (texture-to-buffer copies,
+// ReadTexels, linear write-backs) by the completion thread in chunk_done (wb_apply). Every request was a buffer of its own (stg_new: vkCreateBuffer, vkAllocateMemory,
+// vkMapMemory, and vkFreeMemory in chunk_done). Breath of the Wild on an Ayn Odin 2 makes one per texture upload and one per linear write-back (about 20 linear render
+// targets a frame, lin_writeback): stg_new was 1.5% of the Presentation thread, about 0.6 ms a frame, nearly all of it vkAllocateMemory in the kernel (kgsl_sharedmem_alloc,
+// page zeroing, the map; 57% under vt_upload, 43% under rp_end -> lin_writeback), and the completion thread spent about 0.65 ms a frame in vkFreeMemory (kgsl_sharedmem_free,
+// munmap) inside chunk_done, before the chunk's write-backs counted as landed and its NVN fence completed: every sync on them waited for those frees too.
+// Now a request of up to SP_MAXREQ is a slice cut from a block of SP_BLOCK, made once, persistently mapped, in the memory type stg_new picks by its flags (HOST_VISIBLE |
+// HOST_COHERENT | HOST_CACHED, so wb_apply reads cached memory; HOST_VISIBLE | HOST_COHERENT where no type has all three: no flush or invalidate either way). A chunk takes
+// blocks from a free list as it is recorded and gives them back in chunk_done once its write-backs are applied: a slice is read by the GPU only in its own command buffer and
+// by the CPU only in its own chunk_done (fwd_find forwards arena write-backs only, never staging), so a block is free once its chunk's fence has signalled and chunk_done ran.
+// Blocks never outlive their use in another chunk's commands, and the render thread (taking) and the completion thread (giving back) meet only at the free list (g_sp_mu).
+// At most SP_NBLK blocks exist (SP_KEEP); a request over SP_MAXREQ, or one made while every block is taken and the cap is reached, gets a buffer of its own as before, freed
+// in chunk_done. Blocks the free list held through a whole window of SP_TRIM chunk completions (it never fell below that many) were not needed: they are freed, so a loading
+// burst's blocks do not stay (about 4 s of Breath of the Wild at 56 chunks a frame and 20 fps).
+// A slice is handed out by value (buffer, offset, mapped pointer, the write-back's name for its buffer). stg_take returned a pointer into C->stg, which realloc moves:
+// vt_upload_, copy_b2t, copy_t2b and mtl_read_texels called cb() after it, and cb() -> rp_end -> lin_writeback -> stg_take grows C->stg when a pass was open (stage_textures'
+// uploads end a pass begun before), so they wrote through and copied from a freed stg_t, and copy_t2b and mtl_read_texels took its index (s - C->stg) after cb(). A slice taken
+// before cb() stays valid now, in both modes: blocks and buffers never move, only the arrays naming them. Offsets: a multiple of the copies' texel block size and of 4
+// (vkCmdCopyBufferToImage / vkCmdCopyImageToBuffer bufferOffset; 4 for depth and stencil), of optimalBufferCopyOffsetAlignment and nonCoherentAtomSize, and at least 64.
+// DM_VK_STG_POOL=0 (env.txt): a buffer per request, as before. DM_VK_STG_STAT=1: a line every 300 frames with the staging vkAllocateMemory / vkFreeMemory calls a frame and
+// the pool's counts (mtl_mem_stat)
+typedef struct { VkBuffer b; VkDeviceSize off; uint8_t *p; int st; } stg_sl;   // a slice: its buffer and its offset there (bufferOffset; a write-back's wb_t.off), its mapped bytes, the write-back's wb_t.st; p NULL: none
+enum { SP_BLOCK = 8u << 20, SP_MAXREQ = 4u << 20, SP_KEEP = 64u << 20, SP_NBLK = SP_KEEP / SP_BLOCK, SP_TRIM = 4096, SP_ST = 1 << 24 };   // SP_MAXREQ: Breath of the Wild's 512x512 RGBA8 linear target (1 MiB) and its uploads stay pooled
+static pthread_mutex_t g_sp_mu = PTHREAD_MUTEX_INITIALIZER; static stg_t g_sp_free[SP_NBLK]; static int g_sp_nfree, g_sp_nblk, g_sp_low;   // under g_sp_mu: the free list, the blocks alive, the free list's least length this window
+static int g_sp_on = -1; static uint64_t g_sp_slices, g_sp_big, g_sp_full, g_sp_made; static _Atomic uint64_t g_sp_trimmed;   // slices cut, requests over SP_MAXREQ, requests with the pool at its cap, blocks made / trimmed
+static int stg_pool_on(void) {
+    if (g_sp_on < 0) { const char *e = getenv("DM_VK_STG_POOL"); g_sp_on = !(e && *e == '0');
+        if (g_sp_on) LOG("[vk] staging: slices of %u MB blocks for requests up to %u MB, at most %u MB of blocks (DM_VK_STG_POOL=0: a buffer per request)", SP_BLOCK >> 20, SP_MAXREQ >> 20, SP_KEEP >> 20);
+        else LOG("[vk] DM_VK_STG_POOL=0: a staging buffer per request"); }
+    return g_sp_on;
+}
+static int stg_stat(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STG_STAT"); v = e && atoi(e) != 0; } return v; }
+static VkDeviceSize sp_gcd(VkDeviceSize a, VkDeviceSize b) { while (b) { VkDeviceSize r = a % b; a = b; b = r; } return a; }
+static VkDeviceSize stg_align(int texel) {   // a slice's offset alignment: lcm of the texel block size (0: no image copy), 4, and the device's copy and atom alignments (powers of two), at least 64
+    static VkDeviceSize base; if (!base) { base = 64; VkDeviceSize o = g_vk.props.limits.optimalBufferCopyOffsetAlignment, k = g_vk.props.limits.nonCoherentAtomSize; if (o > base) base = o; if (k > base) base = k; }
+    VkDeviceSize t = texel > 0 ? (VkDeviceSize)texel : 1;
+    return base / sp_gcd(base, t) * t;   // base is a multiple of 4: lcm(base, t) is a multiple of lcm(t, 4)
+}
+static stg_t *sp_block(void) {   // a block for the current chunk: from the free list, else a new one while fewer than SP_NBLK exist; NULL: none (the request takes a buffer of its own)
+    stg_t b; int got = 0, make = 0;
+    pthread_mutex_lock(&g_sp_mu);
+    if (g_sp_nfree) { b = g_sp_free[--g_sp_nfree]; got = 1; if (g_sp_nfree < g_sp_low) g_sp_low = g_sp_nfree; }
+    else if (g_sp_nblk < SP_NBLK) { g_sp_nblk++; make = 1; }
+    pthread_mutex_unlock(&g_sp_mu);
+    if (make) {
+        if (!(got = stg_new(&b, SP_BLOCK))) { pthread_mutex_lock(&g_sp_mu); g_sp_nblk--; pthread_mutex_unlock(&g_sp_mu); RED_ONCE(4, "staging pool block of %u bytes failed", SP_BLOCK); }
+        else if (!g_sp_made++) LOG("[vk] staging: first pool block, memory type %u (flags %#x)", g_stg_mt, g_stg_mt < g_vk.mp.memoryTypeCount ? g_vk.mp.memoryTypes[g_stg_mt].propertyFlags : 0);
+    }
+    if (!got) return NULL;
+    if (C->nsb == C->csb) { C->csb = C->csb ? 2 * C->csb : 4; C->sb = realloc(C->sb, C->csb * sizeof *C->sb); }
+    b.used = 0; C->sb[C->nsb] = b; return &C->sb[C->nsb++];
+}
+// n bytes of staging that live until the current chunk completes; texel: the texel block size of the image copies made through it (0: none). By value: see above
+static stg_sl stg_take(VkDeviceSize n, int texel) {
+    stg_sl s; memset(&s, 0, sizeof s);
+    if (!cur()) return s;
+    if (!n) n = 16;
+    if (stg_pool_on()) {
+        if (n > SP_MAXREQ) g_sp_big++;
+        else {
+            VkDeviceSize a = stg_align(texel), o = 0; stg_t *k = C->nsb ? &C->sb[C->nsb - 1] : NULL;
+            if (k) o = (k->used + a - 1) / a * a;
+            if (!k || o + n > k->n) { k = sp_block(); o = 0; }   // the rest of a block too full for this request stays unused until the chunk completes
+            if (k) { k->used = o + n; g_sp_slices++; s.b = k->b; s.off = o; s.p = k->p + o; s.st = SP_ST + (int)(k - C->sb); return s; }
+            g_sp_full++;
+        }
+    }
     if (C->nstg == C->capstg) { C->capstg = C->capstg ? 2 * C->capstg : 32; C->stg = realloc(C->stg, C->capstg * sizeof *C->stg); }
-    if (!stg_new(&C->stg[C->nstg], n)) { RED_ONCE(1, "staging buffer of %llu bytes failed", (unsigned long long)n); return NULL; }
-    return &C->stg[C->nstg++];
+    if (!stg_new(&C->stg[C->nstg], n)) { RED_ONCE(1, "staging buffer of %llu bytes failed", (unsigned long long)n); return s; }
+    s.b = C->stg[C->nstg].b; s.p = C->stg[C->nstg].p; s.st = C->nstg++;
+    return s;
+}
+// the completion thread, in chunk_done after the chunk's write-backs: its blocks back to the free list; every SP_TRIM completions, the blocks the free list held all along go
+static void sp_done(chunk *c) {
+    if (g_sp_on <= 0) return;   // set before the completion thread started (chunks_init)
+    if (c->nsb) { pthread_mutex_lock(&g_sp_mu); for (int i = 0; i < c->nsb; i++) g_sp_free[g_sp_nfree++] = c->sb[i]; pthread_mutex_unlock(&g_sp_mu); c->nsb = 0; }   // every block is in one chunk or the free list: at most SP_NBLK
+    static unsigned win; if (++win < SP_TRIM) return;
+    win = 0; stg_t f[SP_NBLK]; int nf = 0;
+    pthread_mutex_lock(&g_sp_mu);
+    while (nf < g_sp_low && g_sp_nfree) { f[nf++] = g_sp_free[--g_sp_nfree]; g_sp_nblk--; }   // the free list never held fewer than g_sp_low: that many were idle the whole window
+    g_sp_low = g_sp_nfree;
+    pthread_mutex_unlock(&g_sp_mu);
+    for (int i = 0; i < nf; i++) stg_free(&f[i]);
+    if (nf) atomic_fetch_add(&g_sp_trimmed, (uint64_t)nf);
 }
 static wb_t *wb_add(void) {
     if (!cur()) return NULL;
@@ -394,7 +477,7 @@ static void chunk_done(chunk *c) {
         if (!o->fill) memmove((void *)(uintptr_t)o->dst, (const void *)(uintptr_t)o->src, o->n);
         else { uint8_t *d = (uint8_t *)(uintptr_t)o->dst; for (uint64_t k = 0; k + 4 <= o->n; k += 4) memcpy(d + k, &o->value, 4); }
     }
-    for (int i = 0; i < c->nwb; i++) { const wb_t *w = &c->wb[i]; wb_apply(w, (w->st >= 0 ? c->stg[w->st].p : c->ar[-1 - w->st].p) + w->off); free(c->wb[i].snap); }
+    for (int i = 0; i < c->nwb; i++) { const wb_t *w = &c->wb[i]; wb_apply(w, (w->st >= SP_ST ? c->sb[w->st - SP_ST].p : w->st >= 0 ? c->stg[w->st].p : c->ar[-1 - w->st].p) + w->off); free(c->wb[i].snap); }
     if (c->npq) prof_collect(c);
     if (c->nq) { uint64_t r[1024]; memset(r, 0, sizeof r);
         if (vkGetQueryPoolResults(g_vk.dev, c->qp, 0, (uint32_t)c->nq, sizeof r, r, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
@@ -409,6 +492,7 @@ static void chunk_done(chunk *c) {
         c->ntq = 0; }
     for (int i = 0; i < c->npost; i++) post_apply(&c->post[i]);
     for (int i = 0; i < c->nstg; i++) stg_free(&c->stg[i]);
+    sp_done(c);   // after the write-backs, which read its blocks
     for (int i = 0; i < c->ndead; i++) {
         uint64_t h = c->dead[i].h;
         switch (c->dead[i].kind) { case 1: vkDestroyImageView(g_vk.dev, (VkImageView)h, NULL); break; case 2: vkDestroyFramebuffer(g_vk.dev, (VkFramebuffer)h, NULL); break;
@@ -692,8 +776,8 @@ static int vt_upload_(vtex *v, const tex_t *t, int track) {
         size_t pitch = v->conv ? (size_t)w * v->px : (size_t)((w + bw - 1) / bw) * bpb, rows = v->conv ? h : (h + bh - 1) / bh;
         total += pitch * rows * z * v->layers;
     }
-    stg_t *s = stg_take(total); if (!s) return 0;
-    VkCommandBuffer c = cb(); if (!c) return 0;
+    stg_sl s = stg_take(total, v->conv ? v->px : bpb); if (!s.p) return 0;
+    VkCommandBuffer c = cb(); if (!c) return 0;   // may end an open pass: lin_writeback takes staging too (s stays valid: stg_take)
     uint8_t *tmp = NULL; size_t off = 0;
     for (unsigned l = 0; l < v->levels; l++) {
         uint32_t w = v->w >> l ? v->w >> l : 1, h = v->h >> l ? v->h >> l : 1, z = v->type == VK_IMAGE_TYPE_3D ? (v->d >> l ? v->d >> l : 1) : 1;
@@ -703,20 +787,20 @@ static int vt_upload_(vtex *v, const tex_t *t, int track) {
             if (v->conv) {
                 tmp = realloc(tmp, pitch * rows * z);
                 if (nvn_deswizzle(&t->d, l, y, t->mem, tmp, pitch)) { RED_ONCE(21, "deswizzle failed format %#x target %d", t->d.format, t->d.target); free(tmp); return 0; }
-                for (uint32_t k = 0; k < z; k++) bc_decode(v->conv, tmp + k * pitch * rows, pitch, w, h, s->p + off + (size_t)k * w * v->px * h, (size_t)w * v->px, v->px);
+                for (uint32_t k = 0; k < z; k++) bc_decode(v->conv, tmp + k * pitch * rows, pitch, w, h, s.p + off + (size_t)k * w * v->px * h, (size_t)w * v->px, v->px);
             } else if (is_linear(t)) {   // linear: block rows at the texture's stride (its layer's bytes over its block rows, as GetStorageSize gives them)
                 if (l || z > 1) { RED_ONCE(22, "linear texture with levels or depth: only level 0 of a 2D one is read"); off += out; continue; }
                 size_t srow = t->L.layer_size / (rows ? rows : 1); const uint8_t *src = t->mem + (size_t)y * t->L.layer_size;
                 if (srow < pitch) srow = pitch;
-                for (size_t r = 0; r < rows; r++) memcpy(s->p + off + r * pitch, src + r * srow, pitch);
-            } else if (nvn_deswizzle(&t->d, l, y, t->mem, s->p + off, pitch)) { RED_ONCE(21, "deswizzle failed format %#x target %d", t->d.format, t->d.target); free(tmp); return 0; }
-            VkBufferImageCopy r = {.bufferOffset = off, .imageSubresource = {v->aspect, l, y, 1}, .imageExtent = {w, h, z}};
-            vkCmdCopyBufferToImage(c, s->b, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+                for (size_t r = 0; r < rows; r++) memcpy(s.p + off + r * pitch, src + r * srow, pitch);
+            } else if (nvn_deswizzle(&t->d, l, y, t->mem, s.p + off, pitch)) { RED_ONCE(21, "deswizzle failed format %#x target %d", t->d.format, t->d.target); free(tmp); return 0; }
+            VkBufferImageCopy r = {.bufferOffset = s.off + off, .imageSubresource = {v->aspect, l, y, 1}, .imageExtent = {w, h, z}};
+            vkCmdCopyBufferToImage(c, s.b, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
             off += out;
         }
     }
     free(tmp); cb_barrier();
-    if (vk_debug()) LOG("[vk] upload ser=%llu mem=%p size %#llx levels %u layers %u total %zu first bytes %02x %02x %02x %02x", (unsigned long long)v->serial, t->mem, (unsigned long long)t->L.size, v->levels, v->layers, total, s->p[0], s->p[1], s->p[2], s->p[3]);
+    if (vk_debug()) LOG("[vk] upload ser=%llu mem=%p size %#llx levels %u layers %u total %zu first bytes %02x %02x %02x %02x", (unsigned long long)v->serial, t->mem, (unsigned long long)t->L.size, v->levels, v->layers, total, s.p[0], s.p[1], s.p[2], s.p[3]);
     g_up_bytes += total;
     if (track) { v->span = nvn_dirty_span(t->mem, t->L.size); v->seen = v->stamp; }
     return 1;
@@ -894,15 +978,15 @@ static void copy_b2t(const p_copy_b2t *c) {
     if (!mtl_addr(c->src, img * (nz - 1) + row * (rows - 1) + rb, NULL, NULL)) { RED_ONCE(40, "buffer→texture copy source is in no memory pool"); return; }
     g_vs = 3; cpu_view();
     size_t out_row = v->conv ? (size_t)c->r.width * v->px : rb, out_rows = v->conv ? (size_t)c->r.height : rows;
-    stg_t *s = stg_take(out_row * out_rows * nz); VkCommandBuffer cbuf = cb(); if (!s || !cbuf) return;
+    stg_sl s = stg_take(out_row * out_rows * nz, v->conv ? v->px : bpb); VkCommandBuffer cbuf = cb(); if (!s.p || !cbuf) return;
     for (int z = 0; z < nz; z++) {
-        const uint8_t *src = (const uint8_t *)c->src + (size_t)z * img; uint8_t *d = s->p + (size_t)z * out_row * out_rows;
+        const uint8_t *src = (const uint8_t *)c->src + (size_t)z * img; uint8_t *d = s.p + (size_t)z * out_row * out_rows;
         if (v->conv) bc_decode(v->conv, src, row, (uint32_t)c->r.width, (uint32_t)c->r.height, d, out_row, v->px);
         else for (size_t y = 0; y < rows; y++) memcpy(d + y * rb, src + y * row, rb);
-        VkBufferImageCopy r = {.bufferOffset = (size_t)z * out_row * out_rows, .imageSubresource = {v->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? v->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT : v->aspect, level, is3d ? 0 : layer0 + c->r.zoffset + z, 1},
+        VkBufferImageCopy r = {.bufferOffset = s.off + (size_t)z * out_row * out_rows, .imageSubresource = {v->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? v->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT : v->aspect, level, is3d ? 0 : layer0 + c->r.zoffset + z, 1},
                                .imageOffset = {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset + z : 0}, .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, 1}};
         if (v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) RED_ONCE(41, "buffer→texture copy into a depth-stencil texture: only the depth is copied, as is");
-        vkCmdCopyBufferToImage(cbuf, s->b, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        vkCmdCopyBufferToImage(cbuf, s.b, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     }
     cb_barrier();
 }
@@ -915,14 +999,13 @@ static void copy_t2b(const p_copy_b2t *c) {
     size_t row = S.row ? (size_t)S.row : rb, img = S.img ? (size_t)S.img : row * rows;
     int is3d = v->type == VK_IMAGE_TYPE_3D, nz = c->r.depth ? c->r.depth : 1;
     if (!mtl_addr(c->src, img * (nz - 1) + row * (rows - 1) + rb, NULL, NULL)) { RED_ONCE(43, "texture→buffer copy destination is in no memory pool"); return; }
-    stg_t *s = stg_take(rb * rows * nz); VkCommandBuffer cbuf = cb(); if (!s || !cbuf) return;
-    int st = (int)(s - C->stg);
+    stg_sl s = stg_take(rb * rows * nz, bpb); VkCommandBuffer cbuf = cb(); if (!s.p || !cbuf) return;
     if (vk_debug()) LOG("[vk] t2b ser=%llu pkg %d level %u layer %u region %d,%d %dx%dx%d row %zu img %zu -> %#llx", (unsigned long long)v->serial, v->pkg, level, layer0, c->r.xoffset, c->r.yoffset, c->r.width, c->r.height, nz, row, img, (unsigned long long)c->src);
     for (int z = 0; z < nz; z++) {
-        VkBufferImageCopy r = {.bufferOffset = (size_t)z * rb * rows, .imageSubresource = {v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : v->aspect, level, is3d ? 0 : layer0 + c->r.zoffset + z, 1},
+        VkBufferImageCopy r = {.bufferOffset = s.off + (size_t)z * rb * rows, .imageSubresource = {v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : v->aspect, level, is3d ? 0 : layer0 + c->r.zoffset + z, 1},
                                .imageOffset = {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset + z : 0}, .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, 1}};
-        vkCmdCopyImageToBuffer(cbuf, v->img, VK_IMAGE_LAYOUT_GENERAL, s->b, 1, &r);
-        wb_t *w = wb_add(); if (w) *w = (wb_t){st, (size_t)z * rb * rows, rb, rows, rb, row, (uint8_t *)c->src + (size_t)z * img, NULL};
+        vkCmdCopyImageToBuffer(cbuf, v->img, VK_IMAGE_LAYOUT_GENERAL, s.b, 1, &r);
+        wb_t *w = wb_add(); if (w) *w = (wb_t){s.st, (size_t)s.off + (size_t)z * rb * rows, rb, rows, rb, row, (uint8_t *)c->src + (size_t)z * img, NULL};
     }
     cb_barrier();
 }
@@ -982,15 +1065,14 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     }
     vtex *v = vt_get(t);
     if (!v || v->conv) { pthread_mutex_unlock(&g_bk); for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memset(dst + (size_t)z * img + y * row, 0, wb); return; }
-    stg_t *s = stg_take(wb * hb * nz); VkCommandBuffer cbuf = cb();
-    if (s && cbuf) {
+    stg_sl s = stg_take(wb * hb * nz, bpb); VkCommandBuffer cbuf = cb();
+    if (s.p && cbuf) {
         for (int z = 0; z < nz; z++) {
-            VkBufferImageCopy rc = {.bufferOffset = (size_t)z * wb * hb, .imageSubresource = {v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : v->aspect, level, is3d ? 0 : layer0 + (unsigned)r->zoffset + (unsigned)z, 1},
+            VkBufferImageCopy rc = {.bufferOffset = s.off + (size_t)z * wb * hb, .imageSubresource = {v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : v->aspect, level, is3d ? 0 : layer0 + (unsigned)r->zoffset + (unsigned)z, 1},
                                     .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
-            vkCmdCopyImageToBuffer(cbuf, v->img, VK_IMAGE_LAYOUT_GENERAL, s->b, 1, &rc);
+            vkCmdCopyImageToBuffer(cbuf, v->img, VK_IMAGE_LAYOUT_GENERAL, s.b, 1, &rc);
         }
-        int si = (int)(s - C->stg);
-        for (int z = 0; z < nz; z++) { wb_t *w = wb_add(); if (w) *w = (wb_t){si, (size_t)z * wb * hb, wb, hb, wb, row, dst + (size_t)z * img, NULL}; }   // copied out by the completion thread
+        for (int z = 0; z < nz; z++) { wb_t *w = wb_add(); if (w) *w = (wb_t){s.st, (size_t)s.off + (size_t)z * wb * hb, wb, hb, wb, row, dst + (size_t)z * img, NULL}; }   // copied out by the completion thread
         submit_wait();
     }
     pthread_mutex_unlock(&g_bk);
@@ -1459,6 +1541,12 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         (unsigned long long)atomic_load(&g_pso_made), atomic_load(&g_pso_ns) / 1e6, (unsigned long long)atomic_load(&g_cpso_made), atomic_load(&g_cpso_ns) / 1e6, (unsigned long long)atomic_load(&g_mod_made), atomic_load(&g_mod_ns) / 1e6);
     LOG("[vk] draws not made: shader missing %llu, targets %llu, pipeline %llu, descriptors %llu, invalid binding %llu, pass %llu, vertex buffers %llu; dropped in all %llu (cumulative)", (unsigned long long)g_drop[0], (unsigned long long)g_drop[1], (unsigned long long)g_drop[2], (unsigned long long)g_drop[3], (unsigned long long)g_drop[4], (unsigned long long)g_drop[5], (unsigned long long)g_drop[6], (unsigned long long)g_draws_dropped);
     LOG("[vk] vertex streams read on the GPU from a dispatch's storage buffer: %llu (cumulative)", (unsigned long long)g_fwd);
+    if (stg_stat()) { static unsigned long long f0; static uint64_t a0, r0, s0; uint64_t a = atomic_load(&g_stg_allocs), r = atomic_load(&g_stg_frees), sl = g_sp_slices; double nf = frame > f0 ? (double)(frame - f0) : 1;
+      pthread_mutex_lock(&g_sp_mu); int nb = g_sp_nblk, fr = g_sp_nfree; pthread_mutex_unlock(&g_sp_mu);
+      LOG("[vk] staging over the last %llu frames: vkAllocateMemory %.2f and vkFreeMemory %.2f a frame, %.1f slices a frame cut from the pool%s; pool blocks %d of %d now (%d free, %u MB each), %llu made, %llu trimmed; requests given a buffer of their own: over %u MB %llu, pool at its cap %llu (cumulative)",
+          frame - f0, (double)(a - a0) / nf, (double)(r - r0) / nf, (double)(sl - s0) / nf, g_sp_on > 0 ? "" : " (DM_VK_STG_POOL=0)", nb, SP_NBLK, fr, SP_BLOCK >> 20, (unsigned long long)g_sp_made, (unsigned long long)atomic_load(&g_sp_trimmed),
+          SP_MAXREQ >> 20, (unsigned long long)g_sp_big, (unsigned long long)g_sp_full);
+      f0 = frame; a0 = a; r0 = r; s0 = sl; }
     LOG("[vk] syncs by site (submitted / in flight): other %llu/%llu, draw %llu/%llu, upload %llu/%llu, t2b %llu/%llu, large copy %llu/%llu, buffer texture %llu/%llu, buffer image %llu/%llu, dispatch %llu/%llu",
         (unsigned long long)g_vsite[0][0], (unsigned long long)g_vsite[0][1], (unsigned long long)g_vsite[1][0], (unsigned long long)g_vsite[1][1], (unsigned long long)g_vsite[2][0], (unsigned long long)g_vsite[2][1],
         (unsigned long long)g_vsite[3][0], (unsigned long long)g_vsite[3][1], (unsigned long long)g_vsite[4][0], (unsigned long long)g_vsite[4][1], (unsigned long long)g_vsite[5][0], (unsigned long long)g_vsite[5][1],
