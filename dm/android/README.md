@@ -217,6 +217,6 @@ driver the player put beside `env.txt` (a Turnip build, as for Switch emulators:
 - `build_android_from_nsp.py` builds the three libraries with every host and packs them into both kinds of app (`build_apk.py --lib`).
 - Tried with Mr. Purple's Turnip T30 (Mesa 26.3.0-devel, Vulkan 1.4.359) on an Odin 2 (Adreno 740, Android 13) and a Retroid Pocket 5 (Adreno 650, Android 13), with
   `scripts/bench_android.py`. It loads and draws on both. Super Mario Odyssey's opening: Odin 2 59.9 fps (GPU 3.5 ms against 5.7 on Qualcomm's driver), Retroid
-  Pocket 5 40.2 fps (37.5 on Qualcomm's). Brilliant Diamond in Eterna City: Odin 2 20.6 fps against 60, with the GPU at 6.1 ms against 8.2 but 44 ms a frame in
-  NVN submit + present (open: which wait is slow on Turnip's KGSL path is not known yet). On the Retroid Pocket 5, where Qualcomm's compiler crashes on it
-  ([baselines](baselines.md), problem 2), it runs at 11.3 fps.
+  Pocket 5 40.2 fps (37.5 on Qualcomm's). Brilliant Diamond in Eterna City: Odin 2 60.0 fps on both drivers (GPU 5.9 ms against 8.2). It ran at 20.6 fps until the
+  arena took a cached memory type: Turnip lists a write-combined one first, and the completion thread read storage-buffer write-backs from it ([rendering](../../docs/reference/rendering.md#storage-buffer-write-backs-read-from-cached-memory-on-vulkan)).
+  On the Retroid Pocket 5, where Qualcomm's compiler crashes on it ([baselines](baselines.md), problem 2), it runs at 25.1 fps (11.3 before).
