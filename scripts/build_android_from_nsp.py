@@ -28,13 +28,14 @@
 #      A one-game install of the same game (files/game, the layout before the launcher) is moved there instead of copied again, and its save is copied by the app
 # The picture comes from the Vulkan replay of NVN (dm/android/gfx_vk.c).
 # Needs: Python with lz4, capstone, fonttools and backports.zstd (not on Python 3.14), the .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (ANDROID_HOME or --sdk), adb, keytool (a JDK).
-import argparse, contextlib, datetime, hashlib, json, os, re, shutil, subprocess, sys, tarfile
+import argparse, contextlib, datetime, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'scripts'))
 try: import fcntl  # noqa: F401
 except ImportError: sys.path.append(str(REPO / 'dm/android/tools/compat'))   # Windows: build_ipa_from_nsp.py loads tree_tar.py, which imports fcntl (compat/fcntl.py)
+if os.name == 'nt': os.environ.setdefault('DM_REWRITE_J', '1')   # patch_nso.py's parallel scans fork their workers with SIGTERM blocked, which Windows cannot: one there
 import build_ipa_from_nsp as bi   # noqa: E402
 from build_ipa_from_nsp import BuildError, say   # noqa: E402
 
@@ -130,12 +131,29 @@ def newest(d, what):
     return vs[-1]
 
 
-def build_nx_extract(work, logs, env):   # build_ipa_from_nsp.py's, with Windows' .exe
-    out = work / 'tools/nx_extract'
-    exe = out / ('nx_extract.exe' if os.name == 'nt' else 'nx_extract')
-    bi.run(['dotnet', 'build', REPO / 'dm/tools/nx_extract', '-c', 'Release', '-o', out, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
-    if not exe.exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-    return exe
+def build_nx_extract(work, logs, env):
+    """build_ipa_from_nsp.py's, with Windows' .exe, and built once per version of its source into <data>/tools/nx_extract-<digest>, which every run then takes:
+    the desktop app reads each game with --info, so a build per folder per read was a dotnet build each time, several at once writing the project's obj/.
+    work is unused (that script's builder put it there)"""
+    src = REPO / 'dm/tools/nx_extract'; name = 'nx_extract.exe' if os.name == 'nt' else 'nx_extract'
+    h = hashlib.sha256()
+    for p in sorted(src.rglob('*')):
+        rel = p.relative_to(src)
+        if p.is_file() and not {'bin', 'obj'} & set(rel.parts): h.update(rel.as_posix().encode() + b'\0' + p.read_bytes() + b'\0')
+    out = data_dir() / 'tools' / f'nx_extract-{h.hexdigest()[:16]}'
+    if (out / name).is_file(): return out / name
+    with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:   # built outside and copied in, as that script does: MSBuild breaks on an apostrophe in the path
+        bi.run(['dotnet', 'build', src, '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
+        if not (Path(t) / name).exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
+        part = out.with_name(f'{out.name}.{os.getpid()}'); bi.rmtree(part); shutil.copytree(t, part)
+        try: os.replace(part, out)
+        except OSError: bi.rmtree(part)   # another run put the same build there meanwhile
+    return out / name
+
+
+# build_ipa_from_nsp.py builds nx_extract itself wherever it reads packages (package_reader, which scan() uses) and in the survey, and looks for an executable named
+# nx_extract, which on Windows is nx_extract.exe: every NSP folder stopped there. This script's builder takes its place for the whole run.
+bi.build_nx_extract = lambda repo, work, logs, env: build_nx_extract(work, logs, env)
 
 
 def build_host(sdk, game_id, work, logs, env):   # → (the game's host, the loader, the NDK); VK_DRIVER_LIBS beside them
@@ -770,9 +788,7 @@ def main(argv):
         if (pdir / f'{app:016X}' / 'game.tsv').exists(): say(f'no game profile for {app:016X}: reusing the provisional profile from the last run (delete it to survey again)')
         else:   # the first experimental build only packs; once its provisional profile exists, it is built and installed like a profiled game's (to try it on a phone)
             if not a.no_push: raise BuildError(f'no game profile for {app:016X}: a game without one is first packed with --no-push (a survey, a provisional profile and an APK that may not boot)')
-            ipa_nx, bi.build_nx_extract = bi.build_nx_extract, lambda repo, work, logs, env: build_nx_extract(work, logs, env)   # this script's, with Windows' .exe
-            try: facts = bi.survey(nsp_dir, app, fam, keys, REPO, sys.executable, env)
-            finally: bi.build_nx_extract = ipa_nx
+            facts = bi.survey(nsp_dir, app, fam, keys, REPO, sys.executable, env)
             facts['survey'] = str(nsp_dir / f'{app:016X}_survey' / 'survey.md')
             bi.write_profile(pdir / f'{app:016X}', app, facts)
         g = provisional_profile(gamemod, nsp_dir, app); env['DM_GAMES_DIR'] = os.environ['DM_GAMES_DIR']

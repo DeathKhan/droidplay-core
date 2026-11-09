@@ -110,7 +110,8 @@ game keeps the first one in the app. Game files (code, shaders, RomFS, icon) liv
 - **On the computer:** Python 3.12 or newer with `lz4`, `capstone`, `fonttools` and `backports.zstd` (not needed on Python 3.14), plus `PySide6` for the desktop app:
   `pip install lz4 capstone fonttools backports.zstd PySide6`. The .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (set `ANDROID_HOME` or pass
   `--sdk`), `adb`, and a JDK (for `keytool` and `javac`). The desktop app's **Settings** page checks all of this and says how to get what is missing.
-  On Windows, use Python 3.15 or newer, which reads and writes text as UTF-8 as the scripts expect (with an older one, set `PYTHONUTF8=1`).
+  On Windows, use Python 3.14 and set `PYTHONUTF8=1` for the command line (the desktop app sets it for what it runs): the scripts read and write text as UTF-8,
+  which Python on Windows does by default only from 3.15, and lz4 has no Windows build for 3.15 yet.
 - **On the phone:** USB debugging (or wireless debugging) turned on, so that `adb devices` lists the phone, and room for the game: its RomFS is copied as one image
   (Danganronpa V3's is 6.7 GB).
 

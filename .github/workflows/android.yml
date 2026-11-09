@@ -60,13 +60,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/cc" && ln -sf "$(command -v clang)" "$RUNNER_TEMP/cc/cc"
           PATH="$RUNNER_TEMP/cc:$PATH" python -m unittest -v test_android_cli test_romfs_image
 
-  # The same host build and packing tests on Windows. Python 3.15, whose UTF-8 mode is on by default: nxnative's scripts read and write text without naming UTF-8, which
-  # an older Python on Windows takes as the system's code page. test_romfs_image stays on Linux: it compiles C with cc and runs xattr and bash, which packing on
-  # Windows does not use. The runner is an administrator, so it makes symbolic links that a player's Windows refuses (test_android_cli's Windows tests cover those).
+  # The same host build and packing tests on Windows, set up as a player's PC is (README, What you need): Python 3.14, since lz4 has no Windows wheel for 3.15 and a
+  # player's PC has no compiler to build it, with UTF-8 mode on, since nxnative's scripts read and write text without naming UTF-8, which Python on Windows otherwise
+  # takes as the system's code page. test_romfs_image stays on Linux: it compiles C with cc and runs xattr and bash, which packing on Windows does not use. The runner
+  # is an administrator, so it makes symbolic links that a player's Windows refuses (test_android_cli's Windows tests cover those).
   windows:
     name: Android host build and packing tests (Windows)
     runs-on: windows-2025
     timeout-minutes: 40
+    env:
+      PYTHONUTF8: '1'
     defaults:
       run:
         shell: pwsh
@@ -76,7 +79,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.15'
+          python-version: '3.14'
       - name: Python modules the packing script imports
         run: python -m pip install lz4 capstone fonttools
       - name: NDK and CMake
