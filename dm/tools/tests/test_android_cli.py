@@ -46,6 +46,42 @@ class Json(unittest.TestCase):
         self.assertTrue(all(len(k) == 16 for k in t))
 
 
+class Windows(unittest.TestCase):
+    def test_loads_where_python_has_no_fcntl(self):   # Windows: build_ipa_from_nsp.py loads tree_tar.py, which imports fcntl; dm/android/tools/compat's stand-in is found
+        code = '\n'.join([
+            'import importlib.machinery, importlib.util, sys',
+            'class NoFcntl:   # the platform has no fcntl, as on Windows: only a stand-in on the path is found',
+            '    def find_spec(self, name, path=None, target=None):',
+            "        if name != 'fcntl': return None",
+            "        spec = importlib.machinery.PathFinder.find_spec(name, [p for p in sys.path if p.endswith('compat')])",
+            "        if spec is None: raise ModuleNotFoundError(\"No module named 'fcntl'\")",
+            '        return spec',
+            "sys.modules.pop('fcntl', None); sys.meta_path.insert(0, NoFcntl())",
+            f"spec = importlib.util.spec_from_file_location('build_android_from_nsp', {str(SCRIPT)!r})",
+            'ba = importlib.util.module_from_spec(spec); spec.loader.exec_module(ba)',
+            'import fcntl, tree_tar',
+            'print(fcntl.__file__)',
+            'try: fcntl.flock(0, fcntl.LOCK_EX | fcntl.LOCK_NB)',
+            "except OSError: print('no lock')",
+        ])
+        r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, encoding='utf-8', timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        where, lock = r.stdout.splitlines()
+        self.assertEqual(Path(where), REPO / 'dm/android/tools/compat/fcntl.py')
+        self.assertEqual(lock, 'no lock')
+
+    def test_game_app_stage_without_symbolic_links(self):   # Windows makes them only with Developer Mode on (or as administrator): the stage takes the files instead
+        tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp)
+        spv = tmp / 'spv'; (spv / 'vs').mkdir(parents=True); (spv / 'vs' / '0001.spv').write_bytes(b'spv'); (tmp / 'icon.jpg').write_bytes(b'jpg')
+        stage = tmp / 'stage'; stage.mkdir()
+        def refused(*a, **k): raise OSError(1314, 'A required privilege is not held by the client')
+        with mock.patch.object(Path, 'symlink_to', refused):
+            ba.stage_link(stage / 'spv', spv); ba.stage_link(stage / 'icon.jpg', tmp / 'icon.jpg')
+        self.assertFalse((stage / 'spv').is_symlink())
+        self.assertEqual((stage / 'spv/vs/0001.spv').read_bytes(), b'spv')
+        self.assertEqual((stage / 'icon.jpg').read_bytes(), b'jpg')
+
+
 class Library(Base):
     def test_hosts_kept_per_game_and_all_in_the_apk(self):
         for gid in (GID, '0100A6301214E000'):
