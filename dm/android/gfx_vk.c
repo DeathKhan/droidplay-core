@@ -50,6 +50,7 @@ static PFN_vkResetQueryPoolEXT g_qreset;   // vkResetQueryPoolEXT, through vkGet
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
 static void vk_create(void) {
     pthread_mutex_init(&g_vk.qmu, NULL);
+    if (!vk_driver_load()) return;
     uint32_t ni = 0; vkEnumerateInstanceExtensionProperties(NULL, &ni, NULL);
     VkExtensionProperties *ie = calloc(ni ? ni : 1, sizeof *ie); vkEnumerateInstanceExtensionProperties(NULL, &ni, ie);
     const char *iext[2]; uint32_t nie = 0;
@@ -58,6 +59,7 @@ static void vk_create(void) {
     VkApplicationInfo ai = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "nxnative", .apiVersion = VK_API_VERSION_1_1};
     VkInstanceCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai, .enabledExtensionCount = nie, .ppEnabledExtensionNames = iext};
     if (vkCreateInstance(&ic, NULL, &g_vk.inst) != VK_SUCCESS) { LOG("[RED] [vk] no Vulkan instance"); return; }
+    vk_driver_instance(g_vk.inst);
     uint32_t n = 1; VkResult r = vkEnumeratePhysicalDevices(g_vk.inst, &n, &g_vk.pd);
     if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || !n) { LOG("[RED] [vk] no GPU"); return; }
     vkGetPhysicalDeviceProperties(g_vk.pd, &g_vk.props); vkGetPhysicalDeviceMemoryProperties(g_vk.pd, &g_vk.mp);

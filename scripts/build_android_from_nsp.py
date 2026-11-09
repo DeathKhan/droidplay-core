@@ -50,6 +50,9 @@ STANDARD_FONTS = ['/System/Library/Fonts/Supplemental/Arial Unicode.ttf', '/Syst
                   '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf']
 REMOTE = f'/sdcard/Android/data/{PKG}/files'
 BUILD_TOOLS, PLATFORM = '36.0.0', 'android-35'   # build_apk.py's defaults
+# libadrenotools and its hooks (dm/android/CMakeLists.txt), in every APK: DM_VK_DRIVER opens a Vulkan driver of the player's through them (dm/android/vk_driver.c), so trying
+# one needs no other build. Built beside the loader, and kept with it in the library
+VK_DRIVER_LIBS = ('libadrenotools.so', 'libhook_impl.so', 'libmain_hook.so')
 # Games played on an Android phone (their notes say how): the desktop app shows the others as not tested there
 ANDROID_TESTED = {'010015100B514000'}
 
@@ -114,7 +117,7 @@ def build_nx_extract(work, logs, env):   # build_ipa_from_nsp.py's, with Windows
     return exe
 
 
-def build_host(sdk, game_id, work, logs, env):   # → (the game's host, the loader, the NDK)
+def build_host(sdk, game_id, work, logs, env):   # → (the game's host, the loader, the NDK); VK_DRIVER_LIBS beside them
     ndk = newest(sdk / 'ndk', 'NDK'); cm = newest(sdk / 'cmake', 'CMake') / 'bin'
     exe = '.exe' if os.name == 'nt' else ''
     bdir = work / 'android_host'
@@ -127,7 +130,7 @@ def build_host(sdk, game_id, work, logs, env):   # → (the game's host, the loa
     bi.run([cm / f'cmake{exe}', '-G', 'Ninja', '-S', REPO / 'dm/android', '-B', bdir, f'-DCMAKE_MAKE_PROGRAM={cm / ("ninja" + exe)}',
             f'-DCMAKE_TOOLCHAIN_FILE={ndk / "build/cmake/android.toolchain.cmake"}', '-DANDROID_ABI=arm64-v8a', '-DANDROID_PLATFORM=android-29',
             f'-DGAME={game_id}', f'-DPython3_EXECUTABLE={sys.executable}'], logs / 'android_cmake.log', env=env)
-    bi.run([cm / f'ninja{exe}', '-C', bdir, 'dmhost_app', 'nxloader'], logs / 'android_host.log', env=env)
+    bi.run([cm / f'ninja{exe}', '-C', bdir, 'dmhost_app', 'nxloader', *[n[3:-3] for n in VK_DRIVER_LIBS]], logs / 'android_host.log', env=env)
     return bdir / f'libdmhost_{game_id}.so', bdir / 'libnxloader.so', ndk
 
 
@@ -189,12 +192,17 @@ def build_shaders(sv, dirs, work, logs, env, g, dlc_roms=()):
 
 
 # ---------------- The library of game hosts ----------------
-def library_add(gid, so, loader, selftest, meta):   # the game's host, and the loader and self test of the latest build (they do not depend on the game)
+def library_add(gid, so, loader, selftest, meta):   # the game's host, and the loader, VK_DRIVER_LIBS and self test of the latest build (they do not depend on the game)
     lib = data_dir(); d = lib / 'hosts' / gid; d.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(so, d / so.name)
     (d / 'meta.json').write_text(json.dumps(dict(meta, built=datetime.datetime.now().isoformat(timespec='seconds')), indent=1), encoding='utf-8')
     (lib / 'loader').mkdir(exist_ok=True); shutil.copyfile(loader, lib / 'loader' / loader.name)
+    for f in driver_libs(loader.parent): shutil.copyfile(f, lib / 'loader' / f.name)
     st = lib / 'selftest'; shutil.rmtree(st, ignore_errors=True); shutil.copytree(selftest, st)
+
+
+def driver_libs(d):   # VK_DRIVER_LIBS in a folder: a library made before they were built has none, and its APK goes without (DM_VK_DRIVER then logs that they are missing)
+    return [d / n for n in VK_DRIVER_LIBS if (d / n).is_file()]
 
 
 def library():   # {title ID: (host, meta)} of the hosts built on this computer
@@ -269,7 +277,7 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, wor
     icon = game / 'icon.jpg'
     bi.PROG.set(step='packing the APK' + (' with the RomFS inside' if inside else ''))
     bi.run([sys.executable, REPO / 'dm/android/tools/build_apk.py', '--sdk', sdk, '--game-app', g.id, '--so', so, '--game-dir', stage,
-            *(['--romfs', str(rom)] if inside else []), '--keystore', KEYSTORE, '-o', apk, '--label', meta.get('name') or g.id,
+            *[x for f in driver_libs(Path(so).parent) for x in ('--lib', f)], *(['--romfs', str(rom)] if inside else []), '--keystore', KEYSTORE, '-o', apk, '--label', meta.get('name') or g.id,
             *(['--icon', icon] if icon.is_file() else [])], logs / 'android_game_apk.log', env=env)
     Path(f'{apk}.idsig').unlink(missing_ok=True)   # apksigner's v4 signature, for adb's incremental installs only: clutter beside an app to share
     if xapk:
@@ -303,7 +311,7 @@ def make_apk(sdk, logs, env):   # the app with every host in the library → its
     KEYSTORE.parent.mkdir(parents=True, exist_ok=True)
     apk = lib / 'nxnative.apk'
     bi.run([sys.executable, REPO / 'dm/android/tools/build_apk.py', '--sdk', sdk, '--loader', loader, *[x for so, _ in hosts.values() for x in ('--so', so)],
-            '--selftest', st, '--keystore', KEYSTORE, '-o', apk], logs / 'android_apk.log', env=env)
+            *[x for f in driver_libs(loader.parent) for x in ('--lib', f)], '--selftest', st, '--keystore', KEYSTORE, '-o', apk], logs / 'android_apk.log', env=env)
     names = [m.get('name') or gid for gid, (_, m) in hosts.items()]
     say(f'app: {", ".join(names)} ({apk})')
     return apk

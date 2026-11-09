@@ -45,13 +45,13 @@ jobs:
           sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           (yes || true) | "$sdk" --licenses > /dev/null   # yes ends on a broken pipe once the licences are taken, which pipefail would count as a failure
           "$sdk" --install "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" > /dev/null
-      - name: Build the Android host (the game library, the command-line host and the loader)
+      - name: Build the Android host (the game library, the command-line host, the loader and libadrenotools with its hooks)
         run: |
           CM="$ANDROID_HOME/cmake/$CMAKE_VERSION/bin"
           "$CM/cmake" -G Ninja -S dm/android -B build -DCMAKE_MAKE_PROGRAM="$CM/ninja" \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DGAME="$GAME" -DPython3_EXECUTABLE="$(command -v python)"
-          "$CM/ninja" -C build dmhost_app dmhost_cli nxloader
+          "$CM/ninja" -C build dmhost_app dmhost_cli nxloader adrenotools hook_impl main_hook
       - name: Packing and RomFS image tests
         working-directory: dm/tools/tests
         # test_romfs_image compiles its C with `cc`, Apple's clang where nxnative runs it; Ubuntu's cc is gcc, whose -Wmisleading-indentation (an error under the
@@ -85,7 +85,7 @@ jobs:
           1..50 | ForEach-Object { 'y' } | & $sdk --licenses | Out-Null
           & $sdk --install "ndk;$env:NDK_VERSION" "cmake;$env:CMAKE_VERSION" | Out-Null
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Build the Android host (the game library, the command-line host and the loader)
+      - name: Build the Android host (the game library, the command-line host, the loader and libadrenotools with its hooks)
         run: |
           $sdk = $env:ANDROID_HOME -replace '\\', '/'   # CMake takes forward slashes
           $cm = "$sdk/cmake/$env:CMAKE_VERSION/bin"
@@ -94,7 +94,7 @@ jobs:
             "-DCMAKE_TOOLCHAIN_FILE=$sdk/ndk/$env:NDK_VERSION/build/cmake/android.toolchain.cmake" `
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 "-DGAME=$env:GAME" "-DPython3_EXECUTABLE=$py"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & "$cm/ninja.exe" -C build dmhost_app dmhost_cli nxloader
+          & "$cm/ninja.exe" -C build dmhost_app dmhost_cli nxloader adrenotools hook_impl main_hook
       - name: Packing tests
         working-directory: dm/tools/tests
         run: python -m unittest -v test_android_cli
