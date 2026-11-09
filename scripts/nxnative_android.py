@@ -489,7 +489,10 @@ class LibraryPage(QWidget):
         ex = (g.info.get('extracted') or {}).get(self.win.st.value(f'ver/{g.id}', '') or g.newest) or {}
         rom = ex.get('romfs_bytes'); data = f'its {gb_text(rom)} of game data' if rom else 'its game data'
         d = QDialog(self); d.setWindowTitle(f'Game app: {g.name}'); d.setStyleSheet(STYLE + f'QDialog {{ background: {PANEL}; }}'); d.setMinimumWidth(560)
-        lay = QVBoxLayout(d); lay.setContentsMargins(24, 24, 24, 24); lay.setSpacing(10)
+        outer = QVBoxLayout(d); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); outer.addWidget(scroll, 1)
+        body = QWidget(); body.setStyleSheet('background: transparent'); scroll.setWidget(body)
+        lay = QVBoxLayout(body); lay.setContentsMargins(24, 24, 24, 8); lay.setSpacing(10)
         lay.addWidget(label(f'{g.name} as an app of its own, with its own icon and saves, opening straight into the game on any arm64 device with Vulkan. '
                             'Several games install side by side, without the launcher app.', 'meta', wrap=True))
         lay.addSpacing(6)
@@ -503,7 +506,12 @@ class LibraryPage(QWidget):
                             'that much more space on this computer.', 'muted', wrap=True))
         (xapk if self.win.st.value('game_app_kind', 'apk') == 'xapk' else apk).setChecked(True)
         lay.addSpacing(6); lay.addWidget(label(f'It goes in the game\'s folder, {g.folder}, beside the other kind if that was built too.', 'muted', wrap=True))
-        bb = QDialogButtonBox(QDialogButtonBox.Cancel); bb.addButton('Build', QDialogButtonBox.AcceptRole); bb.accepted.connect(d.accept); bb.rejected.connect(d.reject); lay.addWidget(bb)
+        bb = QDialogButtonBox(QDialogButtonBox.Cancel); bb.addButton('Build', QDialogButtonBox.AcceptRole); bb.accepted.connect(d.accept); bb.rejected.connect(d.reject)
+        foot = QWidget(); fl = QVBoxLayout(foot); fl.setContentsMargins(24, 8, 24, 24); fl.addWidget(bb); outer.addWidget(foot)
+        # as tall as its text at its width, within the screen, and the text scrolls beyond that: left to Qt, a new window keeps within 2/3 of the screen's
+        # height, and the wrapped lines were squeezed and cut mid-line on a laptop at 150% (a 1080p screen is 720 high then)
+        d.ensurePolished(); need = lay.totalHeightForWidth(560) + foot.sizeHint().height()
+        d.resize(560, min(need, int(self.screen().availableGeometry().height() * 0.85)))
         if not d.exec(): return
         x = xapk.isChecked(); self.win.st.setValue('game_app_kind', 'xapk' if x else 'apk')
         made = f'{ba.safe_name(g.name) or g.id}.{"xapk" if x else "apk"}'
