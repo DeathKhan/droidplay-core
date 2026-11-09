@@ -107,12 +107,23 @@ def newest(d, what):
     return vs[-1]
 
 
-def build_nx_extract(work, logs, env):   # build_ipa_from_nsp.py's, with Windows' .exe
-    out = work / 'tools/nx_extract'; name = 'nx_extract.exe' if os.name == 'nt' else 'nx_extract'
-    with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:   # built outside the work folder and copied in, as that script does: MSBuild breaks on an apostrophe in the path
-        bi.run(['dotnet', 'build', REPO / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
+def build_nx_extract(work, logs, env):
+    """build_ipa_from_nsp.py's, with Windows' .exe, and built once per version of its source into <data>/tools/nx_extract-<digest>, which every run then takes:
+    the desktop app reads each game with --info, so a build per folder per read was a dotnet build each time, several at once writing the project's obj/.
+    work is unused (that script's builder put it there)"""
+    src = REPO / 'dm/tools/nx_extract'; name = 'nx_extract.exe' if os.name == 'nt' else 'nx_extract'
+    h = hashlib.sha256()
+    for p in sorted(src.rglob('*')):
+        rel = p.relative_to(src)
+        if p.is_file() and not {'bin', 'obj'} & set(rel.parts): h.update(rel.as_posix().encode() + b'\0' + p.read_bytes() + b'\0')
+    out = data_dir() / 'tools' / f'nx_extract-{h.hexdigest()[:16]}'
+    if (out / name).is_file(): return out / name
+    with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:   # built outside and copied in, as that script does: MSBuild breaks on an apostrophe in the path
+        bi.run(['dotnet', 'build', src, '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
         if not (Path(t) / name).exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-        bi.rmtree(out); shutil.copytree(t, out)
+        part = out.with_name(f'{out.name}.{os.getpid()}'); bi.rmtree(part); shutil.copytree(t, part)
+        try: os.replace(part, out)
+        except OSError: bi.rmtree(part)   # another run put the same build there meanwhile
     return out / name
 
 
