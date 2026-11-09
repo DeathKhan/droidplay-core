@@ -364,6 +364,13 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Fix:** the Java call runs on a host thread of its own, which `front_text_input` waits for; no guest thread attaches to the VM.
 - **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) 1.3.0, `main+0x2944c0`, 17 s after the rival's name entry, on an Ayn Odin 2 (Snapdragon 8 Gen 2, Adreno 740, Android 13).
 
+### Unreal thread stacks refused by `svcMapMemory` (Android)
+
+- **Symptom:** Android only: an Unreal Engine game aborts within a second of start, before its first frame: `[RED] MapMemory refused (0xd401): 0x616ab52000 <- 0xb40000612f1d8000 +0x4000`, then `game called nn::diag abort: Result 0` and `FATAL game aborted` (exit 134).
+- **Cause:** Unreal's allocator runs on a host malloc zone (`hle_uemalloc.c`, [Engine allocators](#engine-allocators)), and Unreal takes its threads' stacks from it. `nn::os::CreateThread` moves a stack into the stack region with `svcMapMemory`, whose source must be backed memory: `map_source_backed` asks `dm_ue_heap_owns`, which asks `vm_region_64` for the region holding the stack. The Android stand-in for `vm_region_64` (`dm/android/compat/dm_android.h`) always failed, as region queries were thought to name a fault's region in a log line only, so every such stack was refused. Behind it, Android tags malloc's pointers in the top byte (`0xb4...`, native heap pointer tagging) while `/proc/self/maps` lists untagged addresses, so a plain lookup would not have matched either.
+- **Fix:** `vm_region_64` in `plat_android.c` reads `/proc/self/maps`: the region holding the untagged address (adjacent lines with the same permissions joined, as Scudo's mappings come in named pieces), or the next one above it as Mach answers, with its start given back carrying the query's tag, so `dm_ue_heap_owns` compares the tagged stack pointer with tagged bounds. Shared code is unchanged.
+- **Found on:** Final Fantasy Resonance 1.0.1 (0100606026F12000, Unreal Engine 5) on a OnePlus Pad 3 (Adreno 830, Android 16): with the fix it boots (first frame at 0.6 s) and plays its title screen and real-time opening, also on an Ayn Odin 2.
+
 ### `MapPhysicalMemory` in 16 KB host pages
 
 - **Symptom:** `MapPhysicalMemory` faults on part of a page.

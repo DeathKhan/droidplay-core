@@ -534,6 +534,36 @@ unsigned char *CC_SHA256(const void *d, CC_LONG n, unsigned char *md) { CC_SHA25
 // mach_absolute_time as a real function, for assembly that calls it (nvn_entry.S; tools/asm_elf.py renames the call)
 uint64_t dm_mach_absolute_time(void) { return mach_absolute_time(); }
 
+// ---- vm_region_64: the region holding *a, or the next one above it (Mach's answer), from /proc/self/maps ----
+// Adjacent lines with the same permissions are one region, as the kernel may split one mapping (Scudo names its pieces). Android tags malloc's pointers in
+// the top byte (0xb4..., the app's native heap pointer tagging), and the maps list untagged addresses: the region is found by the untagged address and its
+// start given back with the query's tag, so a caller comparing the tagged pointer with the bounds (hle_uemalloc.c dm_ue_heap_owns) compares like with like.
+// A query reads the file, so it is for rare questions (a thread's stack, a fault's region)
+kern_return_t vm_region_64(mach_port_t t, vm_address_t *a, vm_size_t *s, int f, vm_region_info_t info, mach_msg_type_number_t *n, mach_port_t *o) {
+    (void)t; (void)f; (void)n;
+    if (o) *o = 0;
+    uintptr_t tag = (uintptr_t)*a & 0xff00000000000000ULL, want = (uintptr_t)*a & ~0xff00000000000000ULL;
+    FILE *m = fopen("/proc/self/maps", "re");
+    if (!m) return KERN_FAILURE;
+    char line[512], perm[5], seen[5] = "";
+    uintptr_t lo = 0, hi = 0;
+    while (fgets(line, sizeof line, m)) {
+        unsigned long l, h;
+        if (sscanf(line, "%lx-%lx %4s", &l, &h, perm) != 3) continue;
+        if (hi) {   // a region found: extend it over the lines that continue it
+            if (l != hi || strncmp(perm, seen, 3)) break;
+            hi = h; continue;
+        }
+        if (h > want) { lo = l; hi = h; memcpy(seen, perm, sizeof seen); }
+    }
+    fclose(m);
+    if (!hi) return KERN_FAILURE;
+    vm_region_basic_info_data_64_t *bi = (vm_region_basic_info_data_64_t *)info;
+    if (bi) bi->protection = bi->max_protection = (seen[0] == 'r' ? VM_PROT_READ : 0) | (seen[1] == 'w' ? VM_PROT_WRITE : 0) | (seen[2] == 'x' ? VM_PROT_EXECUTE : 0);
+    *a = lo | tag; *s = hi - lo;
+    return KERN_SUCCESS;
+}
+
 // ---- thread_info: THREAD_BASIC_INFO from /proc/self/task/<tid>/stat (state) and the thread's CPU clock (user time; system time is not split) ----
 kern_return_t thread_info(mach_port_t t, int flavor, thread_info_t out, mach_msg_type_number_t *n) {
     if (flavor != THREAD_BASIC_INFO || !out) return KERN_INVALID_ARGUMENT;

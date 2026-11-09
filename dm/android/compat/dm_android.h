@@ -84,9 +84,9 @@ static inline kern_return_t vm_deallocate(mach_port_t task, vm_address_t addr, v
 #define VM_REGION_BASIC_INFO_64 9
 #define VM_REGION_BASIC_INFO_COUNT_64 9
 typedef struct { vm_prot_t protection, max_protection; } vm_region_basic_info_data_64_t;
-// Region queries only name a fault's region in a log line: no answer on Android
-static inline kern_return_t vm_region_64(mach_port_t t, vm_address_t *a, vm_size_t *s, int f, vm_region_info_t i, mach_msg_type_number_t *n, mach_port_t *o) {
-    (void)t; (void)a; (void)s; (void)f; (void)i; (void)n; (void)o; return KERN_FAILURE; }
+// The region holding an address, or the next one above it, from /proc/self/maps (plat_android.c). Not only for log lines: hle_uemalloc.c's dm_ue_heap_owns asks it whether
+// an Unreal thread's stack is backed memory before svcMapMemory moves it, and with no answer Final Fantasy Resonance aborted at boot (MapMemory refused 0xd401)
+kern_return_t vm_region_64(mach_port_t t, vm_address_t *a, vm_size_t *s, int f, vm_region_info_t i, mach_msg_type_number_t *n, mach_port_t *o);
 #define mach_vm_region(t, a, s, f, i, n, o) vm_region_64(t, (vm_address_t *)(a), (vm_size_t *)(s), f, i, n, o)
 typedef struct { struct { int seconds, microseconds; } user_time, system_time; int cpu_usage, policy, run_state, flags, suspend_count, sleep_time; } thread_basic_info_data_t;
 // Thread basic info: run state and CPU time of a thread by its id ("port" = tid on Android), from /proc and the kernel's per-thread CPU clock
