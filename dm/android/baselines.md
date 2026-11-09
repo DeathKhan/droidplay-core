@@ -66,11 +66,17 @@ Numbered in the order they were found, so links to a number stay right:
    and Smash's font engine needs a hinted font (`main+0x7caa0`, `addr=0x38`). The packer now copies a hinted TrueType font into each game's
    `font/standard.ttf` (Arial Unicode on a Mac, as the iPhone build does), and Smash boots on all three devices: [Android: the standard shared font must
    be hinted](../../docs/reference/services.md#android-the-standard-shared-font-must-be-hinted).
-4. **Smash crashes now and then at boot; Odyssey's crash is fixed.** Smash at `main+0x385201c` (`addr=0x50`), even with the font, on all three devices (about one
-   launch in six). Odyssey crashed on the Odin 2 three times in about 20 launches, all in its first seconds of loading: twice in its loader thread as the mode-select
-   layout loads (`main+0x95d414` with `addr=0`, once `svcBreak`), once at `main+0x954fb8`; never in 18 launches on the other two then, but later in about one launch in
-   four on the Retroid Pocket 5. Fixed with `core_preempt on` in its profile: [A thread woken by a higher-priority thread of its core runs before that one
-   blocks](../../docs/reference/threads.md#a-thread-woken-by-a-higher-priority-thread-of-its-core-runs-before-that-one-blocks).
+4. **Fixed: Smash and Odyssey crashed now and then at boot.** Smash crashed at `main+0x385201c` (`addr=0x50`) in a `render dispatch` thread, even with the font, on
+   all three devices (about one launch in five; on the Retroid Pocket 5 3 of 12, 2 of 12 with `DM_PREEMPT=1`, 1 of 6 with a test host keeping that sum). Its two
+   render dispatch threads sort their pool of command buffers by `nvnCommandBufferGetCommandMemorySize` while the other one records into them, and the host summed
+   that size at each call from the bytes used and the write pointer, which a record written in between tore. The test host compared each sum with the size kept for
+   the buffer: 7 to 29 torn sums per boot, and in the boot that crashed, the last one was the sort's pivot, read 0x190 bytes short just before the crash; the sort
+   then read it right and walked past the vector's start. Fixed with nxnative's 843081d0, the size kept from `AddCommandMemory`: [`GetCommandMemorySize` read while
+   another thread records](../../docs/reference/nvn-objects.md#getcommandmemorysize-read-while-another-thread-records); with it, 0 of 18 boots crashed on the
+   Retroid Pocket 5, at the same frame times. Odyssey crashed on the Odin 2 three times in about 20 launches, all in its first seconds of loading: twice in its
+   loader thread as the mode-select layout loads (`main+0x95d414` with `addr=0`, once `svcBreak`), once at `main+0x954fb8`; never in 18 launches on the other two
+   then, but later in about one launch in four on the Retroid Pocket 5. Fixed with `core_preempt on` in its profile: [A thread woken by a higher-priority thread of
+   its core runs before that one blocks](../../docs/reference/threads.md#a-thread-woken-by-a-higher-priority-thread-of-its-core-runs-before-that-one-blocks).
 5. **Fixed: the pipeline cache was saved only when the app paused** (`vkb_pipeline_cache_save` on `APP_CMD_PAUSE`). The list of pipelines to make again at start
    (`pipeline.cache.keys4`) is written as each one is made, but the driver's compiled binaries are in the cache, so after a stop by force (the benchmark, or a player
    swiping the app away) the next start made the whole list again without them, in the background while the game played. The Pad 3's driver builds them about six
