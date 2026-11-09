@@ -145,6 +145,7 @@ QTableWidget, QTreeWidget, QListWidget, QPlainTextEdit {{ background: {PANEL}; b
 QTableWidget::item, QTreeWidget::item, QListWidget::item {{ padding: 6px; }}
 QTableWidget::item:selected, QTreeWidget::item:selected, QListWidget::item:selected {{ background: #26262a; }}
 QHeaderView::section {{ background: {PANEL}; color: {TEXT3}; border: none; border-bottom: 1px solid {LINE}; padding: 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; }}
+QPlainTextEdit#log {{ font-family: 'Cascadia Mono', 'Consolas', 'Menlo', 'DejaVu Sans Mono', monospace; font-size: 12px; }}
 QScrollArea {{ background: transparent; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; }} QScrollBar::handle:vertical {{ background: #2e2e33; border-radius: 5px; min-height: 30px; }}
 QScrollBar:horizontal {{ height: 0px; }} QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
@@ -230,6 +231,9 @@ def count_text(done, total, unit):   # "1,234 / 37,393 files", or bytes as "1.2 
         u, d = next((u, d) for u, d in (('GB', 1 << 30), ('MB', 1 << 20), ('KB', 1 << 10), ('B', 1)) if total >= d or d == 1)
         return f'{done / d:.1f} / {total / d:.1f} {u}{pct}'
     return f'{done:,} / {total:,} {unit}'.rstrip() + pct
+
+
+def tint(bar, color): bar.setStyleSheet(f'QProgressBar::chunk {{ background: {color}; border-radius: 4px; }}')   # amber while it runs, green once done, red when it failed
 
 
 def wash(pm, w, h):   # the art's colour wash: the picture shrunk to a few pixels and spread over w x h (a soft blur of its own colours)
@@ -559,9 +563,12 @@ class BuildsPage(QWidget):
         self.ids = set(); self.ext = None   # this app's builds (their journals are skipped: their events come on stdout); the console build followed: {path, pid, pos}
         lay = QVBoxLayout(self); lay.setContentsMargins(48, 32, 48, 24); lay.setSpacing(16)
         self.head = label('Builds', 'h1'); lay.addWidget(self.head); self.sub = label('Nothing running. Builds start from the Library.', 'muted'); lay.addWidget(self.sub)
-        self.tree = QTreeWidget(); self.tree.setHeaderLabels(['Stage', 'Progress', 'Time', 'Result']); self.tree.setColumnWidth(0, 300); self.tree.setColumnWidth(1, 300)
-        self.tree.setRootIsDecorated(False); lay.addWidget(self.tree, 2)
-        self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setFont(QFont('Cascadia Mono', 9)); lay.addWidget(self.log, 3)
+        self.tree = QTreeWidget(); self.tree.setHeaderLabels(['Stage', 'Progress', 'Time', 'Result']); self.tree.setRootIsDecorated(False)
+        hh = self.tree.header(); hh.setStretchLastSection(False); hh.setSectionResizeMode(0, QHeaderView.Stretch); hh.setSectionResizeMode(1, QHeaderView.Fixed)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents); hh.setSectionResizeMode(3, QHeaderView.Stretch); self.tree.setColumnWidth(1, 220)
+        self.tree.setTextElideMode(Qt.ElideMiddle)   # a long step or path keeps both ends; the whole text is the cell's tooltip
+        self.tree.setSelectionMode(QTreeWidget.NoSelection); self.tree.setFocusPolicy(Qt.NoFocus); lay.addWidget(self.tree, 2)   # a selected row lost its result's colour
+        self.log = QPlainTextEdit(); self.log.setObjectName('log'); self.log.setReadOnly(True); lay.addWidget(self.log, 3)
         row = QHBoxLayout(); b = QPushButton('Open the app folder'); b.setObjectName('ghost'); b.clicked.connect(lambda: reveal(ba.data_dir()))
         row.addWidget(b); row.addStretch(); lay.addLayout(row)
         self.live = None   # (the running stage's row, its detail, its fraction or -1)
@@ -596,8 +603,8 @@ class BuildsPage(QWidget):
         if done is not None:
             ok = done == 0; self.ext = None; self.live = None
             self.say('— the console build ' + ('finished' if ok else 'stopped' if done == -1 else f'failed (exit {done})'), READY if ok else ERR)
-            self.sub.setText('done' if ok else 'stopped' if done == -1 else 'failed: see the messages below')
-            self.progress.emit(self.title, 'done' if ok else 'failed', 1.0 if ok else -1, False)
+            self.sub.setText(f'done · {self.ended(ok)}' if ok else 'stopped' if done == -1 else 'failed: see the messages below')
+            self.progress.emit(self.title, self.ended(ok), 1.0 if ok else -1, False)
             if ok: self.win.library.after_task()
     def start(self, title, args, after=None):
         if self.busy() or self.ext: QMessageBox.warning(self, 'Busy', 'A build is running: wait for it or stop it'); return
@@ -631,6 +638,7 @@ class BuildsPage(QWidget):
             bar = QProgressBar(); bar.setRange(0, 0); bar.setTextVisible(False); self.tree.setItemWidget(it, 1, bar); it.t0 = ev.get('t') or time.time(); it.n = ev.get('n', '?'); it.name = ev.get('name', '')
         bar = self.tree.itemWidget(it, 1); frac = -1.0
         if ev.get('step'): it.setText(0, f'{key}/{it.n}   {it.name} · {ev["step"]}')
+        it.setToolTip(0, it.text(0))
         if k == 'progress' and ev.get('total'):
             frac = (ev.get('done') or 0) / ev['total']; bar.setRange(0, 1000); bar.setValue(int(1000 * frac))
         it.setText(2, clock_text(time.time() - it.t0))
@@ -638,7 +646,8 @@ class BuildsPage(QWidget):
         if k == 'progress' and ev.get('total'): detail += (f' · {ev["note"]}' if ev.get('note') else '') + ' · ' + count_text(ev.get('done') or 0, ev['total'], ev.get('unit') or '')
         if ev.get('eta'): detail += f' · {int(ev["eta"])}s left'
         if k == 'stage_end':
-            bar.setRange(0, 1); bar.setValue(1); it.setText(2, clock_text(ev.get('elapsed', 0))); it.setText(3, ev.get('summary', '')); it.setForeground(3, QColor(READY if ev.get('ok') else ERR))
+            bar.setRange(0, 1); bar.setValue(1); tint(bar, READY if ev.get('ok') else ERR); it.setText(0, f'{key}/{it.n}   {it.name}'); it.setToolTip(0, it.text(0))   # its last step was not still going on
+            it.setText(2, clock_text(ev.get('elapsed', 0))); it.setText(3, ev.get('summary', '')); it.setToolTip(3, ev.get('summary', '')); it.setForeground(3, QColor(READY if ev.get('ok') else ERR))
             detail = f'{it.name} done'; frac = 1.0; QTimer.singleShot(0, self.win.library.reload)
         self.sub.setText(f'stage {key} of {it.n} · {detail}')
         self.live = None if k == 'stage_end' else (it, detail, frac if frac >= 0 else (self.live[2] if self.live and self.live[0] is it and k != 'step' else -1))
@@ -650,11 +659,15 @@ class BuildsPage(QWidget):
     def finished(self, code, _status):
         self.read()
         ok = code == 0; self.live = None; self.say(f'— finished in {time.time() - self.t0:.0f} s, exit {code}', READY if ok else ERR)
-        self.sub.setText('done' if ok else 'failed: see the messages below')
-        self.progress.emit(self.title, 'done' if ok else 'failed', 1.0 if ok else -1, False)
+        self.sub.setText(f'done · {self.ended(ok)}' if ok else 'failed: see the messages below')
+        self.progress.emit(self.title, self.ended(ok), 1.0 if ok else -1, False)
         after, self.after = self.after, None
         if ok and after: QTimer.singleShot(200, after)
         if not ok: self.win.toast(f'{self.title} failed: see Builds')
+    def ended(self, ok):   # what the bar says under "<build> — done" or "— failed", rather than the same word again
+        if not ok: return 'see the messages on the Builds page'
+        n = len(self.items); took = clock_text(time.time() - self.t0)
+        return f'{n} stage{"" if n == 1 else "s"} in {took}' if n else f'took {took}'
     def stop(self):
         if self.ext:   # a console build: its process tree
             if QMessageBox.question(self, 'Stop', f'Stop {self.title}, started from the console?') != QMessageBox.Yes: return
@@ -681,7 +694,7 @@ class BuildBar(QWidget):   # the running build at the bottom of every page
     def update_from(self, title, detail, frac, running):
         self.show(); self.hide_timer.stop()
         self.title.setText(f'{title} in progress' if running else title + (' — done' if frac >= 0 else ' — failed'))
-        self.detail.setText(detail)
+        self.detail.setText(detail); tint(self.bar, BUILD if running else READY if frac >= 0 else ERR)
         if frac < 0: self.bar.setRange(0, 0 if running else 1000); self.pct.setText('')
         else: self.bar.setRange(0, 1000); self.bar.setValue(int(frac * 1000)); self.pct.setText(f'{frac * 100:.0f}%')
         self.stop.setVisible(running)
@@ -845,7 +858,7 @@ class PerformancePage(QWidget):
         split = QSplitter(Qt.Horizontal)
         left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(0, 0, 0, 0)
         self.filter = QLineEdit(); self.filter.setPlaceholderText('Filter the log (e.g. RED)'); ll.addWidget(self.filter)
-        self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMaximumBlockCount(5000); self.log.setFont(QFont('Cascadia Mono', 9)); ll.addWidget(self.log)
+        self.log = QPlainTextEdit(); self.log.setObjectName('log'); self.log.setReadOnly(True); self.log.setMaximumBlockCount(5000); ll.addWidget(self.log)
         split.addWidget(left)
         self.prof = QTableWidget(0, 3); self.prof.setHorizontalHeaderLabels(['GPU passes of a frame', 'ms', 'share']); self.prof.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.prof.verticalHeader().hide(); self.prof.setShowGrid(False); split.addWidget(self.prof); split.setSizes([700, 380])
