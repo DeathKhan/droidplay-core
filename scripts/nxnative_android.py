@@ -20,7 +20,7 @@ try:
                                    QProgressBar, QPushButton, QScrollArea, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QToolButton,
                                    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 except ImportError:
-    sys.exit(f'nxnative_android needs PySide6: {sys.executable} -m pip install PySide6')
+    sys.exit(f'DroidPlay (nxnative_android.py) needs PySide6: uv run {__file__}, or {sys.executable} -m pip install PySide6')
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / 'scripts' / 'build_android_from_nsp.py'
@@ -67,6 +67,26 @@ def icon(name, color=TEXT2, size=20):
     pm = QPixmap(size * 2, size * 2); pm.fill(Qt.transparent)
     p = QPainter(pm); QSvgRenderer(QByteArray(svg.encode())).render(p); p.end(); pm.setDevicePixelRatio(2)
     return QIcon(pm)
+
+
+# The window is DroidPlay for Windows and Linux: DroidPlay on a Mac is a separate app (github.com/enjoyerofslop/droidplay), whose name and icon it shares.
+# DroidPlay's icon, from the Mac app's layers (droidplay App/AppIcon.icon: the plate, the Joy-Cons and the play glyph) on its light green, flattened for the window
+# and the taskbar: the Mac draws the glass and shadows itself
+APP_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9ee8ad"/>'
+           '<stop offset="1" stop-color="#47ba75"/></linearGradient></defs><rect width="1024" height="1024" rx="228" fill="url(#g)"/>'
+           '<g transform="translate(512 512) scale(1.5161) translate(-512 -512)"><rect x="413" y="334" width="198" height="356" rx="26" fill="#3a3f4b" stroke="#4a505e" stroke-width="4"/>'
+           '<path d="M415,322 L415,702 L335,702 A80,80 0 0 1 255,622 L255,402 A80,80 0 0 1 335,322 Z" fill="#00b8d9"/>'
+           '<g fill="#0a5f70"><circle cx="335" cy="432" r="36"/><circle cx="335" cy="556" r="15"/><circle cx="335" cy="624" r="15"/><circle cx="301" cy="590" r="15"/>'
+           '<circle cx="369" cy="590" r="15"/></g><path d="M609,322 L689,322 A80,80 0 0 1 769,402 L769,622 A80,80 0 0 1 689,702 L609,702 Z" fill="#ff4f5e"/>'
+           '<g fill="#8a1d27"><circle cx="689" cy="398" r="15"/><circle cx="689" cy="466" r="15"/><circle cx="655" cy="432" r="15"/><circle cx="723" cy="432" r="15"/>'
+           '<circle cx="689" cy="590" r="36"/></g><path d="M490,476 L490,548 L550,512 Z" fill="#fff" stroke="#fff" stroke-width="26" stroke-linejoin="round"/></g></svg>')
+
+
+def app_icon():   # every size Windows and the Linux desktops ask for, drawn from APP_SVG
+    out, r = QIcon(), QSvgRenderer(QByteArray(APP_SVG.encode()))
+    for s in (16, 24, 32, 48, 64, 128, 256):
+        pm = QPixmap(s, s); pm.fill(Qt.transparent); p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing); r.render(p); p.end(); out.addPixmap(pm)
+    return out
 
 
 STYLE = f"""
@@ -410,7 +430,7 @@ class LibraryPage(QWidget):
         elif state == 'install': self.run(g, ['--push-only'], 'Install')
         elif state == 'build': self.run(g, [], 'Build') if s else self.run(g, ['--no-push'], 'Build')
         elif state == 'survey':   # no profile: the script surveys the game, guesses a provisional profile and packs a best-effort APK (not installed: it may not boot)
-            box = QMessageBox(QMessageBox.Warning, 'Experimental build', f'{g.name} has no profile in nxnative, so it is not supported yet. '
+            box = QMessageBox(QMessageBox.Warning, 'Experimental build', f'{g.name} has no profile in droidnative, so it is not supported yet. '
                               'The build extracts the game, writes a survey of it (survey.md in its folder), guesses a provisional profile and packs an APK that '
                               'will most likely not boot. Nothing is installed on the phone. It is the starting point for porting the game.', parent=self)
             go = box.addButton('Build anyway', QMessageBox.AcceptRole); box.setDefaultButton(box.addButton(QMessageBox.Cancel)); box.exec()
@@ -842,13 +862,13 @@ class SettingsPage(QWidget):
 # ---------------- The window ----------------
 class Window(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle('nxnative'); self.setMinimumSize(1000, 620)
+        super().__init__(); self.setWindowTitle('DroidPlay'); self.setWindowIcon(app_icon()); self.setMinimumSize(1000, 620)
         a = QApplication.primaryScreen().availableGeometry(); self.resize(min(1440, a.width() - 40), min(900, a.height() - 40))
-        self.st = QSettings('nxnative', 'android'); self.devs = []; self.phone_games = {}; self.phone_legacy = False; self.models = {}
+        self.st = QSettings('nxnative', 'android'); self.devs = []; self.phone_games = {}; self.phone_legacy = False; self.models = {}   # the old name: the settings stay
         central = QWidget(); central.setObjectName('page'); root = QVBoxLayout(central); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0); self.setCentralWidget(central)
         # the top bar: the wordmark, the pages, the phone, search, + Build game
         top = QWidget(); top.setObjectName('topbar'); top.setAttribute(Qt.WA_StyledBackground, True); tl = QHBoxLayout(top); tl.setContentsMargins(28, 14, 28, 14); tl.setSpacing(6)
-        tl.addWidget(label('nxnative', 'wordmark'))
+        tl.addWidget(label('DroidPlay', 'wordmark'))
         self.navs = {}; group = QButtonGroup(self); group.setExclusive(True)
         for key, text, ic in (('library', 'Library', 'library'), ('builds', 'Builds', 'builds'), ('phones', 'Phones', 'phone'), ('perf', 'Performance', 'perf'), ('settings', 'Settings', 'settings')):
             b = QToolButton(); b.setObjectName('nav'); b.setText(f' {text}'); b.setIcon(icon(ic, TEXT2, 18)); b.setIconSize(QSize(18, 18)); b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -962,7 +982,10 @@ class Window(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv); app.setApplicationName('nxnative'); app.setStyle('Fusion'); app.setStyleSheet(STYLE)
+    if os.name == 'nt':   # a taskbar button of its own, with DroidPlay's name and icon, not grouped with every other Python window
+        try: import ctypes; ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('io.github.enjoyerofslop.droidplay.desktop')
+        except Exception: pass
+    app = QApplication(sys.argv); app.setApplicationName('DroidPlay'); app.setWindowIcon(app_icon()); app.setStyle('Fusion'); app.setStyleSheet(STYLE)
     w = Window(); w.show(); sys.exit(app.exec())
 
 

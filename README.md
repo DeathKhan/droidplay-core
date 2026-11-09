@@ -25,7 +25,8 @@ maintainer's choice: Android work belongs here, not there. Everything below the 
   XAPK for an installer app). See [DroidPlay](https://github.com/enjoyerofslop/droidplay).
 - **The command line, any computer:** [Packing from the command line](#packing-from-the-command-line). `--game-apk` makes a game app; without it the game goes into
   the launcher app on a connected device.
-- **The desktop app** (`python scripts/nxnative_android.py`, Windows, macOS or Linux): the launcher-app flow with a window ([below](#the-desktop-app)).
+- **DroidPlay for Windows and Linux**, the desktop app (`python scripts/nxnative_android.py`; it runs on a Mac too): the launcher-app flow with a window
+  ([below](#the-desktop-app)). It has DroidPlay's name and icon, but it is a separate app from DroidPlay on a Mac.
 
 <!-- The "status" anchor keeps links made before the rename working: DroidPlay's README links to #status. -->
 ## <a id="status"></a>Game Status
@@ -114,7 +115,7 @@ game keeps the first one in the app. Game files (code, shaders, RomFS, icon) liv
 - **On the phone:** USB debugging (or wireless debugging) turned on, so that `adb devices` lists the phone, and room for the game: its RomFS is copied as one image
   (Danganronpa V3's is 6.7 GB).
 
-## The desktop app
+## <a id="the-desktop-app"></a>DroidPlay for Windows and Linux: the desktop app
 
 `python scripts/nxnative_android.py` opens a window that drives the packing script and adb for you:
 
