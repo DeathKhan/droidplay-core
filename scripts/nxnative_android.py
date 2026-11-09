@@ -435,13 +435,13 @@ class LibraryPage(QWidget):
             if self.win.phone_legacy and not self.legacy_ok(s): return
             args += ['--serial', s]
         self.win.builds.start(f'{what} {g.name}', args + extra, after=after or self.after_task)
-    def game_app(self, g):   # the game as an app of its own (build_android_from_nsp.py --game-apk): no phone, and the nxnative app on the phones is left as it is
+    def game_app(self, g):   # the game as an app of its own (build_android_from_nsp.py --game-apk): no phone, and the launcher app on the phones is left as it is
         ex = (g.info.get('extracted') or {}).get(self.win.st.value(f'ver/{g.id}', '') or g.newest) or {}
         rom = ex.get('romfs_bytes'); data = f'its {gb_text(rom)} of game data' if rom else 'its game data'
         d = QDialog(self); d.setWindowTitle(f'Game app: {g.name}'); d.setStyleSheet(STYLE + f'QDialog {{ background: {PANEL}; }}'); d.setMinimumWidth(560)
         lay = QVBoxLayout(d); lay.setContentsMargins(24, 24, 24, 24); lay.setSpacing(10)
         lay.addWidget(label(f'{g.name} as an app of its own, with its own icon and saves, opening straight into the game on any arm64 device with Vulkan. '
-                            'Several games install side by side, without the nxnative app.', 'meta', wrap=True))
+                            'Several games install side by side, without the launcher app.', 'meta', wrap=True))
         lay.addSpacing(6)
         apk = QRadioButton('APK'); lay.addWidget(apk)
         beside = ('as a .romfs file beside the APK, which takes no extra space on the same drive: copy both to the device, put the .romfs anywhere (an SD card '
