@@ -27,7 +27,28 @@ maintainer's choice: Android work belongs here, not there. Everything below the 
   the launcher app on a connected device.
 - **The desktop app** (`python scripts/nxnative_android.py`, Windows, macOS or Linux): the launcher-app flow with a window ([below](#the-desktop-app)).
 
-## Status
+<!-- The "status" anchor keeps links made before the rename working: DroidPlay's README links to #status. -->
+## <a id="status"></a>Game Status
+
+Screen captures from the test runs, taken on the device. The round button at the top is droidnative's menu, the line at the bottom Android's gesture bar.
+
+<table>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/pokemon-brilliant-diamond-odin-2.jpg" width="256" alt="Pokémon Brilliant Diamond in Eterna City on an Ayn Odin 2"><br><small><b><a href="dm/games/0100000011D90000/README.md">Pokémon Brilliant Diamond</a></b><br>Ayn Odin 2: Eterna City, 60 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/animal-crossing-new-horizons-odin-2.jpg" width="256" alt="Animal Crossing: New Horizons outside the player's house on an Ayn Odin 2"><br><small><b><a href="dm/games/01006F8002326000/README.md">Animal Crossing: New Horizons</a></b><br>Ayn Odin 2: outside the player's house, 30 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/super-mario-odyssey-retroid-pocket-5.jpg" width="256" alt="Super Mario Odyssey's opening cutscene on a Retroid Pocket 5"><br><small><b><a href="dm/games/0100000000010000/README.md">Super Mario Odyssey</a></b><br>Retroid Pocket 5: the opening cutscene, 38 fps</small></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/super-smash-bros-ultimate-odin-2.jpg" width="256" alt="A Super Smash Bros. Ultimate battle on an Ayn Odin 2"><br><small><b><a href="dm/games/01006A800016E000/README.md">Super Smash Bros. Ultimate</a></b><br>Ayn Odin 2: a battle, 40–59 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/zelda-links-awakening-odin-2.jpg" width="256" alt="The Legend of Zelda: Link's Awakening's opening movie on an Ayn Odin 2, drawn in banded colours"><br><small><b><a href="dm/games/01006BB00C6F0000/README.md">The Legend of Zelda: Link's Awakening</a></b><br>Ayn Odin 2: the opening movie, in banded colours</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/zelda-skyward-sword-hd-odin-2.jpg" width="256" alt="The Legend of Zelda: Skyward Sword HD in Skyloft on an Ayn Odin 2, with grey terrain"><br><small><b><a href="dm/games/01002DA013484000/README.md">The Legend of Zelda: Skyward Sword HD</a></b><br>Ayn Odin 2: Skyloft, grey terrain, 30 fps</small></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/zelda-breath-of-the-wild-odin-2.jpg" width="256" alt="The Legend of Zelda: Breath of the Wild on the Great Plateau on an Ayn Odin 2"><br><small><b><a href="dm/games/01007EF00011E000/README.md">The Legend of Zelda: Breath of the Wild</a></b><br>Ayn Odin 2: the Great Plateau, about 20 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/mario-kart-world-odin-2.jpg" width="256" alt="Mario Kart World's world map on an Ayn Odin 2"><br><small><b><a href="dm/games/0400C3F00006E000/README.md">Mario Kart World</a></b><br>Ayn Odin 2: the world map, about 55 fps</small></td>
+<td></td>
+</tr>
+</table>
 
 | Game | Device | State |
 |---|---|---|
