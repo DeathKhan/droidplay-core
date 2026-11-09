@@ -1,0 +1,5 @@
+# Switches this game gets on Android (build_android_from_nsp.py puts them in the game's defaults.txt; env.txt and the settings screen still win)
+# DM_VK_WB_ABSORB: its 1920x1080 linear render target's own write-back is not uploaded again (gfx_vk.c, linear render targets' write-backs). Without it, every frame
+# wrote the target back and uploaded its 7.9 MB again, and Skyloft ran at 30 fps on an Ayn Odin 2 and a OnePlus Pad 3; with it, 60 on the Pad 3. Not on for every
+# game: with it, DM_VK_LINWB_SNAP and DM_VK_UP_RANGE on together, Breath of the Wild's tall grass collapsed in single frames, and which one does that is not known
+DM_VK_WB_ABSORB=1
