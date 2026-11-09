@@ -687,7 +687,7 @@ def check(sdk_arg):
     except BuildError as e: dn = None; row('.NET SDK 10', False, str(e), 'install the .NET 10 SDK: https://dotnet.microsoft.com/download')
     else: row('.NET SDK 10', dn and dn.split('.')[0] == '10', dn or 'not found', 'install the .NET 10 SDK: https://dotnet.microsoft.com/download')
     try: sdk = sdk_dir(sdk_arg)
-    except BuildError as e: sdk = None; row('Android SDK', False, str(e), 'install Android Studio or the command-line tools, then set ANDROID_HOME')
+    except BuildError: sdk = None; row('Android SDK', False, 'not found', 'install Android Studio or the command-line tools, then set ANDROID_HOME (or give --sdk)')
     else: row('Android SDK', True, str(sdk))
     if sdk:
         for what, d in (('NDK', sdk / 'ndk'), ('CMake', sdk / 'cmake')):
@@ -698,7 +698,9 @@ def check(sdk_arg):
     a = tool_version(['adb', 'version'])
     row('adb', a, a.splitlines()[0] if a else 'not found', 'install the Android SDK platform-tools and put them on PATH')
     for t in ('keytool', 'javac'):
-        v = shutil.which(t); row(f'JDK {t}', v, v or 'not found', 'install a JDK (17 or newer) and put its bin folder on PATH')
+        v = shutil.which(t)
+        if v and os.name == 'nt': v = str(Path(v).with_suffix(Path(v).suffix.lower()))   # which() spells the extension as PATHEXT does (javac.EXE), not as the file is named
+        row(f'JDK {t}', v, v or 'not found', 'install a JDK (17 or newer) and put its bin folder on PATH')
     row('signing key', True, f'{KEYSTORE}' + ('' if KEYSTORE.is_file() else ' (made at the first build)'))
     hosts = library(); row('game hosts', True, f'{len(hosts)} in {data_dir() / "hosts"}' + (': ' + ', '.join(hosts) if hosts else ''))
     return rows
