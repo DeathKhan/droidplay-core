@@ -355,6 +355,13 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, wor
     return made, inside
 
 
+def core_version():   # DroidPlay Core's version, for the launcher app's: the VERSION file a release's archives carry (release-assets.yml), else git describe in a checkout
+    if (REPO / 'VERSION').is_file(): return (REPO / 'VERSION').read_text(encoding='utf-8').strip() or None
+    try: r = subprocess.run(['git', '-C', str(REPO), 'describe', '--tags', '--always'], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired): return None
+    return (r.stdout.strip().removeprefix('v') or None) if r.returncode == 0 else None
+
+
 def make_apk(sdk, logs, env):   # the app with every host in the library → its path
     lib = data_dir(); hosts = library()
     loader, st = lib / 'loader' / 'libnxloader.so', lib / 'selftest'
@@ -362,7 +369,8 @@ def make_apk(sdk, logs, env):   # the app with every host in the library → its
     KEYSTORE.parent.mkdir(parents=True, exist_ok=True)
     apk = lib / 'nxnative.apk'
     bi.run([sys.executable, REPO / 'dm/android/tools/build_apk.py', '--sdk', sdk, '--loader', loader, *[x for so, _ in hosts.values() for x in ('--so', so)],
-            *[x for f in driver_libs(loader.parent) for x in ('--lib', f)], '--selftest', st, '--keystore', KEYSTORE, '-o', apk], logs / 'android_apk.log', env=env)
+            *[x for f in driver_libs(loader.parent) for x in ('--lib', f)], '--selftest', st, '--keystore', KEYSTORE, '-o', apk,
+            *(['--version-name', v] if (v := core_version()) else [])], logs / 'android_apk.log', env=env)
     names = [m.get('name') or gid for gid, (_, m) in hosts.items()]
     say(f'app: {", ".join(names)} ({apk})')
     return apk

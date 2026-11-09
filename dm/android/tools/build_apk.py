@@ -37,6 +37,7 @@ def main():
     ap.add_argument('--keystore', required=True); ap.add_argument('-o', '--out', required=True)
     ap.add_argument('--label', help="the app's name in the launcher (default DroidPlay)"); ap.add_argument('--icon', help="the app's launcher icon: a JPEG or PNG (the game's icon.jpg)")
     ap.add_argument('--build-tools', default='36.0.0'); ap.add_argument('--platform', default='android-35')
+    ap.add_argument('--version-name', help="the app's version, as Android's settings and DroidPlay's Phones page show it (the manifest's 0.1 otherwise)")
     a = ap.parse_args()
     for so in a.so:
         n = os.path.basename(so)
@@ -74,7 +75,9 @@ def main():
             manifest = manifest.replace('<application android:label="DroidPlay"', '<application' + attrs, 1)
         mf = os.path.join(d, 'AndroidManifest.xml')
         with open(mf, 'w', encoding='utf-8') as f: f.write(manifest)
-        run(aapt2, 'link', '-o', base, '--manifest', mf, '-I', jar, *res, '--min-sdk-version', '29', '--target-sdk-version', '34')
+        # the version name only: the version code stays 1, as a lower code than the installed app's would make adb refuse the update
+        ver = ['--version-name', a.version_name, '--replace-version'] if a.version_name else []
+        run(aapt2, 'link', '-o', base, '--manifest', mf, '-I', jar, *res, '--min-sdk-version', '29', '--target-sdk-version', '34', *ver)
         # the Java side (the touch controls, the text box): javac for Java 8 against the platform's android.jar, then d8 to classes.dex
         src = os.path.join(HERE, '..', 'java'); cls = os.path.join(d, 'classes'); os.makedirs(cls)
         javas = [os.path.join(r, f) for r, _, fs in os.walk(src) for f in fs if f.endswith('.java')]
