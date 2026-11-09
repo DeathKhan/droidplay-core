@@ -9,8 +9,9 @@
 #   Settings     your keys, and what the build needs on this computer with how to get what is missing; on Windows, Install what's missing (--setup)
 # /// script
 # # Below 3.15: lz4 has no wheels for it yet, and a player's computer has no compiler to build one. The packing script runs in this same Python.
+# # PySide6-Essentials has every Qt module the app uses (Core, Gui, Widgets, Svg) without PySide6's add-ons and web engine, a few hundred MB less to download.
 # requires-python = ">=3.12,<3.15"
-# dependencies = ["PySide6", "lz4", "capstone>=5,<6", "fonttools", "backports.zstd; python_version < '3.14'"]
+# dependencies = ["PySide6-Essentials", "lz4", "capstone>=5,<6", "fonttools", "backports.zstd; python_version < '3.14'"]
 # ///
 import json, os, re, shutil, subprocess, sys, time, uuid
 from pathlib import Path
@@ -1060,6 +1061,10 @@ class Window(QMainWindow):
 
 
 def main():
+    if '--write-icon' in sys.argv[:-1]:   # the Windows installer's shortcuts take DroidPlay's icon as an .ico file (dm/android/windows/install_droidplay.cmd)
+        app = QApplication(sys.argv[:1]); path = sys.argv[sys.argv.index('--write-icon') + 1]
+        if not app_icon().pixmap(256, 256).save(path, 'ICO'): sys.exit(f'could not write {path}')
+        return
     if os.name == 'nt':   # a taskbar button of its own, with DroidPlay's name and icon, not grouped with every other Python window
         try: import ctypes; ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('io.github.enjoyerofslop.droidplay.desktop')
         except Exception: pass
