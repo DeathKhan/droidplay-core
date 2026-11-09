@@ -26,6 +26,7 @@ static _Atomic int g_watch_stage_idx;
 static char g_watch_stage[2][256] = {"startup", "startup"};
 static unsigned g_watch_stall;
 static void (*g_dump_hook)(void);
+static void (*g_gfx_hook)(void);   // the graphics backend's part of a crash dump (crash_set_gfx_hook)
 static void (*g_wait_dump)(void);
 
 static uint64_t watch_now_ns(void) {
@@ -152,6 +153,8 @@ void dm_guest_write_prepare(void *addr, size_t len) { for (int i = 0; i < g_nwri
 static int (*g_trap_hook)(ucontext_t *uc);
 void crash_set_trap_hook(int (*fn)(ucontext_t *uc)) { g_trap_hook = fn; }
 void crash_set_dump_hook(void (*fn)(void)) { g_dump_hook = fn; }
+// The Android Vulkan backend lists the pipelines it is building (gfx_vk_draw.inc pb_dump): a crash in a driver's shader compiler (libllvm-qgl.so) said nothing of which one
+void crash_set_gfx_hook(void (*fn)(void)) { g_gfx_hook = fn; }
 void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
 void crash_dump_now(const char *why) { fprintf(stderr, "[dm] state dump (%s): tick %u / stage %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
@@ -187,10 +190,19 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     funlockfile(stderr);
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
     off("addr", (uint64_t)si->si_addr); off("pc", DM_SS(uc).__pc); off("lr", DM_SS(uc).__lr);
-    fprintf(stderr, " sp=%#llx\n", DM_SS(uc).__sp);
+    fprintf(stderr, " sp=%#llx", DM_SS(uc).__sp);
+    {   // the crashing thread by name: a crash in a host thread (the replay, its completion thread, a pipeline build) or a driver's own was told apart only by the stack
+        char tn[32] = ""; pthread_getname_np(pthread_self(), tn, sizeof tn);
+#if defined(__ANDROID__)
+        fprintf(stderr, " thread %d \"%s\"\n", (int)gettid(), tn);
+#else
+        fprintf(stderr, " thread \"%s\"\n", tn);
+#endif
+    }
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, DM_SS(uc).__x[i], i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
     dm_backtrace(DM_SS(uc).__fp);   // first: the most useful line, out before anything below can fail (an Android stack overflow lost everything after the registers)
+    if (g_gfx_hook) g_gfx_hook();   // next: what the graphics backend was building (a few lines, read from fixed slots)
     // What the registers point at: the first six words of each readable target (read with vm_read_overwrite, which fails instead of faulting); a word inside a module prints as a module offset, so an object's vtable names its class
     for (int i = 0; i < 29; i++) {
         uint64_t a = DM_SS(uc).__x[i], w[6]; vm_size_t got = 0;
