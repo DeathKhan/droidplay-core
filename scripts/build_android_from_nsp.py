@@ -488,7 +488,7 @@ def install(serial, apk, logs):   # an update (-r): the app's data, saves includ
     try: adb(serial, 'install', '-r', apk, log=logs / 'adb_install.log')
     except BuildError as e:
         if 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' in str(e):
-            raise BuildError(f'the nxnative app on the phone was signed with another key than {KEYSTORE}. Uninstalling it deletes its saves and game files: '
+            raise BuildError(f'the DroidPlay app ({PKG}) on the phone was signed with another key than {KEYSTORE}. Uninstalling it deletes its saves and game files: '
                              f'back up {REMOTE} and the saves first (the launcher\'s Back up saves), then uninstall it by hand and run this again') from e
         raise
 

@@ -644,7 +644,7 @@ class PhonesPage(QWidget):
         if r >= 0 and self.table.item(r, 0): self.win.set_serial(self.table.item(r, 0).text())
     def show_phone(self, pkg, games, legacy):
         self.ph.setText(self.win.phone_name() or 'No phone'); self.games.clear()
-        self.app.setText(('The nxnative app · ' + ' · '.join(x.strip() for x in pkg.splitlines())) if 'lastUpdateTime' in pkg else 'The nxnative app is not installed')
+        self.app.setText(('The DroidPlay app · ' + ' · '.join(x.strip() for x in pkg.splitlines())) if 'lastUpdateTime' in pkg else 'The DroidPlay app is not installed')
         for gid, meta in games.items():
             it = QListWidgetItem(f'{meta.get("name") or gid}     {gid} · {meta.get("display") or meta.get("version") or "?"}'); it.setData(Qt.UserRole, gid); self.games.addItem(it)
         if legacy: self.games.addItem('A one-game install (files/game, before the launcher): Move the old one-game install puts it in the launcher, its save copied over')

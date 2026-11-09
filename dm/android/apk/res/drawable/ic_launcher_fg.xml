@@ -1,9 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The app's mark (the adaptive icon's foreground, and its monochrome layer): two halves of a controller, one solid and one drawn, cream on ink as the desktop app's Play.
-     108 x 108 dp, the mark inside the 66 dp safe circle; Launcher.java Mark draws the same shapes -->
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#FDF3DC" android:pathData="M42,31 a10,10 0 0 1 10,10 v26 a10,10 0 0 1 -20,0 v-26 a10,10 0 0 1 10,-10 z"/>
-    <path android:fillColor="#0B0B0C" android:pathData="M42,38.8 a4.2,4.2 0 1 1 0,8.4 a4.2,4.2 0 1 1 0,-8.4 z"/>
-    <path android:fillColor="#00000000" android:strokeColor="#FDF3DC" android:strokeWidth="3" android:pathData="M66,32.5 a8.5,8.5 0 0 1 8.5,8.5 v26 a8.5,8.5 0 0 1 -17,0 v-26 a8.5,8.5 0 0 1 8.5,-8.5 z"/>
-    <path android:fillColor="#FDF3DC" android:pathData="M66,59.8 a4.2,4.2 0 1 1 0,8.4 a4.2,4.2 0 1 1 0,-8.4 z"/>
+<!-- The adaptive icon's foreground: DroidPlay's controller (the Joy-Cons, the plate between them and the play glyph), from the layers of DroidPlay's Mac icon
+     (droidplay App/AppIcon.icon) on their 1024-unit grid, scaled into the 108 dp icon so the Joy-Cons' rounded corners stay inside the 66 dp safe circle.
+     Launcher.java Mark and the desktop app's APP_SVG draw the same shapes -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <group android:pivotX="512" android:pivotY="512" android:scaleX="0.1144" android:scaleY="0.1144" android:translateX="-458" android:translateY="-458">
+        <path android:fillColor="#FF3A3F4B" android:strokeColor="#FF4A505E" android:strokeWidth="4"
+            android:pathData="M439,334 h146 a26,26 0 0 1 26,26 v304 a26,26 0 0 1 -26,26 h-146 a26,26 0 0 1 -26,-26 v-304 a26,26 0 0 1 26,-26 z"/>
+        <path android:fillColor="#FF00B8D9" android:pathData="M415,322 L415,702 L335,702 A80,80 0 0 1 255,622 L255,402 A80,80 0 0 1 335,322 Z"/>
+        <path android:fillColor="#FF0A5F70"
+            android:pathData="M299,432 a36,36 0 1 0 72,0 a36,36 0 1 0 -72,0 z M320,556 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M320,624 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M286,590 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M354,590 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z"/>
+        <path android:fillColor="#FFFF4F5E" android:pathData="M609,322 L689,322 A80,80 0 0 1 769,402 L769,622 A80,80 0 0 1 689,702 L609,702 Z"/>
+        <path android:fillColor="#FF8A1D27"
+            android:pathData="M674,398 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M674,466 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M640,432 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M708,432 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M653,590 a36,36 0 1 0 72,0 a36,36 0 1 0 -72,0 z"/>
+        <path android:fillColor="#FFFFFFFF" android:strokeColor="#FFFFFFFF" android:strokeWidth="26" android:strokeLineJoin="round" android:pathData="M490,476 L490,548 L550,512 Z"/>
+    </group>
 </vector>
