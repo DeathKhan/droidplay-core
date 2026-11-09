@@ -1,5 +1,6 @@
 """DroidPlay for Windows' first run, as the desktop app (scripts/nxnative_android.py) shows it, from its Qt-free helpers in dm/android/desktop: the "Get started"
-checklist's four steps worked out from what the computer has (first_run.py), and Install tools' one bar across --setup's stages. No PySide6, phone or network needed."""
+checklist's four steps worked out from what the computer has (first_run.py), Install tools' one bar across --setup's stages, and plain words for what went wrong
+with the report for #help (explain.py), matched against the packing script's, nx_extract's and adb's own messages. No PySide6, phone or network needed."""
 from pathlib import Path
 import shutil
 import sys
@@ -9,6 +10,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'dm/android/desktop'))
 import first_run as fr   # noqa: E402  # pyright: ignore[reportMissingImports]  (dm/android/desktop, put on the path above)
+import explain as ex   # noqa: E402  # pyright: ignore[reportMissingImports]
 
 ROWS_OK = [{'name': n, 'ok': True, 'detail': '', 'fix': ''} for n in ('Python module lz4', '.NET SDK 10', 'Android SDK', 'NDK', 'CMake', 'build-tools 36.0.0',
                                                                        'platform android-35', 'adb', 'JDK keytool', 'JDK javac', 'signing key', 'game hosts')]
@@ -160,6 +162,92 @@ class Count(unittest.TestCase):
     def test_counts_the_done_steps(self):
         steps = [fr.keys_step(''), fr.tools_step(rows(), True), fr.phone_step([], True, seen=True), fr.game_step([], [], False)]
         self.assertEqual(fr.ready_count(steps), 2)
+
+
+
+class Explain(unittest.TestCase):   # the messages as the script, nx_extract and adb print them; each gets a title, what to do and its button
+    def test_phone_full_names_the_sizes(self):
+        h = ex.explain('the phone has 2.1 GB free: the RomFS image needs 4.7 GB, plus 268 MB left free for Android and the app. Free up 2.9 GB on the phone, then install again',
+                       phone='Galaxy S25 Edge', game='Pokémon Brilliant Diamond')
+        self.assertEqual((h.title, h.action), ('Not enough space on Galaxy S25 Edge', 'retry'))
+        self.assertIn('needs 4.7 GB and Galaxy S25 Edge has 2.1 GB free. Free up 2.9 GB', h.body)
+
+    def test_a_step_that_failed_on_a_nearly_full_phone(self):   # says_when_phone_full's line under a step that printed nothing
+        h = ex.explain('adb -s X shell sh /data/local/tmp/nxnative_mkdirs.sh failed (exit status 1): no output\nThe phone has only 310 MB free, which is likely why: free up space')
+        self.assertTrue(h.title.startswith('Not enough space on')); self.assertIn('310 MB', h.body)
+
+    def test_adb_no_space_is_the_phones_and_oserror_the_pcs(self):
+        self.assertIn('your phone', ex.explain('adb -s X push a b failed (exit status 1): adb: error: failed to copy: No space left on device').title)
+        self.assertEqual(ex.explain("[Errno 28] No space left on device: 'D:\\BD\\x'", folder='D:\\Games\\BD').title, 'Not enough space on this PC')
+
+    def test_pc_full_names_the_drive(self):
+        h = ex.explain('less than 12 GB free on the volume of D:\\Games\\BD\\0100000011D90000_build', game='Pokémon Brilliant Diamond')
+        self.assertEqual((h.title, h.action), ('Not enough space on this PC', 'folder')); self.assertIn('about 12 GB free on drive D:', h.body)
+
+    def test_unauthorized_asks_for_allow(self):
+        for t in ('0 adb devices ready (R5C0 (unauthorized)): connect one, or pick it with --serial', 'adb: device unauthorized.'):
+            h = ex.explain(t, phone='Galaxy S25 Edge'); self.assertEqual((h.title, h.action), ("Galaxy S25 Edge hasn't allowed this PC yet", 'phone'))
+
+    def test_a_web_servers_401_isnt_the_phone(self):
+        self.assertEqual(ex.explain('<urlopen error HTTP Error 401: Unauthorized>', setup=True).title, 'The download stopped')
+
+    def test_offline_and_unplugged_mid_copy(self):
+        for t in ("adb: device offline", "adb: error: device 'R5C0' not found", 'adb -s R5C0 push x y failed (exit status 255): no output', 'error: no devices/emulators found'):
+            self.assertEqual(ex.explain(t).title, 'Your phone stopped answering', t)
+
+    def test_no_phone(self):
+        h = ex.explain('0 adb devices ready (none): connect one, or pick it with --serial')
+        self.assertEqual((h.title, h.label), ('No phone connected', 'Set up my phone…'))
+
+    def test_keys(self):
+        self.assertEqual(ex.explain('give -k <prod.keys>: the game is in NSP / XCI files, which are encrypted').action, 'keys')
+        h = ex.explain('[RED] BD.nsp: prod.keys has no titlekek_13 (master key 13, which came with firmware 17.0.0): the keys are older than the game; dump prod.keys again')
+        self.assertEqual(h.title, 'Your keys are older than this game'); self.assertIn('firmware 17.0.0 or later', h.body)
+
+    def test_no_ticket(self):
+        h = ex.explain('BD.nsp: no title key for rights ID 0100000011d90000000000000000000d: the package has no common ticket for it')
+        self.assertEqual((h.title, h.action), ("This game file can't be opened with your keys", ''))
+
+    def test_tools_missing_isnt_called_unsupported(self):
+        h = ex.explain("reading the packages' titles and versions needs dotnet (.NET SDK 10), which the extraction needs too")
+        self.assertEqual((h.title, h.action), ('Install the tools first', 'tools'))
+
+    def test_install_blocks(self):
+        self.assertEqual(ex.explain('adb: failed to install x.apk: Failure [INSTALL_FAILED_USER_RESTRICTED: Install canceled by user]').title, 'Your Xiaomi phone blocked the install')
+        self.assertEqual(ex.explain('the DroidPlay app (org.nxnative.android) on the phone was signed with another key than ~/.android/nxnative-debug.jks').action, 'backup')
+
+    def test_setup_downloads(self):
+        self.assertEqual(ex.explain('<urlopen error [Errno 11001] getaddrinfo failed>', setup=True).body, 'Check your internet connection, then Install tools again.')
+        self.assertEqual(ex.explain('the JDK: the download does not match its sha256 (https://aka.ms/x)', setup=True).title, 'The download came through damaged')
+
+    def test_anything_else_is_a_bug_with_the_plain_stage(self):
+        h = ex.explain('patch_nso.py exit code 1 on subsdk0 (full output: x)', stage='rewrite')
+        self.assertTrue(h.bug); self.assertEqual(h.title, 'The build stopped at "Adapting the game\'s code for Android"'); self.assertIn('#help', h.body)
+        self.assertEqual(ex.explain('boom', stage='extract v393216').title, 'The build stopped at "Reading the game files"')
+        self.assertEqual(ex.explain('boom', setup=True, stage='Android SDK packages').title, 'Installing the tools stopped at "Installing the Android SDK"')
+
+
+class Report(unittest.TestCase):   # Copy report: one Discord message, home folder as ~, never key material
+    INFO = {'version': '0.5.0', 'title': 'Build Pokémon Brilliant Diamond', 'stage': 'rewrite', 'k': 3, 'n': 8, 'game': 'Pokémon Brilliant Diamond',
+            'game_id': '0100000011D90000', 'game_version': '393216', 'phone': 'Galaxy S25 Edge', 'android': '16', 'gpu': 'Adreno (TM) 830'}
+
+    def test_fits_one_discord_message_however_long_the_log(self):
+        log = [f'C:\\Users\\andre\\games\\step {i} ' + 'x' * 150 for i in range(400)]
+        text = ex.markdown_report(self.INFO, ['[RED] patch_nso.py exit code 1 on subsdk0'] * 3 + ['[RED] ' + 'y' * 900], log, 'C:\\Users\\andre')
+        self.assertLess(len(text), ex.DISCORD_LIMIT)
+        self.assertIn('stopped at Adapting the game\'s code for Android (`rewrite`, stage 3 of 8)', text); self.assertIn('Adreno (TM) 830', text)
+        self.assertIn('step 399', text); self.assertNotIn('andre', text)
+
+    def test_key_lines_are_dropped(self):
+        text = ex.markdown_report(self.INFO, [], ['header_key = 0123456789abcdef0123456789abcdef0123456789abcdef', 'fine'], '/home/p')
+        self.assertNotIn('0123456789abcdef', text); self.assertIn('fine', text)
+
+    def test_the_phones_serial_stays_out(self):
+        text = ex.markdown_report(self.INFO, ['[RED] adb -s R5CY00000XX push a b failed (exit status 255): no output'], ['$ python b.py D:/BD -k k --serial R5CY00000XX'], '/home/p')
+        self.assertNotIn('R5CY00000XX', text); self.assertIn('adb -s <serial> push', text); self.assertIn('--serial <serial>', text)
+
+    def test_forward_slashed_home_is_redacted_too(self):
+        self.assertNotIn('andre', ex.full_report(self.INFO, 'C:/Users/andre/x.log failed', 'C:\\Users\\andre\\j.jsonl', 'C:\\Users\\andre'))
 
 
 if __name__ == '__main__':
