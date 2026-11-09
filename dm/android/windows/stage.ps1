@@ -31,7 +31,8 @@ Say 'core: the tree of HEAD without docs and .github'
 $core = Join-Path $Out 'core'; New-Item -ItemType Directory -Force $core | Out-Null
 Run git -C $Repo archive --format=tar -o (Join-Path $work 'core.tar') HEAD ':!docs' ':!.github'
 Run $Tar -xf (Join-Path $work 'core.tar') -C $core
-if (-not $Version) { $Version = (& git -C $Repo describe --tags --always).Trim() -replace '^v', '' }
+if (-not $Version) { $Version = (& git -C $Repo describe --tags --always).Trim() }
+$Version = $Version -replace '^v', ''   # a release's tag, v0.5.0, is version 0.5.0
 [IO.File]::WriteAllText((Join-Path $core 'VERSION'), "$Version`n")   # no BOM, \n: build_android_from_nsp.py core_version reads it as it is
 
 # ---- runtime: uv's Python, installed into a folder of this stage (not the user's), then copied whole: it is relocatable

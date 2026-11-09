@@ -127,14 +127,18 @@ modules the script names at its top; `python scripts/nxnative_android.py` works 
 
 **On Windows**, from nothing:
 
-1. Download **Install DroidPlay.cmd** from the [latest release](https://github.com/enjoyerofslop/droidplay-core/releases/latest) and double-click it (Windows warns
-   that it is from the internet and unsigned: **More info**, then **Run anyway**). It installs [uv](https://docs.astral.sh/uv/) for you, puts the newest release
-   in `%LOCALAPPDATA%\DroidPlay` with Python and the app's modules, adds DroidPlay to the Start menu and the desktop, and opens it. The release comes from its
-   assets (about 55 MB, or 90 MB where Windows' own tar can't read xz files, then about 150 MB of Python and modules the first time), and a download that is cut
-   off carries on from where it stopped when you run the installer again. Run it again to update, with DroidPlay closed (it stops if DroidPlay is open);
-   `Install DroidPlay.cmd uninstall` removes it (`dm/android/windows/install_droidplay.cmd` is the same file). Or by hand: install uv
-   (`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`), get DroidPlay Core (`git clone https://github.com/enjoyerofslop/droidplay-core`)
-   and, in its folder, `uv run scripts\nxnative_android.py`.
+1. Download **DroidPlay-Setup-&lt;version&gt;.exe** from the [latest release](https://github.com/enjoyerofslop/droidplay-core/releases/latest) and run it. Windows
+   warns that it comes from the internet and isn't signed: **More info**, then **Run anyway**.
+   - It installs DroidPlay for you only, in `%LOCALAPPDATA%\Programs\DroidPlay`, with no administrator prompt and nothing more to download: its own Python with
+     the app's modules, and DroidPlay Core (Setup is about 80 MB, 600 MB installed). Each Setup has a `.sha256` beside it on the release page.
+   - DroidPlay is then in the Start menu, on the desktop, and in **Settings › Apps**, which uninstalls it. Your games and their builds, the Android SDK, the
+     tools and your settings stay.
+   - DroidPlay says when a newer release is out, and **Update** installs it: DroidPlay downloads the new Setup, checks it against the release, runs it
+     and opens again. Or close DroidPlay and run the new Setup yourself.
+   - **Coming from Install DroidPlay.cmd?** Close DroidPlay and run Setup: it moves your DroidPlay over and removes the copy the .cmd installed, and keeps your
+     games, builds and settings. `Install DroidPlay.cmd uninstall` still removes such a copy by hand (`dm/android/windows/install_droidplay.cmd`).
+   - Or from source: install [uv](https://docs.astral.sh/uv/) (`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`), get
+     DroidPlay Core (`git clone https://github.com/enjoyerofslop/droidplay-core`) and, in its folder, `uv run scripts\nxnative_android.py`.
 2. In **Settings**, pick your `prod.keys`, then **Install what's missing**: it downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder
    (`%LOCALAPPDATA%\nxnative\android\tools`), and Google's Android SDK with the NDK, CMake, build-tools, platform and platform-tools into Android Studio's place,
    `%LOCALAPPDATA%\Android\Sdk` (about 1.5 GB to download, 5 GB installed). Installing the Android SDK means accepting its
