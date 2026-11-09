@@ -257,6 +257,8 @@ class Game:
         return max(0, (on_phone.get(self.id) or {}).get('captures', 0) - self.captures) if self.provisional else 0
     def status(self, on_phone, phone):   # (text, colour, state): state picks what Play does
         if self.info.get('needs_keys'): return 'Needs your prod.keys to read it: pick them in Settings', ERR, 'keys'
+        # not the game's fault: the tools that read it aren't installed yet. It showed as unreadable, with a disabled "Not supported", to every new player
+        if self.info.get('needs_tools'): return "Install DroidPlay's tools to read it: Settings › Install what's missing", BUILD, 'tools'
         if self.error: return f'Could not read the folder: {self.error}', ERR, 'none'
         if not self.profile: return 'No profile: experimental build only', ERR, 'survey'
         x = 'Experimental (provisional profile, may not boot) · ' if self.provisional else ''   # an experimental build's profile, guessed from the survey
@@ -402,7 +404,10 @@ class LibraryPage(QWidget):
                 try: out[f] = self.win.script_json('--info', f, *(['-k', keys] if keys else []))
                 except Exception as e:
                     msg = str(e).strip().splitlines()[-1].removeprefix('[RED] ') if str(e).strip() else 'could not be read'
-                    out[f] = {'error': msg, 'needs_keys': not keys and 'prod.keys' in msg, 'name': names.get(str(Path(f).resolve())) or Path(f).name}
+                    # no keys yet, or no tools yet: before Install what's missing has brought the .NET SDK, nothing can read the packages (build_ipa_from_nsp.py's
+                    # "needs dotnet"), and every game read as a folder that could not be read
+                    out[f] = {'error': msg, 'needs_keys': not keys and 'prod.keys' in msg, 'needs_tools': 'dotnet' in msg,
+                              'name': names.get(str(Path(f).resolve())) or Path(f).name}
             return out
         def got(r):
             self.reading = False
@@ -442,7 +447,7 @@ class LibraryPage(QWidget):
         text, color, state = g.status(self.win.phone_games, self.win.phone_name())
         self.hero.show_game(g, text, color); self.hero.opts.setEnabled(bool(g.profile))
         self.hero.play.setText({'play': '  Play', 'install': '  Install on phone', 'build': '  Build and install', 'survey': '  Experimental build', 'keys': '  Pick your prod.keys',
-                                'none': '  Not supported'}[state])
+                                'tools': '  Install the tools', 'none': "  Can't read it"}[state])
         self.hero.play.setEnabled(state != 'none')
     def current(self): return self.games.get(self.picked)
     def slide(self, d): sb = self.scroll.horizontalScrollBar(); sb.setValue(sb.value() + d * (Card.W + 20) * 2)
@@ -460,7 +465,7 @@ class LibraryPage(QWidget):
         if not g: return
         state = g.status(self.win.phone_games, self.win.phone_name())[2]
         s = self.win.serial()
-        if state == 'keys': self.win.go('settings'); return
+        if state in ('keys', 'tools'): self.win.go('settings'); return
         if state in ('play', 'install') and not s: self.win.toast('Connect a phone first (Phones)'); return
         if state == 'play':
             bg(lambda: adb_run(s, 'shell', 'am', 'start', '-n', f'{PKG}/.Launcher', '--es', 'game', g.id, '--ez', 'play', 'true'),
@@ -1001,7 +1006,7 @@ class SettingsPage(QWidget):
         go = b.addButton('Accept and install' if sdk else 'Install', QMessageBox.AcceptRole); b.setDefaultButton(QMessageBox.Cancel); b.exec()
         if b.clickedButton() is not go: return
         self.win.builds.start('Set up this computer', ['--setup'] + (['--accept-android-licenses'] if sdk else []),
-                              after=lambda: (ba.tool_paths(), self.run(), self.win.refresh_devices()))   # this app's PATH takes the new tools too (adb)
+                              after=lambda: (ba.tool_paths(), self.run(), self.win.refresh_devices(), self.win.library.reload()))   # this app's PATH takes the new tools too (adb and dotnet), and the games are read again with them
         self.win.go('builds')
 
 
