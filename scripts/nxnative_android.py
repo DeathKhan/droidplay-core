@@ -891,7 +891,10 @@ class PerformancePage(QWidget):
 class SettingsPage(QWidget):
     def __init__(self, win):
         super().__init__(); self.win = win; self.setObjectName('page')
-        lay = QVBoxLayout(self); lay.setContentsMargins(48, 32, 48, 24); lay.setSpacing(16)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); outer.addWidget(scroll)
+        inner = QWidget(); inner.setObjectName('page'); scroll.setWidget(inner)   # a low window scrolls the page: the table is as tall as its rows, with no scroller of its own
+        lay = QVBoxLayout(inner); lay.setContentsMargins(48, 32, 48, 24); lay.setSpacing(16)
         lay.addWidget(label('Settings', 'h1'))
         keys = QHBoxLayout(); keys.addWidget(label('Your prod.keys', 'meta')); self.keys = QLineEdit(win.st.value('keys', '')); self.keys.setPlaceholderText('the keys dumped from your Switch')
         self.keys.editingFinished.connect(lambda: self.set_keys(self.keys.text().strip())); keys.addWidget(self.keys, 1)
@@ -900,10 +903,17 @@ class SettingsPage(QWidget):
         head = QHBoxLayout(); head.addWidget(label('Requirements', 'h2')); head.addStretch(); b = QPushButton('Check again'); b.setObjectName('ghost'); b.clicked.connect(lambda *_: self.run()); head.addWidget(b)
         self.setup = QPushButton("Install what's missing"); self.setup.clicked.connect(self.install); self.setup.hide(); head.addWidget(self.setup); self.rows = []
         lay.addLayout(head)
-        lay.addWidget(label(f'The build runs with {PYTHON}: install missing Python modules into it.', 'muted', wrap=True))
+        self.summary = label('Checking what the build needs…', 'muted', wrap=True); lay.addWidget(self.summary)
         self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(['', 'What', 'Detail / how to get it']); self.table.verticalHeader().hide(); self.table.setShowGrid(False)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch); self.table.setColumnWidth(0, 36); self.table.setColumnWidth(1, 220); self.table.setWordWrap(True)
-        lay.addWidget(self.table, 1)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter); self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table.setSelectionMode(QTableWidget.NoSelection); self.table.setFocusPolicy(Qt.NoFocus)   # nothing to pick here, and a selected row lost its dot's colour
+        self.table.horizontalHeader().sectionResized.connect(lambda i, old, new: i == 2 and old != new and QTimer.singleShot(0, self.fit))
+        lay.addWidget(self.table); lay.addStretch(1)
+    def fit(self):   # the rows' heights at the table's width now: rows sized while the page was hidden wrapped at that narrower width and kept two lines
+        t = self.table; t.resizeRowsToContents()
+        t.setFixedHeight(t.horizontalHeader().height() + sum(t.rowHeight(i) for i in range(t.rowCount())) + 2 * t.frameWidth())
+    def showEvent(self, e): super().showEvent(e); QTimer.singleShot(0, self.fit)
     def pick_keys(self):
         f, _ = QFileDialog.getOpenFileName(self, 'Your prod.keys', '', 'Keys (*.keys);;All files (*)')
         if f: self.keys.setText(f); self.set_keys(f)
@@ -912,13 +922,24 @@ class SettingsPage(QWidget):
         self.win.st.setValue('keys', f); self.win.library.reload()
     def run(self, then=None):
         def got(rows):
-            if isinstance(rows, Exception): rows = [{'name': 'check', 'ok': False, 'detail': str(rows), 'fix': ''}]
-            self.table.setRowCount(len(rows))
-            for i, r in enumerate(rows):
+            failed = isinstance(rows, Exception)
+            if failed: rows = [{'name': 'check', 'ok': False, 'detail': str(rows), 'fix': ''}]
+            self.rows = rows; fixes = set(self.installable())
+            # what is missing first; the Python modules, which come with the app, in one row while they are all there. The fix of what Install what's missing
+            # gets is that button, above, rather than the console's --setup
+            missing = [dict(r, fix="Install what's missing gets it") if r['name'] in fixes else r for r in rows if not r['ok']]
+            found = [r for r in rows if r['ok'] and not r['name'].startswith('Python')]
+            py = [r for r in rows if r['ok'] and r['name'].startswith('Python')]
+            if py: found.insert(0, {'name': 'Python modules', 'ok': True, 'detail': ', '.join(r['name'].split()[-1] for r in py), 'fix': '', 'tip': py[0]['detail']})
+            shown = missing + found; self.table.setRowCount(len(shown))
+            for i, r in enumerate(shown):
                 mark = QTableWidgetItem('●'); mark.setForeground(QColor(READY if r['ok'] else ERR)); mark.setTextAlignment(Qt.AlignCenter); self.table.setItem(i, 0, mark)
-                self.table.setItem(i, 1, QTableWidgetItem(r['name'])); self.table.setItem(i, 2, QTableWidgetItem(r['detail'] + (f'\n→ {r["fix"]}' if r['fix'] else '')))
-            self.table.resizeRowsToContents()
-            self.rows = rows; self.setup.setVisible(bool(self.installable()))
+                detail = QTableWidgetItem(r['detail'] + (f'\n→ {r["fix"]}' if r['fix'] else '')); detail.setToolTip(r.get('tip') or '')
+                self.table.setItem(i, 1, QTableWidgetItem(r['name'])); self.table.setItem(i, 2, detail)
+            n, it = len(missing), 'it' if len(missing) == 1 else 'them'
+            self.summary.setText('Could not check what the build needs:' if failed else 'Everything the build needs is on this computer.' if not n else
+                                 f"{n} missing: Install what's missing gets {it}." if len(fixes) == n else f'{n} missing: the rows below say how to get {it}.')
+            self.fit(); self.setup.setVisible(bool(fixes))
             if then: then(rows)
         bg(lambda: self.win.script_json('--check'), got)
     def installable(self):   # the failing rows --setup installs: Windows only so far, and not the Python modules (uv run brings those, or pip)
