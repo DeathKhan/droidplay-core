@@ -47,6 +47,11 @@ class Json(unittest.TestCase):
         self.assertEqual(t[GID]['graphics'], 'NVN')
         self.assertTrue(all(len(k) == 16 for k in t))
 
+    def test_games_played_on_android_have_profiles(self):   # a mistyped title ID would leave its game shown as not played on Android
+        t = ba.games_table()
+        self.assertTrue(ba.ANDROID_TESTED)
+        self.assertEqual(sorted(g for g in ba.ANDROID_TESTED if g not in t), [])
+
 
 class Windows(unittest.TestCase):
     def test_loads_where_python_has_no_fcntl(self):   # Windows: build_ipa_from_nsp.py loads tree_tar.py, which imports fcntl; dm/android/tools/compat's stand-in is found

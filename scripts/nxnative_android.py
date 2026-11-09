@@ -284,7 +284,7 @@ class Hero(QWidget):   # the picked game, large: its art's wash behind, the art 
         self.status.setText(f'<span style="color:{color}">●&nbsp;&nbsp;{esc(status.upper())}</span>' if g else '')
         self.title.setText(esc(g.name) if g else 'Add your first game')
         if g:
-            bits = [g.id, f'v{g.display}' if g.display else None, (g.info.get('table') or {}).get('engine'), 'played on Android' if g.tested else 'not tested on Android yet']
+            bits = [g.id, f'v{g.display}' if g.display else None, (g.info.get('table') or {}).get('engine'), 'played on Android' if g.tested else 'not played on Android yet']
             self.meta.setText('   ·   '.join(b for b in bits if b))
         else: self.meta.setText('Pick the folder with your game\'s NSP files and your prod.keys: + Build game, at the top right')
         self.update()
