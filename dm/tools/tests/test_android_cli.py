@@ -320,7 +320,7 @@ class Phone(Base):
         self.assertEqual(len(sent), 3)   # the first piece once, then the two left
         self.assertTrue(any('going on from there' in s for s in self.said), self.said)
 
-    def test_folder_script_stops_at_the_first_failure_and_must_finish(self):   # droidnative issue #37: "nxnative_mkdirs.sh failed:" and nothing after it
+    def test_folder_script_stops_at_the_first_failure_and_must_finish(self):   # droidplay-core issue #37: "nxnative_mkdirs.sh failed:" and nothing after it
         self.push()
         script = (self.tmp / 'logs' / 'push_S/adb_push_font.mkdirs.sh').read_text(encoding='utf-8').splitlines()
         self.assertEqual(script[0], 'set -e'); self.assertEqual(script[-1], f'echo {ba.MKDIRS_DONE}')

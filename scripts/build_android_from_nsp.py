@@ -371,7 +371,7 @@ def adb(serial, *a, log=None, check=True):
     cmd = ['adb'] + (['-s', serial] if serial else []) + [str(x) for x in a]
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', env=dict(os.environ, MSYS_NO_PATHCONV='1'))
     if log: log.write_text(r.stdout + r.stderr)
-    # the exit status too: a step that printed nothing left only "failed:" (droidnative issue #37), with no way to tell a missing program (127), adb losing the phone (255)
+    # the exit status too: a step that printed nothing left only "failed:" (droidplay-core issue #37), with no way to tell a missing program (127), adb losing the phone (255)
     # and a command that failed (1)
     if r.returncode and check:
         out = (r.stdout + r.stderr).strip()
@@ -394,7 +394,7 @@ def remote_size(serial, f):
     return int(n) if n.isdigit() else None
 
 
-# A phone that fills up in the middle of an install fails at whatever step comes next, often with nothing printed (droidnative issue #37: the folder script, after an install
+# A phone that fills up in the middle of an install fails at whatever step comes next, often with nothing printed (droidplay-core issue #37: the folder script, after an install
 # that ran out of room). The large copies check the room first, and a failed install on a nearly full phone says how full it is
 ROOM_SPARE = 256 << 20   # left free besides a copy's own bytes: Android, the app's saves and its log need room too
 LOW_ROOM = 1 << 30       # a failed install on a phone with less than this free names the free space as the likely cause
