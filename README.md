@@ -184,8 +184,8 @@ names the driver that runs: `[vk] driver: … (DM_VK_DRIVER, through libadrenoto
 minute to the first frame, and it stutters until they are built), and the system driver's cache is still there afterwards.
 
 Whether a driver helps depends on the game and the device. With Mr. Purple's T30, Super Mario Odyssey's opening runs at 60 fps on an Odin 2 (as on its own driver)
-and at 40 fps on a Retroid Pocket 5 (38 on its own); Pokémon Brilliant Diamond, which crashes on the Retroid Pocket 5's own driver, runs there on Turnip, but slowly
-(11 fps), and on an Odin 2 it drops from 60 fps to 20.
+and at 40 fps on a Retroid Pocket 5 (38 on its own); Pokémon Brilliant Diamond, which crashes on the Retroid Pocket 5's own driver, runs there on Turnip at 25 fps,
+and at 60 fps on an Odin 2, as on its own driver.
 
 ## Packing from the command line
 

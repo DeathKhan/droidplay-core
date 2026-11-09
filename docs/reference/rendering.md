@@ -1656,6 +1656,22 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** the range is taken from the indices as they are written; storage buffer snapshots are copied from guest memory, not from the arena.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): 78 → 27 ms of replay CPU a frame in a level.
 
+### Storage buffer write-backs read from cached memory on Vulkan
+
+- **Symptom:** Android only, on Mesa's Turnip: a third of the phone's own driver's frame rate with a faster GPU, and the `vk-done` thread busy in `top -H`.
+  The game writes storage buffers from its shaders. `NVN submit+present` in the `timing up to frame` lines is most of the frame, `vk-done` is on a CPU nearly all
+  the time, and the replay thread sleeps in `cur()`, waiting for a free chunk.
+- **Cause:** the arena took the first host-visible coherent memory type. A storage buffer or buffer image a shader writes lives in the arena, and the completion thread
+  reads it back to copy the bytes the GPU changed into guest memory (`chunk_done` → `wb_apply`, compared with its snapshot a byte at a time where a word differs). Qualcomm's
+  driver on an Ayn Odin 2 offers the arena's buffers a single host-visible type, cached and coherent (types 0 and 6, flags `0x1` and `0xf`); Turnip lists a write-combined
+  type first (types 0 to 2: `0x7`, then `0xf`), so every read of the write-backs went to DRAM, the completion thread fell behind, and all four chunks stayed in flight.
+- **Fix:** `ar_mem_type` (`gfx_vk_draw.inc`) prefers a host-visible, coherent and cached type for the arena, as staging does, and falls back to the first host-visible
+  coherent one; the log names the type (`[vk] arena: memory type`). `DM_VK_ARENA_CACHED=0` takes the first host-visible coherent type, as before.
+- **Check:** Pokémon Brilliant Diamond's `eterna` route (`scripts/bench_android.py`) on an Ayn Odin 2 with Mr. Purple's Turnip T30 (`DM_VK_DRIVER`): 20.4 and
+  21.0 fps before (submit+present p50 about 44 ms, 19 command buffers a frame, `vk-done` 78% of a CPU; simpleperf: 37 ms a frame in `wb_apply` and its `memcpy`),
+  60.0 fps after (submit+present 13.4 ms, `vk-done` 27%), GPU time 6.1 → 5.9 ms. On the system driver both settings take type 6: 60.0 fps either way.
+- **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md).
+
 ### Linear render targets written back to guest memory
 
 - **Symptom:** Android only: what a game reads on the CPU from textures it draws into is zeros or stale. Breath of the Wild: Link sinks into grass up to his knees while he stands still, and the grass presses in a pass dump carry the presser's world height (`c3[3].z` about 200–270 instead of below 1) with a flat slope.
