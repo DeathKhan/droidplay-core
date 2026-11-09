@@ -123,10 +123,13 @@ modules the script names at its top; `python scripts/nxnative_android.py` works 
 
 **On Windows**, from nothing:
 
-1. Install uv, in PowerShell: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
-2. Get droidnative: `git clone https://github.com/enjoyerofslop/droidnative` (or download it as a ZIP from GitHub and unpack it).
-3. In its folder: `uv run scripts\nxnative_android.py`
-4. In **Settings**, pick your `prod.keys`, then **Install what's missing**: it downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder
+1. Download **Install DroidPlay.cmd** from the [latest release](https://github.com/enjoyerofslop/droidnative/releases/latest) and double-click it (Windows warns
+   that it is from the internet and unsigned: **More info**, then **Run anyway**). It installs [uv](https://docs.astral.sh/uv/) for you, puts the newest release
+   in `%LOCALAPPDATA%\DroidPlay` with Python and the app's modules, adds DroidPlay to the Start menu and the desktop, and opens it. Run it again to update;
+   `Install DroidPlay.cmd uninstall` removes it (`dm/android/windows/install_droidplay.cmd` is the same file). Or by hand: install uv
+   (`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`), get droidnative (`git clone https://github.com/enjoyerofslop/droidnative`)
+   and, in its folder, `uv run scripts\nxnative_android.py`.
+2. In **Settings**, pick your `prod.keys`, then **Install what's missing**: it downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder
    (`%LOCALAPPDATA%\nxnative\android\tools`), and Google's Android SDK with the NDK, CMake, build-tools, platform and platform-tools into Android Studio's place,
    `%LOCALAPPDATA%\Android\Sdk` (about 1.5 GB to download, 5 GB installed). Installing the Android SDK means accepting its
    [license](https://developer.android.com/studio/terms), which the app asks first; its usage metrics stay off. What the computer already has is kept.

@@ -1,0 +1,2 @@
+# The Windows installer is a batch file, which cmd.exe reads correctly only with CRLF line endings (a label or goto can go astray with LF alone)
+*.cmd text eol=crlf
