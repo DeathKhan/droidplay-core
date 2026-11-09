@@ -70,6 +70,11 @@ class Windows(unittest.TestCase):
         self.assertEqual(Path(where), REPO / 'dm/android/tools/compat/fcntl.py')
         self.assertEqual(lock, 'no lock')
 
+    def test_packages_are_read_with_this_scripts_nx_extract(self):   # build_ipa_from_nsp.py's package_reader builds its own, which looked for nx_extract, not Windows' nx_extract.exe
+        with mock.patch.object(ba, 'build_nx_extract', return_value='nx') as built:
+            self.assertEqual(ba.bi.build_nx_extract(REPO, Path('work'), Path('logs'), {}), 'nx')
+        built.assert_called_once_with(Path('work'), Path('logs'), {})
+
     def test_game_app_stage_without_symbolic_links(self):   # Windows makes them only with Developer Mode on (or as administrator): the stage takes the files instead
         tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp)
         spv = tmp / 'spv'; (spv / 'vs').mkdir(parents=True); (spv / 'vs' / '0001.spv').write_bytes(b'spv'); (tmp / 'icon.jpg').write_bytes(b'jpg')
