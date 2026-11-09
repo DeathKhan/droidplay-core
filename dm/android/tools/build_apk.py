@@ -2,7 +2,9 @@
 # from dm/android/java (javac, then d8), the self test in assets/selftest (the synthetic module of dm/android/tests/selftest_nso.py, rewritten with DM_TARGET=android),
 # page-aligned by zipalign, signed by apksigner.
 # Usage: build_apk.py --sdk <Android SDK> --loader <libnxloader.so> --so <libdmhost_<id>.so> [--so ...] --selftest <folder of main.patched.bin, main.fixups.tsv, ...>
-#   [--demo <folder>] --keystore <.jks> -o <out.apk> [--label <app name>] [--icon <icon.jpg or .png>] [--build-tools 36.0.0] [--platform android-35]
+#   [--lib <lib*.so> ...] [--demo <folder>] --keystore <.jks> -o <out.apk> [--label <app name>] [--icon <icon.jpg or .png>] [--build-tools 36.0.0] [--platform android-35]
+# --lib: another library for lib/arm64-v8a/, in either kind of app: libadrenotools.so and its hooks libhook_impl.so and libmain_hook.so, which DM_VK_DRIVER opens a Vulkan
+#   driver of the player's through (dm/android/vk_driver.c)
 # The app is "DroidPlay" (package org.nxnative.android) with DroidPlay's adaptive icon in apk/res: its launcher shows the games' own icons and names. --label and
 # --icon name it otherwise.
 # A game app instead: build_apk.py --sdk <SDK> --game-app <title ID> --so libdmhost_<title ID>.so --game-dir <folder> [--romfs <RomFS.img>] --keystore <.jks> -o <out.apk>
@@ -28,6 +30,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--sdk', required=True); ap.add_argument('--selftest', help='the self test module (the launcher app; not a game app)')
     ap.add_argument('--so', action='append', required=True, help='a game host, libdmhost_<title ID>.so (once per game)'); ap.add_argument('--loader', help='libnxloader.so (the launcher app; not a game app)')
+    ap.add_argument('--lib', action='append', default=[], help='another native library for lib/arm64-v8a/ (libadrenotools.so and its hooks)')
     ap.add_argument('--game-app', metavar='TITLE_ID', help='a game app: that game alone, entered through GameStart (its host is the one --so)')
     ap.add_argument('--game-dir', help="a game app's files, the launcher's games/<title ID>/ layout, for assets/game/"); ap.add_argument('--romfs', help="a game app's RomFS image, stored in assets/game/")
     ap.add_argument('--demo', help='folder for assets/demo: the synthetic shaders and their SPIR-V (tests/synth_shaders.py, tools/spv_android.py)')
@@ -38,6 +41,9 @@ def main():
     for so in a.so:
         n = os.path.basename(so)
         if not (n.startswith('libdmhost_') and n.endswith('.so')): sys.exit(f'--so must be a game host named libdmhost_<title ID>.so: {so}')
+    for lib in a.lib:
+        n = os.path.basename(lib)
+        if not (n.startswith('lib') and n.endswith('.so')) or n.startswith('libdmhost_') or n == 'libnxloader.so': sys.exit(f'--lib takes another lib<name>.so than a host or the loader: {lib}')
     if a.game_app:
         if len(set(a.so)) != 1 or os.path.basename(a.so[0]) != f'libdmhost_{a.game_app.upper()}.so': sys.exit(f'--game-app {a.game_app} takes one --so, libdmhost_{a.game_app.upper()}.so')
         if not a.game_dir or not os.path.isfile(os.path.join(a.game_dir, 'game.json')): sys.exit('--game-app needs --game-dir with the game\'s files (game.json among them)')
@@ -80,6 +86,7 @@ def main():
                 z.write(os.path.join(d, 'classes.dex'), 'classes.dex')
                 if a.loader: z.write(a.loader, 'lib/arm64-v8a/libnxloader.so')
                 for so in sorted(set(a.so)): z.write(so, f'lib/arm64-v8a/{os.path.basename(so)}')
+                for lib in sorted(set(a.lib), key=os.path.basename): z.write(lib, f'lib/arm64-v8a/{os.path.basename(lib)}')
                 if a.selftest:
                     n = 0
                     for f in sorted(os.listdir(a.selftest)):

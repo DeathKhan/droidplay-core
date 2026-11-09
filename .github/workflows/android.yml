@@ -45,13 +45,13 @@ jobs:
           sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           (yes || true) | "$sdk" --licenses > /dev/null   # yes ends on a broken pipe once the licences are taken, which pipefail would count as a failure
           "$sdk" --install "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" > /dev/null
-      - name: Build the Android host (the game library, the command-line host and the loader)
+      - name: Build the Android host (the game library, the command-line host, the loader and libadrenotools with its hooks)
         run: |
           CM="$ANDROID_HOME/cmake/$CMAKE_VERSION/bin"
           "$CM/cmake" -G Ninja -S dm/android -B build -DCMAKE_MAKE_PROGRAM="$CM/ninja" \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DGAME="$GAME" -DPython3_EXECUTABLE="$(command -v python)"
-          "$CM/ninja" -C build dmhost_app dmhost_cli nxloader
+          "$CM/ninja" -C build dmhost_app dmhost_cli nxloader adrenotools hook_impl main_hook
       - name: Packing and RomFS image tests
         working-directory: dm/tools/tests
         # test_romfs_image compiles its C with `cc`, Apple's clang where nxnative runs it; Ubuntu's cc is gcc, whose -Wmisleading-indentation (an error under the
@@ -60,13 +60,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/cc" && ln -sf "$(command -v clang)" "$RUNNER_TEMP/cc/cc"
           PATH="$RUNNER_TEMP/cc:$PATH" python -m unittest -v test_android_cli test_romfs_image
 
-  # The same host build and packing tests on Windows. Python 3.15, whose UTF-8 mode is on by default: nxnative's scripts read and write text without naming UTF-8, which
-  # an older Python on Windows takes as the system's code page. test_romfs_image stays on Linux: it compiles C with cc and runs xattr and bash, which packing on
-  # Windows does not use. The runner is an administrator, so it makes symbolic links that a player's Windows refuses (test_android_cli's Windows tests cover those).
+  # The same host build and packing tests on Windows, set up as a player's PC is (README, What you need): Python 3.14, since lz4 has no Windows wheel for 3.15 and a
+  # player's PC has no compiler to build it, with UTF-8 mode on, since nxnative's scripts read and write text without naming UTF-8, which Python on Windows otherwise
+  # takes as the system's code page. test_romfs_image stays on Linux: it compiles C with cc and runs xattr and bash, which packing on Windows does not use. The runner
+  # is an administrator, so it makes symbolic links that a player's Windows refuses (test_android_cli's Windows tests cover those).
   windows:
     name: Android host build and packing tests (Windows)
     runs-on: windows-2025
     timeout-minutes: 40
+    env:
+      PYTHONUTF8: '1'
     defaults:
       run:
         shell: pwsh
@@ -76,7 +79,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.15'
+          python-version: '3.14'
       - name: Python modules the packing script imports
         run: python -m pip install lz4 capstone fonttools
       - name: NDK and CMake
@@ -85,7 +88,7 @@ jobs:
           1..50 | ForEach-Object { 'y' } | & $sdk --licenses | Out-Null
           & $sdk --install "ndk;$env:NDK_VERSION" "cmake;$env:CMAKE_VERSION" | Out-Null
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Build the Android host (the game library, the command-line host and the loader)
+      - name: Build the Android host (the game library, the command-line host, the loader and libadrenotools with its hooks)
         run: |
           $sdk = $env:ANDROID_HOME -replace '\\', '/'   # CMake takes forward slashes
           $cm = "$sdk/cmake/$env:CMAKE_VERSION/bin"
@@ -94,7 +97,7 @@ jobs:
             "-DCMAKE_TOOLCHAIN_FILE=$sdk/ndk/$env:NDK_VERSION/build/cmake/android.toolchain.cmake" `
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 "-DGAME=$env:GAME" "-DPython3_EXECUTABLE=$py"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & "$cm/ninja.exe" -C build dmhost_app dmhost_cli nxloader
+          & "$cm/ninja.exe" -C build dmhost_app dmhost_cli nxloader adrenotools hook_impl main_hook
       - name: Packing tests
         working-directory: dm/tools/tests
         run: python -m unittest -v test_android_cli

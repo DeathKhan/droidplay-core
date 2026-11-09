@@ -25,7 +25,8 @@ maintainer's choice: Android work belongs here, not there. Everything below the 
   XAPK for an installer app). See [DroidPlay](https://github.com/enjoyerofslop/droidplay).
 - **The command line, any computer:** [Packing from the command line](#packing-from-the-command-line). `--game-apk` makes a game app; without it the game goes into
   the launcher app on a connected device.
-- **The desktop app** (`python scripts/nxnative_android.py`, Windows, macOS or Linux): the launcher-app flow with a window ([below](#the-desktop-app)).
+- **DroidPlay for Windows and Linux**, the desktop app (`python scripts/nxnative_android.py`; it runs on a Mac too): the launcher-app flow with a window
+  ([below](#the-desktop-app)). It has DroidPlay's name and icon, but it is a separate app from DroidPlay on a Mac.
 
 <!-- The "status" anchor keeps links made before the rename working: DroidPlay's README links to #status. -->
 ## <a id="status"></a>Game Status
@@ -110,13 +111,26 @@ game keeps the first one in the app. Game files (code, shaders, RomFS, icon) liv
 - **On the computer:** Python 3.12 or newer with `lz4`, `capstone`, `fonttools` and `backports.zstd` (not needed on Python 3.14), plus `PySide6` for the desktop app:
   `pip install lz4 capstone fonttools backports.zstd PySide6`. The .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (set `ANDROID_HOME` or pass
   `--sdk`), `adb`, and a JDK (for `keytool` and `javac`). The desktop app's **Settings** page checks all of this and says how to get what is missing.
-  On Windows, use Python 3.15 or newer, which reads and writes text as UTF-8 as the scripts expect (with an older one, set `PYTHONUTF8=1`).
+  On Windows, use Python 3.14 and set `PYTHONUTF8=1` for the command line (the desktop app sets it for what it runs): the scripts read and write text as UTF-8,
+  which Python on Windows does by default only from 3.15, and lz4 has no Windows build for 3.15 yet.
 - **On the phone:** USB debugging (or wireless debugging) turned on, so that `adb devices` lists the phone, and room for the game: its RomFS is copied as one image
   (Danganronpa V3's is 6.7 GB).
 
 ## The desktop app
 
-`python scripts/nxnative_android.py` opens a window that drives the packing script and adb for you:
+`uv run scripts/nxnative_android.py` opens a window that drives the packing script and adb for you ([uv](https://docs.astral.sh/uv/) brings Python and the
+modules the script names at its top; `python scripts/nxnative_android.py` works too, with them installed).
+
+**On Windows**, from nothing:
+
+1. Install uv, in PowerShell: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+2. Get droidnative: `git clone https://github.com/enjoyerofslop/droidnative` (or download it as a ZIP from GitHub and unpack it).
+3. In its folder: `uv run scripts\nxnative_android.py`
+4. In **Settings**, pick your `prod.keys`, then **Install what's missing**: it downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder
+   (`%LOCALAPPDATA%\nxnative\android\tools`), and Google's Android SDK with the NDK, CMake, build-tools, platform and platform-tools into Android Studio's place,
+   `%LOCALAPPDATA%\Android\Sdk` (about 1.5 GB to download, 5 GB installed). Installing the Android SDK means accepting its
+   [license](https://developer.android.com/studio/terms), which the app asks first; its usage metrics stay off. What the computer already has is kept.
+   From a console: `build_android_from_nsp.py --setup --accept-android-licenses`.
 
 - **Library:** the games you added (**+ Build game** picks a folder with a game's NSP files), each with its box art, version and status on the phone picked at the top.
   The big button does what comes next: **Build and install**, **Install on phone** (a game built before, without building again) or **Play**. **Manage** has the rest:
@@ -125,7 +139,7 @@ game keeps the first one in the app. Game files (code, shaders, RomFS, icon) liv
 - **Builds:** the running build's stages, progress and messages (the bar at the bottom of every page follows it); a build started from a console shows here too.
 - **Phones:** adb devices over USB and Wi-Fi (pair, connect, discover), the app version and the games on each phone, saves backed up to the computer.
 - **Performance:** the game's log from `adb logcat`, with the frame time, GPU and CPU figures the host prints, and a frame's GPU time per pass.
-- **Settings:** your `prod.keys`, and the requirements above with how to install what is missing.
+- **Settings:** your `prod.keys`, and the requirements above with how to install what is missing (on Windows, **Install what's missing** does it).
 
 A rebuild only does what changed: the extraction, the rewritten code and the translated shaders are reused when their inputs are the same, and the RomFS image is not
 copied to the phone again when the phone already holds the same one.
@@ -142,6 +156,27 @@ copied to the phone again when the phone already holds the same one.
   it, and picking another game asks before closing the running one.
 - **Saves** stay in the app's internal storage (`saves/<title ID>`), so updating the app keeps them; the desktop app backs them up to the computer. The log is
   `Android/data/org.nxnative.android/files/log.txt` (also `adb logcat -s nxnative`).
+
+## Another Vulkan driver (Turnip)
+
+On a phone with an Adreno GPU, a game can run on a Vulkan driver you put on the phone instead of the system's, as in Switch emulators: usually a build of Mesa's
+open-source Turnip driver, such as [Mr. Purple's](https://github.com/MrPurple666/purple-turnip/releases). The app carries what loads it
+([libadrenotools](dm/third_party/libadrenotools/README.md)), so trying one needs no new build:
+
+1. Unzip the driver package (`turnip_mrpurple_T30-toasted.adpkg.zip`, say). It holds a `.so` (`vulkan.purple.so`) and a `meta.json` that names it.
+2. Copy the `.so` into `Android/data/org.nxnative.android/files/`, beside `env.txt`: `adb push vulkan.purple.so /sdcard/Android/data/org.nxnative.android/files/`.
+   A game app reads its own folder, `Android/data/org.nxnative.game.t<title ID>/files/`.
+3. Add `DM_VK_DRIVER=vulkan.purple.so` to `env.txt` there (a path relative to that folder, or an absolute one), then start the game.
+
+The app copies the driver into its internal storage at start, since Android loads no code from shared storage, and copies it again when the file changes. The log
+names the driver that runs: `[vk] driver: … (DM_VK_DRIVER, through libadrenotools), not the system's: PurpleVK-public Adreno (TM) 740 …`. A driver that can't run
+(a wrong path, a build for another GPU) gets one `[RED] [vk] DM_VK_DRIVER …` line saying why, and the game runs on the system's driver. Remove the line from `env.txt`
+(or start it with `#`) to go back. Each driver keeps its own pipeline cache, so the first start on a new driver compiles the game's pipelines again (it can take a
+minute to the first frame, and it stutters until they are built), and the system driver's cache is still there afterwards.
+
+Whether a driver helps depends on the game and the device. With Mr. Purple's T30, Super Mario Odyssey's opening runs at 60 fps on an Odin 2 (as on its own driver)
+and at 40 fps on a Retroid Pocket 5 (38 on its own); Pokémon Brilliant Diamond, which crashes on the Retroid Pocket 5's own driver, runs there on Turnip, but slowly
+(11 fps), and on an Odin 2 it drops from 60 fps to 20.
 
 ## Packing from the command line
 

@@ -58,10 +58,15 @@ static int js_int(const jv *o, const char *k, int def) { const jv *v = js_get(o,
 // The driver's compiled pipelines kept across runs: loaded from DM_PIPELINE_CACHE (front_android.c: the app's internal files) when the first pipeline is made,
 // written back by vkb_pipeline_cache_save when it grew: the app paused or stopped, the start-up list done, and during play (pcache_made)
 static VkPipelineCache g_pc; static int g_pc_tried; static size_t g_pc_saved;
+// DM_PIPELINE_CACHE, with the name of a DM_VK_DRIVER driver after it: a driver ignores another's cache, so one file for both would lose the system driver's whenever a
+// player tried another (and a smaller cache is written only once it outgrows the file it replaced)
+static char g_pc_path[600];
 static VkPipelineCache pcache(void) {
     if (g_pc_tried) return g_pc;
     g_pc_tried = 1;
-    const char *path = getenv("DM_PIPELINE_CACHE"); void *data = NULL; long n = 0;
+    const char *env = getenv("DM_PIPELINE_CACHE"), *drv = vk_driver_name(), *path = NULL; void *data = NULL; long n = 0;
+    if (env && drv) snprintf(g_pc_path, sizeof g_pc_path, "%s.%s", env, drv); else if (env) snprintf(g_pc_path, sizeof g_pc_path, "%s", env);
+    if (env) path = g_pc_path;
     FILE *f = path ? fopen(path, "rb") : NULL;
     if (f) { fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET); data = malloc((size_t)n); if (!data || fread(data, 1, (size_t)n, f) != (size_t)n) n = 0; fclose(f); }
     VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = (size_t)n, .pInitialData = n ? data : NULL};
@@ -73,12 +78,12 @@ static VkPipelineCache pcache(void) {
 // Under a lock of its own, not the replay's: the driver's cache is internally synchronized, and copying out its tens of megabytes held the game's draws up
 static pthread_mutex_t g_pc_mu = PTHREAD_MUTEX_INITIALIZER;
 void vkb_pipeline_cache_save(void) {
-    const char *path = getenv("DM_PIPELINE_CACHE");
-    if (!g_pc || !path) return;
+    const char *path = g_pc_path;   // (set by pcache before g_pc)
+    if (!g_pc || !path[0]) return;
     pthread_mutex_lock(&g_pc_mu);
     size_t n = 0; void *data = NULL;
     if (vkGetPipelineCacheData(g_vk.dev, g_pc, &n, NULL) == VK_SUCCESS && n > g_pc_saved && (data = malloc(n)) && vkGetPipelineCacheData(g_vk.dev, g_pc, &n, data) == VK_SUCCESS) {
-        char tmp[600]; snprintf(tmp, sizeof tmp, "%s.new", path); FILE *f = fopen(tmp, "wb");
+        char tmp[620]; snprintf(tmp, sizeof tmp, "%s.new", path); FILE *f = fopen(tmp, "wb");
         if (f && fwrite(data, 1, n, f) == n && !fclose(f) && !rename(tmp, path)) { LOG("[vk] pipeline cache: %zu bytes written", n); g_pc_saved = n; }
         else if (f) fclose(f);
     }

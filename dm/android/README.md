@@ -197,3 +197,26 @@ border colors and no extended dynamic state; it has geometry and tessellation sh
 The replay has shaders of its own too, for what Vulkan has no command for: `dm/android/shaders/` (a depth-stencil copy that scales or changes format, drawn by
 `gfx_vk_dscopy.inc`), compiled at build time by the NDK's `glslc` (`shader-tools/`). The copy writes the stencil from its shader where the device has
 `VK_EXT_shader_stencil_export` (the Adreno 740 and 830), and a bit at a time where it has not (the Adreno 650).
+
+## Another Vulkan driver: DM_VK_DRIVER
+
+The host does not link `libvulkan.so`. Every `vk*` function the replay and the front end call is a pointer (`gfx_vk.h`, `VK_NO_PROTOTYPES` with the list in
+`VKB_FNS`), filled by `vk_driver.c` when `vkb()` makes the device: from the system's `libvulkan.so`, opened then, by default; with `DM_VK_DRIVER=<file>`, from a
+driver the player put beside `env.txt` (a Turnip build, as for Switch emulators: [README](../../README.md#another-vulkan-driver-turnip)).
+
+- The file is copied into the internal files (`vk_driver/<name>`, read-only, again when its size or time changes): Android maps no code from shared storage.
+- It is opened through libadrenotools ([dm/third_party/libadrenotools](../third_party/libadrenotools/README.md)): `adrenotools_open_libvulkan` loads a second copy of
+  the system's `libvulkan.so` in a linker namespace of its own, whose hook (`libmain_hook.so`, `libhook_impl.so`) loads the player's driver where that loader would load
+  the vendor's. The loader still makes the window surface and the swapchain (Turnip on Android has no WSI of its own). The hooks are found in the app's extracted native
+  library folder (both manifests set `extractNativeLibs`), and `libadrenotools.so` is opened only when `DM_VK_DRIVER` is set: its liblinkernsbypass constructor changes
+  the protection of the linker's `dlopen` page as it loads.
+- A driver is used only once it offers a GPU on an instance made to ask, and once its file is mapped in the process (by device and inode in `/proc/self/maps`): when the
+  hook fails, libadrenotools loads the vendor's driver in its place and says so only in logcat (`hook_impl`). Anything short of that is one `[RED] [vk] DM_VK_DRIVER`
+  line, and the system's driver runs.
+- Each driver keeps its own pipeline cache: `DM_PIPELINE_CACHE` with `.<driver file name>` after it (`gfx_vk_draw.inc` `pcache`).
+- `build_android_from_nsp.py` builds the three libraries with every host and packs them into both kinds of app (`build_apk.py --lib`).
+- Tried with Mr. Purple's Turnip T30 (Mesa 26.3.0-devel, Vulkan 1.4.359) on an Odin 2 (Adreno 740, Android 13) and a Retroid Pocket 5 (Adreno 650, Android 13), with
+  `scripts/bench_android.py`. It loads and draws on both. Super Mario Odyssey's opening: Odin 2 59.9 fps (GPU 3.5 ms against 5.7 on Qualcomm's driver), Retroid
+  Pocket 5 40.2 fps (37.5 on Qualcomm's). Brilliant Diamond in Eterna City: Odin 2 20.6 fps against 60, with the GPU at 6.1 ms against 8.2 but 44 ms a frame in
+  NVN submit + present (open: which wait is slow on Turnip's KGSL path is not known yet). On the Retroid Pocket 5, where Qualcomm's compiler crashes on it
+  ([baselines](baselines.md), problem 2), it runs at 11.3 fps.
