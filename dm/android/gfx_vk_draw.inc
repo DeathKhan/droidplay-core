@@ -461,6 +461,22 @@ static vshader *sh_get(const char *key) {
 static void key_hex(const uint8_t k[8], char out[17]) { static const char *hx = "0123456789abcdef"; for (int i = 0; i < 8; i++) { out[2 * i] = hx[k[i] >> 4]; out[2 * i + 1] = hx[k[i] & 15]; } out[16] = 0; }
 
 // ---------------- The arena: host-visible memory for one submission's vertex, index, uniform and storage data ----------------
+// The arena's memory type: host-visible and coherent, and cached where the driver has such a type, as staging is (stg_new). The completion thread reads the arena back: a
+// storage buffer or buffer image a shader wrote is compared with its snapshot and its changed bytes copied to guest memory (chunk_done -> wb_apply, a byte at a time where
+// a word differs), and every one of those reads from write-combined memory goes to DRAM. Qualcomm's driver on an Ayn Odin 2 offers the arena's buffers one host-visible
+// type, cached and coherent (types 0 and 6: flags 0x1 and 0xf), so the arena was cached there all along. Mesa's Turnip lists a write-combined type first (types 0 to 2:
+// 0x7, then 0xf), which the arena took: Pokémon Brilliant Diamond's write-backs held the completion thread about 37 ms a frame, the replay waited for free chunks (cur)
+// and the game ran at 20 fps; 60 fps in the cached type, GPU time unchanged (5.9 against 6.1 ms). DM_VK_ARENA_CACHED=0 (env.txt): the first host-visible coherent type,
+// as before (the A/B of this alone)
+static uint32_t ar_mem_type(uint32_t bits) {
+    static int cached = -1, logged;
+    if (cached < 0) { const char *e = getenv("DM_VK_ARENA_CACHED"); cached = !(e && *e == '0'); }
+    uint32_t mt = cached ? vkb_mem_type(bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) : UINT32_MAX;
+    if (mt == UINT32_MAX) mt = vkb_mem_type(bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!logged++) LOG("[vk] arena: memory type %u (flags %#x, of the types %#x)%s", mt, mt < g_vk.mp.memoryTypeCount ? g_vk.mp.memoryTypes[mt].propertyFlags : 0, bits,
+                       cached ? "" : " (DM_VK_ARENA_CACHED=0: the first host-visible coherent type)");
+    return mt;
+}
 // the current chunk's (gfx_vk.c): blocks kept and reused when it completes
 static int ar_new(VkDeviceSize n) {
     if (C->nar == C->car) { C->car = C->car ? 2 * C->car : 8; C->ar = realloc(C->ar, C->car * sizeof *C->ar); }
@@ -470,7 +486,7 @@ static int ar_new(VkDeviceSize n) {
         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
     if (vkCreateBuffer(g_vk.dev, &bc, NULL, &a->b) != VK_SUCCESS) return 0;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, a->b, &mr);
-    uint32_t mt = vkb_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    uint32_t mt = ar_mem_type(mr.memoryTypeBits);
     VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt};
     if (mt == UINT32_MAX || vkAllocateMemory(g_vk.dev, &ma, NULL, &a->m) != VK_SUCCESS) { vkDestroyBuffer(g_vk.dev, a->b, NULL); return 0; }
     vkBindBufferMemory(g_vk.dev, a->b, a->m, 0); vkMapMemory(g_vk.dev, a->m, 0, n, 0, (void **)&a->p); a->n = n; C->nar++;
@@ -1636,7 +1652,7 @@ static VkBufferView tbuf_view(const tex_t *t, int write) {
     VkBuffer b; VkDeviceSize off; uint8_t *d = ar_alloc(bytes, &b, &off); if (!d) return VK_NULL_HANDLE;
     int inpool = mtl_addr((uint64_t)(uintptr_t)t->mem, bytes, NULL, NULL);
     if (inpool) memcpy(d, t->mem, bytes); else { memset(d, 0, bytes); RED_ONCE(103, "buffer texture outside every memory pool: reads 0"); }
-    if (write) { wb_t *w = wb_add(); uint8_t *snap = malloc(bytes); if (snap) { if (inpool) memcpy(snap, t->mem, bytes); else memset(snap, 0, bytes); }   // from guest memory: the arena is write-combined (slow to read)
+    if (write) { wb_t *w = wb_add(); uint8_t *snap = malloc(bytes); if (snap) { if (inpool) memcpy(snap, t->mem, bytes); else memset(snap, 0, bytes); }   // from guest memory: the arena may be write-combined (slow to read: ar_mem_type)
         if (w) *w = (wb_t){-1 - C->ar_last, (size_t)off, bytes, 1, bytes, bytes, t->mem, snap}; }
     VkBufferViewCreateInfo vc = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = bytes};
     VkBufferView v; if (vkCreateBufferView(g_vk.dev, &vc, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -1773,7 +1789,7 @@ static void stage_textures(vshader *s) {
     }
 }
 // A draw's copy of a constant or storage buffer reuses the copy an earlier draw of the same chunk made of the same bytes: same source and size, and the source still
-// equal to a shadow kept in host memory (the arena is write-combined: it is not read back). Super Mario Bros. Wonder's scene draws read six or seven uniform buffers
+// equal to a shadow kept in host memory (the arena may be write-combined, slow to read: ar_mem_type). Super Mario Bros. Wonder's scene draws read six or seven uniform buffers
 // each, mostly the same from draw to draw; copying them again for every draw was the largest cost of its render thread on an Adreno 619 (memcpy, 15%)
 typedef struct { const void *src; size_t n; uint64_t seq; VkBuffer b; VkDeviceSize off; uint8_t *shadow; size_t cap; } ucopy_t;
 static int support_skip(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SUPPORT_SKIP"); v = !(e && *e == '0'); } return v; }   // stage_set
@@ -1895,7 +1911,7 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
         if (u && u->addr && !(sb->flags & 1)) { if (!ucopy((const void *)(uintptr_t)u->addr, n, (n + 15) & ~(size_t)15, &b, &ao)) return 0; }   // read only: shared as uniforms are
         else if (u && u->addr) { uint8_t *d = ar_alloc((n + 15) & ~(size_t)15, &b, &ao); if (!d) return 0; memcpy(d, (const void *)(uintptr_t)u->addr, n);
             if (sb->flags & 1) {   // written by the shader: what it changed is copied back when the chunk completes
-                wb_t *w = wb_add(); uint8_t *snap = malloc(n); if (snap) memcpy(snap, (const void *)(uintptr_t)u->addr, n);   // from guest memory, as d was: the arena is write-combined
+                wb_t *w = wb_add(); uint8_t *snap = malloc(n); if (snap) memcpy(snap, (const void *)(uintptr_t)u->addr, n);   // from guest memory, as d was: the arena may be write-combined (ar_mem_type)
                 if (w) { *w = (wb_t){-1 - C->ar_last, (size_t)ao, n, 1, n, n, (uint8_t *)(uintptr_t)u->addr, snap}; w->fwd = s->stage == SH_CS; if (w->fwd) C->nfwd++; } } }
         else if (!ucopy(NULL, 16, 16, &b, &ao)) return 0;
         bi[nbi] = (VkDescriptorBufferInfo){b, ao, (n + 15) & ~(size_t)15}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)sb->binding, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[nbi++], NULL};
@@ -2407,8 +2423,8 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
         uint32_t *o = fill ? (uint32_t *)fill : (uint32_t *)ar_alloc((VkDeviceSize)icount * 4, &ib, &ioff); if (!o) return 0; i32 = 1;
         if (fill) { ib = gc_buf(ge); ioff = ge->off; } else g_gc_copy++;
         #define IDX(j) (isz == 1 ? (uint32_t)src[j] : isz == 2 ? (uint32_t)((const uint16_t *)(const void *)src)[j] : ((const uint32_t *)(const void *)src)[j])
-        // the vertex range is taken from the indices as they are written: the arena is write-combined memory, and reading the indices back from it took over half
-        // of the render thread in a Super Mario Bros. Wonder level (uncached reads)
+        // the vertex range is taken from the indices as they are written: the arena may be write-combined memory (ar_mem_type), and reading the indices back from it
+        // took over half of the render thread in a Super Mario Bros. Wonder level on an Adreno 619 (uncached reads)
         #define MM(x) do { uint32_t x_ = (x); if (x_ != UINT32_MAX) { if (x_ > mx) mx = x_; if (x_ < mn) mn = x_; } } while (0)
         if (quads || qstrip) for (uint32_t q = 0; q < nq; q++) { uint32_t a0, a1, a2, a3; if (quads) { a0 = IDX(4 * q); a1 = IDX(4 * q + 1); a2 = IDX(4 * q + 2); a3 = IDX(4 * q + 3); } else { a0 = IDX(2 * q); a1 = IDX(2 * q + 1); a2 = IDX(2 * q + 3); a3 = IDX(2 * q + 2); }
                 uint32_t t6[6] = {a0, a1, a2, a0, a2, a3}; memcpy(o + 6 * q, t6, sizeof t6); MM(a0); MM(a1); MM(a2); MM(a3); }
