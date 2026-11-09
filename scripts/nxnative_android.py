@@ -944,6 +944,9 @@ class SettingsPage(QWidget):
         keys = QHBoxLayout(); keys.addWidget(label('Your prod.keys', 'meta')); self.keys = QLineEdit(win.st.value('keys', '')); self.keys.setPlaceholderText('the keys dumped from your Switch')
         self.keys.editingFinished.connect(lambda: self.set_keys(self.keys.text().strip())); keys.addWidget(self.keys, 1)
         b = QPushButton('Choose…'); b.clicked.connect(self.pick_keys); keys.addWidget(b); lay.addLayout(keys)
+        upd = QHBoxLayout(); upd.addWidget(label('Updates', 'meta')); self.update_line = label('', 'muted'); upd.addWidget(self.update_line, 1)
+        self.update_btn = QPushButton('Check for updates'); self.update_btn.setObjectName('ghost'); self.update_btn.clicked.connect(self.update_clicked); upd.addWidget(self.update_btn)
+        lay.addLayout(upd)
         lay.addSpacing(8)
         head = QHBoxLayout(); head.addWidget(label('Requirements', 'h2')); head.addStretch(); b = QPushButton('Check again'); b.setObjectName('ghost'); b.clicked.connect(lambda *_: self.run()); head.addWidget(b)
         self.setup = QPushButton("Install what's missing"); self.setup.clicked.connect(self.install); self.setup.hide(); head.addWidget(self.setup); self.rows = []
@@ -955,6 +958,16 @@ class SettingsPage(QWidget):
         self.table.setSelectionMode(QTableWidget.NoSelection); self.table.setFocusPolicy(Qt.NoFocus)   # nothing to pick here, and a selected row lost its dot's colour
         self.table.horizontalHeader().sectionResized.connect(lambda i, old, new: i == 2 and old != new and QTimer.singleShot(0, self.fit))
         lay.addWidget(self.table); lay.addStretch(1)
+    def show_update(self, newer):   # the version, when DroidPlay last looked, and a newer release if there is one
+        st, v = self.win.st, self.win.version; checked = st.value('update/checked', '')
+        when = f' Last checked {checked}.' if checked else ''
+        if newer: self.update_line.setText(f'DroidPlay {v} · {newer.lstrip("v")} is out.{when}'); self.update_btn.setText(f'Download {newer.lstrip("v")}')
+        elif release_number(v): self.update_line.setText(f'DroidPlay {v}.{when}'); self.update_btn.setText('Check for updates')
+        else: self.update_line.setText(f'DroidPlay {v or "(its version unknown)"}: a copy from source, so it doesn\'t look for releases by itself.'); self.update_btn.setText('Check for updates')
+        self.newer = newer
+    def update_clicked(self):
+        if getattr(self, 'newer', None): QDesktopServices.openUrl(QUrl(self.win.st.value('update/url', '') or 'https://github.com/enjoyerofslop/droidplay-core/releases/latest'))
+        else: self.win.check_updates(asked=True)
     def fit(self):   # the rows' heights at the table's width now: rows sized while the page was hidden wrapped at that narrower width and kept two lines
         t = self.table; t.resizeRowsToContents()
         t.setFixedHeight(t.horizontalHeader().height() + sum(t.rowHeight(i) for i in range(t.rowCount())) + 2 * t.frameWidth())
@@ -1010,6 +1023,38 @@ class SettingsPage(QWidget):
         self.win.go('builds')
 
 
+# ---------------- Updates ----------------
+# Like DroidPlay for Mac's ad-hoc builds, which can't update themselves: the app says a newer release is out and links its page, and the player downloads it.
+RELEASES_API = 'https://api.github.com/repos/enjoyerofslop/droidplay-core/releases/latest'
+
+
+def release_number(v):   # (0, 5, 1) for v0.5.1 or 0.5.1; None for anything else, such as a checkout's 0.5.0-3-gabc1234, which no release can be newer than
+    m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', (v or '').strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def latest_release():   # the newest release on GitHub: its tag and its page. Raises when offline or rate-limited
+    import urllib.request
+    req = urllib.request.Request(RELEASES_API, headers={'User-Agent': 'DroidPlay', 'Accept': 'application/vnd.github+json'})
+    with urllib.request.urlopen(req, timeout=15) as r: d = json.load(r)
+    return d['tag_name'], d['html_url']
+
+
+class UpdateBar(QWidget):   # under the top bar, on every page, while a newer release is out and the player hasn't put it off
+    def __init__(self, win):
+        super().__init__(); self.win = win; self.tag = self.url = None; self.setObjectName('updatebar'); self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet('QWidget#updatebar { background: rgba(61,220,132,0.10); border-bottom: 1px solid rgba(61,220,132,0.25); }')
+        lay = QHBoxLayout(self); lay.setContentsMargins(28, 10, 28, 10); lay.setSpacing(14)
+        self.text = label(''); self.text.setStyleSheet('font-size: 14px; font-weight: 600'); lay.addWidget(self.text); lay.addStretch()
+        get = QPushButton('Download'); get.clicked.connect(lambda: self.url and QDesktopServices.openUrl(QUrl(self.url))); lay.addWidget(get)
+        later = QPushButton('Not now'); later.setObjectName('ghost'); later.clicked.connect(self.later); lay.addWidget(later)
+        self.hide()
+    def show_release(self, tag, url):
+        self.tag, self.url = tag, url
+        self.text.setText(f'DroidPlay {tag.lstrip("v")} is out. Download its installer from the release page; your games, builds and settings stay.'); self.show()
+    def later(self): self.win.st.setValue('update/later', self.tag); self.hide()   # until the release after it
+
+
 # ---------------- The window ----------------
 class Window(QMainWindow):
     def __init__(self):
@@ -1034,6 +1079,8 @@ class Window(QMainWindow):
         add = QPushButton('  Build game'); add.setObjectName('ghost'); add.setIcon(icon('plus', TEXT2, 16)); add.setCursor(Qt.PointingHandCursor); add.clicked.connect(self.add_game); tl.addWidget(add)
         root.addWidget(top)
         sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet(f'background: {LINE}'); root.addWidget(sep)
+        self.version = ba.core_version()   # the VERSION file a release carries (its installer's copy too), git describe in a checkout
+        self.updatebar = UpdateBar(self); root.addWidget(self.updatebar)
         self.pages = QStackedWidget(); root.addWidget(self.pages, 1)
         self.builds = BuildsPage(self); self.phones = PhonesPage(self); self.perf = PerformancePage(self); self.settings = SettingsPage(self); self.library = LibraryPage(self)
         self.page_of = {'library': self.library, 'builds': self.builds, 'phones': self.phones, 'perf': self.perf, 'settings': self.settings}
@@ -1045,6 +1092,23 @@ class Window(QMainWindow):
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_devices); self.timer.start(5000); self.refresh_devices()
         self.settings.run(then=lambda rows: self.go('settings') if any(not r['ok'] for r in rows) else None)
         if os.name == 'nt': self.dark_title()
+        self.settings.show_update(None)
+        QTimer.singleShot(5000, self.check_updates); self.update_t = QTimer(self); self.update_t.timeout.connect(self.check_updates); self.update_t.start(24 * 3600 * 1000)
+
+    def check_updates(self, asked=False):   # at launch and once a day; Settings' Check for updates asks too. Quiet when it can't reach GitHub, unless asked
+        if not release_number(self.version) and not asked: return
+        def got(r):
+            if isinstance(r, Exception):
+                if asked: self.toast(f'Could not reach GitHub to look for a newer DroidPlay: {r}')
+                return
+            tag, url = r; self.st.setValue('update/checked', time.strftime('%Y-%m-%d %H:%M')); self.st.setValue('update/latest', tag); self.st.setValue('update/url', url)
+            mine, theirs = release_number(self.version), release_number(tag)
+            newer = bool(mine and theirs and theirs > mine)
+            if newer and (asked or self.st.value('update/later', '') != tag): self.updatebar.show_release(tag, url)
+            elif not newer: self.updatebar.hide()
+            self.settings.show_update(tag if newer else None)
+            if asked and not newer: self.toast(f'DroidPlay {self.version} is the newest' if mine else f'The newest release is {tag}; this copy is {self.version or "of no release"}')
+        bg(latest_release, got)
 
     def dark_title(self):   # Windows' own title bar in its dark mode, to match the room
         try:

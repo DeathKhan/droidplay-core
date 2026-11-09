@@ -357,7 +357,8 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, wor
 
 def core_version():   # DroidPlay Core's version, for the launcher app's: the VERSION file a release's archives carry (release-assets.yml), else git describe in a checkout
     if (REPO / 'VERSION').is_file(): return (REPO / 'VERSION').read_text(encoding='utf-8').strip() or None
-    try: r = subprocess.run(['git', '-C', str(REPO), 'describe', '--tags', '--always'], capture_output=True, text=True, timeout=10)
+    try: r = subprocess.run(['git', '-C', str(REPO), 'describe', '--tags', '--always'], capture_output=True, text=True, timeout=10,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))   # the desktop app asks too, from pythonw.exe: no console window for git
     except (OSError, subprocess.TimeoutExpired): return None
     return (r.stdout.strip().removeprefix('v') or None) if r.returncode == 0 else None
 
