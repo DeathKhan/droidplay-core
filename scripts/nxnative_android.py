@@ -18,12 +18,12 @@ from pathlib import Path
 
 try:
     from PySide6.QtCore import QByteArray, QObject, QProcess, QProcessEnvironment, QRectF, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, Signal  # pyright: ignore[reportMissingImports]   (PySide6 is the desktop app's alone; the lint job does not install it)
-    from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap  # pyright: ignore[reportMissingImports]
+    from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap  # pyright: ignore[reportMissingImports]
     from PySide6.QtSvg import QSvgRenderer  # pyright: ignore[reportMissingImports]
     from PySide6.QtWidgets import (  # pyright: ignore[reportMissingImports]
                                    QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
                                    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
-                                   QProgressBar, QPushButton, QRadioButton, QScrollArea, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QToolButton,
+                                   QProgressBar, QPushButton, QRadioButton, QScrollArea, QSplitter, QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
                                    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 except ImportError:
     sys.exit(f'DroidPlay (nxnative_android.py) needs PySide6: uv run {__file__}, or {sys.executable} -m pip install PySide6')
@@ -689,6 +689,18 @@ class BuildBar(QWidget):   # the running build at the bottom of every page
 
 
 # ---------------- Phones ----------------
+class KeepColour(QStyledItemDelegate):   # a selected row keeps its coloured text (a phone's state in green or red): the selection painted all of it in one colour
+    def initStyleOption(self, opt, index):
+        super().initStyleOption(opt, index)
+        fg = index.data(Qt.ForegroundRole)
+        if fg is not None: opt.palette.setBrush(QPalette.HighlightedText, fg)
+
+
+STATES = {'device': 'connected', 'unauthorized': 'allow USB debugging on the phone', 'authorizing': 'allow USB debugging on the phone', 'offline': 'offline'}   # adb's words
+NO_ADB = "adb isn't installed, so DroidPlay can't see your phones. Settings › Install what's missing installs it with the Android SDK."
+NO_PHONE = 'No phone connected. Plug one in with USB debugging on (Developer options) and allow this computer when the phone asks, or pair one over Wi-Fi.'
+
+
 class PhonesPage(QWidget):
     def __init__(self, win):
         super().__init__(); self.win = win; self.setObjectName('page')
@@ -697,12 +709,14 @@ class PhonesPage(QWidget):
         lay.addWidget(label('Over Wi-Fi: on the phone, Developer options → Wireless debugging. "Pair device with pairing code" gives an address and a code for Pair; '
                             'the address on the Wireless debugging screen itself is the one to Connect to (its port changes when wireless debugging restarts).', 'muted', wrap=True))
         self.table = QTableWidget(0, 5); self.table.setHorizontalHeaderLabels(['Device', 'Model', 'Android', 'Connection', 'State'])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); self.table.verticalHeader().hide(); self.table.setShowGrid(False)
+        hh = self.table.horizontalHeader(); hh.setSectionResizeMode(QHeaderView.Stretch); hh.setSectionResizeMode(2, QHeaderView.ResizeToContents); hh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.table.verticalHeader().hide(); self.table.setShowGrid(False); self.table.setItemDelegate(KeepColour(self.table))
         self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.itemSelectionChanged.connect(self.selected)
         self.table.setMaximumHeight(200); lay.addWidget(self.table)
-        row = QHBoxLayout()
+        self.note = label('', 'meta', wrap=True); self.note.hide(); lay.addWidget(self.note)   # why the list is empty: no adb, or no phone
+        row = QHBoxLayout(); self.adb_buttons = []
         for text, fn in (('Pair over Wi-Fi…', self.pair), ('Connect…', self.connect), ('Discover', self.discover), ('Disconnect', self.disconnect)):
-            b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
+            b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b); self.adb_buttons.append(b)
         row.addStretch(); lay.addLayout(row)
         lay.addSpacing(10); self.ph = label('The picked phone', 'h2'); lay.addWidget(self.ph); self.app = label('—', 'meta', wrap=True); lay.addWidget(self.app)
         self.games = QListWidget(); lay.addWidget(self.games, 1)
@@ -711,19 +725,24 @@ class PhonesPage(QWidget):
             b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
             if name: b.setObjectName(name)
         row.addStretch(); lay.addLayout(row)
-    def fill(self, devs):
+    def fill(self, devs, adb=True):   # the phone's own name and its model's, with the serial beside how it is connected
         self.table.setRowCount(len(devs))
         for i, d in enumerate(devs):
-            for j, v in enumerate((d['serial'], d.get('model', ''), d.get('android', ''), 'Wi-Fi' if ':' in d['serial'] or '._adb-tls' in d['serial'] else 'USB', d['state'])):
-                it = QTableWidgetItem(v)
+            how = 'Wi-Fi' if ':' in d['serial'] or '._adb-tls' in d['serial'] else 'USB'
+            for j, v in enumerate((d.get('name') or d['serial'], d.get('model', ''), d.get('android', ''), f'{how} · {d["serial"]}', STATES.get(d['state'], d['state']))):
+                it = QTableWidgetItem(v); it.setData(Qt.UserRole, d['serial'])
                 if j == 4: it.setForeground(QColor(READY if d['state'] == 'device' else ERR))
                 self.table.setItem(i, j, it)
+        self.note.setText('' if devs else NO_PHONE if adb else NO_ADB); self.note.setVisible(not devs)
+        for b in self.adb_buttons: b.setEnabled(adb)
     def selected(self):
         r = self.table.currentRow()
-        if r >= 0 and self.table.item(r, 0): self.win.set_serial(self.table.item(r, 0).text())
+        if r >= 0 and self.table.item(r, 0): self.win.set_serial(self.table.item(r, 0).data(Qt.UserRole))
     def show_phone(self, pkg, games, legacy):
         self.ph.setText(self.win.phone_name() or 'No phone'); self.games.clear()
-        self.app.setText(('The DroidPlay app · ' + ' · '.join(x.strip() for x in pkg.splitlines())) if 'lastUpdateTime' in pkg else 'The DroidPlay app is not installed')
+        m = {k: v.strip() for k, v in re.findall(r'(versionName|lastUpdateTime)=(.+)', pkg)}   # dumpsys package's lines
+        self.app.setText(f'The DroidPlay app {m.get("versionName", "")} · updated {m["lastUpdateTime"][:16]}' if 'lastUpdateTime' in m else
+                         'The DroidPlay app is not installed' if self.win.serial() else 'The app and the games on the picked phone show here.')
         for gid, meta in games.items():
             it = QListWidgetItem(f'{meta.get("name") or gid}     {gid} · {meta.get("display") or meta.get("version") or "?"}'); it.setData(Qt.UserRole, gid); self.games.addItem(it)
         if legacy: self.games.addItem('A one-game install (files/game, before the launcher): Move the old one-game install puts it in the launcher, its save copied over')
@@ -949,7 +968,7 @@ class Window(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle('DroidPlay'); self.setWindowIcon(app_icon()); self.setMinimumSize(1000, 620)
         a = QApplication.primaryScreen().availableGeometry(); self.resize(min(1440, a.width() - 40), min(900, a.height() - 40))
-        self.st = QSettings('nxnative', 'android'); self.devs = []; self.phone_games = {}; self.phone_legacy = False; self.models = {}   # the old name: the settings stay
+        self.st = QSettings('nxnative', 'android'); self.devs = None; self.adb = True; self.phone_games = {}; self.phone_legacy = False; self.models = {}   # the old name: the settings stay
         central = QWidget(); central.setObjectName('page'); root = QVBoxLayout(central); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0); self.setCentralWidget(central)
         # the top bar: the wordmark, the pages, the phone, search, + Build game
         top = QWidget(); top.setObjectName('topbar'); top.setAttribute(Qt.WA_StyledBackground, True); tl = QHBoxLayout(top); tl.setContentsMargins(28, 14, 28, 14); tl.setSpacing(6)
@@ -1042,28 +1061,38 @@ class Window(QMainWindow):
         bg(look, got)
     def refresh_devices(self):
         def look():
+            if not shutil.which('adb'): return None   # Install what's missing brings it, with the Android SDK
             ok, out = adb_run(None, 'devices', '-l', timeout=10)
             devs = []
             for line in out.splitlines()[1:] if ok else []:
                 c = line.split()
                 if len(c) < 2: continue
                 d = {'serial': c[0], 'state': c[1], 'model': next((x[6:] for x in c if x.startswith('model:')), '').replace('_', ' ')}
-                if d['state'] == 'device':
-                    d['android'] = adb_run(d['serial'], 'shell', 'getprop', 'ro.build.version.release', timeout=8)[1]
-                    d['name'] = adb_run(d['serial'], 'shell', 'settings', 'get', 'global', 'device_name', timeout=8)[1] or d['model']
+                if d['state'] == 'device':   # in one call: Android's version, the model's market name where the maker sets one (devices -l has its code: OPD2415 for a OnePlus Pad 3), the phone's own name
+                    got_p, p = adb_run(d['serial'], 'shell', 'getprop ro.build.version.release; getprop ro.product.marketname; getprop ro.vendor.oplus.market.name; '
+                                       'settings get global device_name', timeout=8)
+                    v = [x.strip() for x in p.splitlines()] + [''] * 4 if got_p else [''] * 4
+                    d['android'], d['model'] = v[0], v[1] or v[2] or d['model']
+                    d['name'] = v[3] if v[3] not in ('', 'null') else d['model']
                 devs.append(d)
             return devs if ok else out
         def got(r):
-            if isinstance(r, (Exception, str)): return
-            if [(d['serial'], d['state']) for d in r] == [(d['serial'], d['state']) for d in self.devs]: return
-            self.devs = r; keep = self.serial() or self.st.value('serial', '')
+            if isinstance(r, Exception): return
+            adb = r is not None
+            if isinstance(r, str):   # adb didn't answer: the list stays as it was, or says no phone is connected when it was never filled
+                if self.devs is not None: return
+                r = []
+            r = r or []
+            if r == self.devs and adb == self.adb: return
+            self.devs, self.adb = r, adb; keep = self.serial() or self.st.value('serial', '')
             self.models = {d['serial']: d.get('name') or d.get('model') or d['serial'] for d in r}
             self.phone.blockSignals(True); self.phone.clear()
             for d in r:
                 if d['state'] == 'device': self.phone.addItem(icon('phone', TEXT2, 16), f'{self.models[d["serial"]]}' + (f' · Android {d.get("android")}' if d.get('android') else ''), d['serial'])
-            if not self.phone.count(): self.phone.addItem(icon('phone', TEXT3, 16), 'No phone connected', None)
+            if not self.phone.count(): self.phone.addItem(icon('phone', TEXT3, 16), 'No phone connected' if adb else 'adb not found: see Settings', None)
+            self.phone.setToolTip('The phone builds install to' if adb else "DroidPlay finds the phones with adb: Settings › Install what's missing installs it")
             i = self.phone.findData(keep); self.phone.setCurrentIndex(i if i >= 0 else 0); self.phone.blockSignals(False)
-            self.phones.fill(r); self.phone_changed(0)
+            self.phones.fill(r, adb); self.phone_changed(0)
         bg(look, got)
 
 
