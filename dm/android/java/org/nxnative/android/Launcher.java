@@ -63,7 +63,7 @@ import java.util.Locale;
 import java.util.Map;
 
 public class Launcher extends Activity {
-    static final String TAG = "nxnative";
+    static final String TAG = "DroidPlay";   // logcat's tag, as the host's (front_android.c); nxnative before 0.5.0
     static final String GAME_PROCESS = "org.nxnative.android:game";
 
     // nacp.py LANGUAGES: one bit of SupportedLanguageFlag (0x302C) per language, in this order

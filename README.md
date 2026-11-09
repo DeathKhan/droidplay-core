@@ -83,7 +83,7 @@ Help with packing and playing, and reports of how a game runs on your device, go
 for a problem, #compatibility for a game. Its rules are this README's: no games, keys, firmware or packed APKs.
 
 Testers and contributors are welcome. Useful reports name the device and its GPU (Settings, or `adb shell getprop ro.product.model`), Android version, the game,
-its title ID and version, how it was packed (DroidPlay, the command line, game app or launcher), and attach the log: `adb logcat -s nxnative`, or `log.txt` in the
+its title ID and version, how it was packed (DroidPlay, the command line, game app or launcher), and attach the log: `adb logcat -s DroidPlay` (`-s nxnative` for an app older than 0.5.0), or `log.txt` in the
 app's folder (`Android/data/<package>/files/`). A screenshot and the first `[RED]` lines help most. Never attach game files or keys. How changes get in, and how
 DroidPlay Core stays in step with nxnative: [CONTRIBUTING.md](CONTRIBUTING.md#droidplay-core).
 
@@ -168,7 +168,7 @@ copied to the phone again when the phone already holds the same one.
   shakes the controller. The **≡** button at the top (left of −) goes back to the launcher while the game keeps running behind it: **Play** on the same game resumes
   it, and picking another game asks before closing the running one.
 - **Saves** stay in the app's internal storage (`saves/<title ID>`), so updating the app keeps them; the desktop app backs them up to the computer. The log is
-  `Android/data/org.nxnative.android/files/log.txt` (also `adb logcat -s nxnative`).
+  `Android/data/org.nxnative.android/files/log.txt` (also `adb logcat -s DroidPlay`).
 
 ## Another Vulkan driver (Turnip)
 

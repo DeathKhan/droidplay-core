@@ -5,7 +5,7 @@
 //   as the iPhone's Documents/env.txt). Save data stays in the app's internal storage, a folder per game (saves/<title ID>), and so does the driver's pipeline cache
 //   (cache/<title ID>). Without its game (or with DM_FORCE_SELFTEST, the launcher's self test) the host runs the built-in self test (assets/selftest:
 //   dm/android/tests/selftest_nso.py, rewritten).
-//   Log: the host's stderr goes to logcat (tag nxnative) and to <external files>/log.txt.
+//   Log: the host's stderr goes to logcat (tag DroidPlay; nxnative before 0.5.0) and to <external files>/log.txt.
 //   Window: Vulkan, on the NVN replay's device (gfx_vk.c). The window texture the game presented last is drawn scaled to fit (vkb_frame_lock);
 //   before the first one, and without a game, a status screen. The device's Vulkan capabilities are written to the log at start.
 //   Input: touches are the touchscreen (hle_touch.c); a physical controller is player 1's (buttons by position, Nintendo's layout).
@@ -49,7 +49,7 @@ static void *log_reader(void *p) {
         char *s = buf, *e;
         while ((e = memchr(s, '\n', buf + n - s))) {
             *e = 0;
-            __android_log_write(strstr(s, "[RED]") || strstr(s, "FATAL") || strstr(s, "CRASH") ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "nxnative", s);
+            __android_log_write(strstr(s, "[RED]") || strstr(s, "FATAL") || strstr(s, "CRASH") ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "DroidPlay", s);   // the app's name as players see it (adb logcat -s DroidPlay); nxnative before 0.5.0
             if (f) { fputs(s, f); fputc('\n', f); fflush(f); }
             if (strstr(s, "selftest: PASS")) atomic_store(&g_state, ST_PASS);
             else if (strstr(s, "selftest: FAIL")) atomic_store(&g_state, ST_FAIL);
@@ -379,7 +379,7 @@ static void status_draw(void) {
     static const uint32_t bg[] = {0xFF101820, 0xFF101820, 0xFF0E3B1E, 0xFF4A1010, 0xFF101820, 0xFF202020, 0xFF4A1010, 0xFF101820};
     (*e)->CallVoidMethod(e, g_canvas, g_drawColor, (jint)bg[st]);
     float u = (float)(g_ext2.width < g_ext2.height ? g_ext2.width : g_ext2.height) / 20.f, y = 2.2f * u;
-    text("nxnative for Android", u, y, 1.4f * u, 0xFFFFFFFF); y += 1.6f * u;
+    text("DroidPlay", u, y, 1.4f * u, 0xFFFFFFFF); y += 1.6f * u;   // the app's name on the screen a game starts behind, as the launcher and the game apps say it
     static const char *what[] = {"starting", "self test running", "self test PASSED", "self test FAILED", "game running", "host finished", "host crashed: see log.txt", "NVN picture check"};
     char line[256]; snprintf(line, sizeof line, "state: %s", what[st]); text(line, u, y, 0.9f * u, 0xFFE0E0E0); y += 1.2f * u;
     if (st == ST_PASS) { text("Switch code ran natively: x18 slots, TLS, gates, imports, threads", u, y, 0.6f * u, 0xFFB0FFB0); y += 0.9f * u; }
@@ -612,7 +612,7 @@ void android_main(struct android_app *app) {
     snprintf(g_game, sizeof g_game, "%s/games/%s", g_ext, DM_GAME_ID);
     mkdirs(g_ext); mkdirs(g_int);
     log_start();
-    LOG("nxnative for Android: %s (%s), files %s, internal %s", DM_GAME_NAME, DM_GAME_ID, g_game, g_int);
+    LOG("DroidPlay on Android: %s (%s), files %s, internal %s", DM_GAME_NAME, DM_GAME_ID, g_game, g_int);   // a log's first line
     env_file(g_ext, "env.txt", 1); env_file(g_game, "launcher.txt", 0); env_file(g_game, "defaults.txt", 0);
     vk_driver_dirs(g_ext, g_int);   // DM_VK_DRIVER: a driver beside env.txt, run from a copy in the internal files
     (*app->activity->vm)->AttachCurrentThread(app->activity->vm, &g_env, NULL);

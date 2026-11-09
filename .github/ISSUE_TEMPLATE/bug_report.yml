@@ -84,6 +84,7 @@ body:
         - Mac app: `~/Library/Logs/nxnative/<title ID>.log` (the run before is `<title ID>.prev.log`)
         - Terminal (`--platform mac`): the host's output, e.g. the command followed by `2>&1 | tee run.log`
         - iPhone or iPad: `log.txt` in the Files app under the app's name (the run before is `log.prev.txt`)
+        - Android: `log.txt` in `Android/data/org.nxnative.android/files/` (a game app: `Android/data/org.nxnative.game.t<title ID>/files/`), or `adb logcat -s DroidPlay` (`-s nxnative` for an app older than 0.5.0)
         - Graphics problems: also `<title ID>_build/logs/dmsh_build.log` from the build you ran
         - Script or build failures: the script's full console output
     validations:
