@@ -17,8 +17,11 @@
 // copies in the arena (written ones copied back); images are the textures' own images (storage usage), so what a shader writes stays on the GPU.
 // Coherence: submissions are synchronous and guest memory is copied at each draw, so a draw or dispatch after one that wrote guest memory (storage buffers, buffer
 // images, texture-to-buffer copies) first completes the submission; indirect arguments are then read on the CPU and the draw made direct.
-// The window origin follows NVN's (mtl_set_origin_lower_left): lower left (GL, NVN's default) keeps the viewport as is, so memory rows are GL's window rows, and
-// inverts the front face; upper left flips the viewport. Depth -1..1 (mtl_set_depth_zero 0, NVN's default) takes the vertex shaders' .z variants.
+// The window origin follows NVN's (mtl_set_origin_lower_left): lower left (GL, NVN's default) keeps the viewport as is, so memory rows are GL's window rows; upper
+// left flips the viewport. The front face is inverted by the queue's raster flip alone (g_queue_ll, captured when the queue was initialized), as Metal's draws do: the
+// viewport places vertices as Metal's does for both origins, and both judge winding as seen in the framebuffer. Taking the device origin too (front ^ queue ^ device,
+// from Metal's CPU coverage test, which works in other coordinates) cancelled the inversion for Link's Awakening, which keeps the lower-left origin for its device
+// and its queue: its back-face culled full-screen passes (ambient occlusion, its blurs, the composite) drew nothing, and the world stayed black behind the HUD. Depth -1..1 (mtl_set_depth_zero 0, NVN's default) takes the vertex shaders' .z variants.
 
 // ---------------- A small JSON reader (the translator's res.json) ----------------
 typedef struct jv { int t; double num; char *s; struct jv *kid; char **key; int n; } jv;   // t: 0 null 1 number 2 string 3 array 4 object 5 bool
@@ -103,7 +106,7 @@ typedef struct {
 } vshader;
 static nvn_hmap g_sh = {.klen = 16};
 static char g_spv_dir[512];
-static int g_depth_zero, g_origin_ll = 1, g_queue_ll;   // g_queue_ll: the queue's raster flip, captured when it was initialized (mtl_set_queue_origin_lower_left); winding = front ^ queue ^ device, as on Metal
+static int g_depth_zero, g_origin_ll = 1, g_queue_ll;   // g_queue_ll: the queue's raster flip, captured when it was initialized (mtl_set_queue_origin_lower_left); winding = front ^ queue, as Metal's draws
 // ---- Inputs no earlier stage writes ----
 // Vulkan wants every fragment shader input written by the stage before it (the Switch reads an unwritten one as whatever is there), and the Adreno 619 refuses such
 // a pipeline (VK_ERROR_UNKNOWN): Super Mario Bros. Wonder pairs fragment shader f4b9c56566956b03 (locations 0-4) with vertex shaders that write 0, 1, 2 and 4.
@@ -1345,7 +1348,7 @@ static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t
     int strip = tp == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || tp == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = tp, .primitiveRestartEnable = strip && k->restart};
     VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
-    int front_ccw = k->poly.front == NVN_FRONT_FACE_CCW; if (k->ll) front_ccw = !front_ccw;   // see the file header: lower-left origin inverts the winding as Vulkan sees it
+    int front_ccw = k->poly.front == NVN_FRONT_FACE_CCW; if (k->ll) front_ccw = !front_ccw;   // see the file header: the queue's lower-left raster flip inverts the winding
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .rasterizerDiscardEnable = k->tf != 0, .depthClampEnable = k->depth_clamp && g_vk_feat.depthClamp,
         .polygonMode = k->poly.mode == NVN_POLYGON_MODE_LINE && g_vk_feat.fillModeNonSolid ? VK_POLYGON_MODE_LINE : k->poly.mode == NVN_POLYGON_MODE_POINT && g_vk_feat.fillModeNonSolid ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL,
         .cullMode = (VkCullModeFlags)(k->poly.cull & 3), .frontFace = front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE, .depthBiasEnable = k->poly.offset_en != 0, .lineWidth = 1};
@@ -2221,7 +2224,7 @@ static int vk_draw(const p_draw *dw, const p_draw_idx *di) {
 // ---- The pipeline-key memo (vk_draw_) ----
 // A draw whose pipeline key has every input of the draw before's has its pipeline: the bound state the key takes (D, through g_pso_gen: draw_state_op bumps it only when
 // one of those values really changes), the shaders (the program memo's or resolved), the pass (P.rp and its key), the primitive, the depth mode (g_depth_zero) and the
-// origin flip (g_origin_ll ^ g_queue_ll). The rest the key reads is fixed per shader (io_in, modz) or device (logicOp). Building the key (about 400 bytes, field by field and
+// queue's raster flip (g_queue_ll). The rest the key reads is fixed per shader (io_in, modz) or device (logicOp). Building the key (about 400 bytes, field by field and
 // masked), its 49-word hash and its compare in pipe_get cost Breath of the Wild on the Odin 2 about 2.35% of the replay thread (pipe_get 1.72%, the build 0.63%), for 82% of
 // draws that repeat the draw before's state (attributes included). Pipelines are never freed (g_pipes keeps every pipe_t; prewarm_thread only adds), so the memo keeps a
 // pointer. Only a made pipeline is kept; a dump frame builds every key (its log reads the key's fields). DM_VK_PSO_MEMO=0 (env.txt): every draw builds its key, as before;
@@ -2233,7 +2236,7 @@ static struct { uint64_t gen; vshader *sh[4]; VkRenderPass rp; rp_key rk; int pr
 static uint64_t g_pso_hit, g_pso_miss, g_pso_checked, g_pso_bad;
 static pipe_t *pso_memo_find(vshader *const sh[4], int prim) {
     if (!pso_memo_on() || dump_on() || !g_pso_m.pp || g_pso_m.gen != g_pso_gen || memcmp(g_pso_m.sh, sh, sizeof g_pso_m.sh) || g_pso_m.rp != P.rp || memcmp(&g_pso_m.rk, &P.key, sizeof P.key)
-        || g_pso_m.prim != prim || g_pso_m.z != !g_depth_zero || g_pso_m.ll != (uint8_t)(g_origin_ll ^ g_queue_ll)) return NULL;
+        || g_pso_m.prim != prim || g_pso_m.z != !g_depth_zero || g_pso_m.ll != (uint8_t)g_queue_ll) return NULL;
     g_pso_hit++; return g_pso_m.pp;
 }
 static void pso_memo_note(const pipe_key *k, int prim, pipe_t *pp, pipe_t *pm) {   // the key built, its pipeline pp; pm: the memo's answer (DM_VK_PSO_CHECK), compared
@@ -2243,12 +2246,12 @@ static void pso_memo_note(const pipe_key *k, int prim, pipe_t *pp, pipe_t *pm) {
             LOG("[RED] [vk] pipeline memo check: shaders %s %s, the memo's key differs in:%s%s", k->sh[0] ? k->sh[0]->key : "-", k->sh[1] ? k->sh[1]->key : "-", d[0] ? d : " (padding only)", pp != pm ? " (another pipeline)" : ""); } }
     else g_pso_miss++;
     g_pso_m.gen = g_pso_gen; memcpy(g_pso_m.sh, k->sh, sizeof g_pso_m.sh); g_pso_m.rp = P.rp; g_pso_m.rk = P.key; g_pso_m.prim = prim; g_pso_m.z = !g_depth_zero;
-    g_pso_m.ll = (uint8_t)(g_origin_ll ^ g_queue_ll); g_pso_m.pp = pp;
+    g_pso_m.ll = (uint8_t)g_queue_ll; g_pso_m.pp = pp;
     if (pso_check()) g_pso_m.k = *k;
 }
 // the pipeline key of the draw being made, over k's zeroed bits with its shaders set: the bound state (D), the pass (P), the primitive and the origin
 static void pipe_key_build(pipe_key *k, int prim) {
-    k->z = !g_depth_zero; k->rp = P.rp; k->rk = P.key; k->ncolor = P.key.ncolor; k->ll = (uint8_t)(g_origin_ll ^ g_queue_ll);
+    k->z = !g_depth_zero; k->rp = P.rp; k->rk = P.key; k->ncolor = P.key.ncolor; k->ll = (uint8_t)g_queue_ll;
     memcpy(k->attr, D.attr, sizeof k->attr); memcpy(k->stream, D.stream, sizeof k->stream);
     k->topo = (uint8_t)topo_of(prim); k->restart = (uint8_t)D.restart.on; k->depth_clamp = (uint8_t)D.depth_clamp;
     // the state objects field by field over zeroed bits: bind_state copies the game's objects whole, and the bits the fields leave over (16 of colour's 32, 24 of polygon's,
@@ -2420,10 +2423,13 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
         if (nv > pr->big) { pr->big = nv; pr->bigvs = k.sh[0]->key; pr->bigfs = k.sh[1] ? k.sh[1]->key : NULL; } }
     if (dump_on()) {
         char tg[160] = ""; for (int i = 0; i < 8; i++) if (P.cv[i]) { size_t l = strlen(tg); snprintf(tg + l, sizeof tg - l, " a%d=s%llu(%ux%u vk%d)", i, (unsigned long long)P.cv[i]->serial, P.cv[i]->w, P.cv[i]->h, P.cv[i]->fmt); }
-        LOG("[dump] pass %d draw %llu: vs %s fs %s prim %d count %u inst %u%s vp %.0f,%.0f %.0fx%.0f sc %d,%d %ux%u ll %d targets%s; blend %#x [%u %u %u / %u %u %u] mask %#x cull %u front %u", g_dump_pass + 1, (unsigned long long)g_draws,
+        // the depth-stencil attachment's format and the depth and stencil tests too: a draw that writes nothing may be failing one (k.ds: test, write, function)
+        LOG("[dump] pass %d draw %llu: vs %s fs %s prim %d count %u inst %u%s vp %.0f,%.0f %.0fx%.0f sc %d,%d %ux%u ll %d targets%s depth vk%d; blend %#x [%u %u %u / %u %u %u] mask %#x cull %u front %u; "
+            "depth test %u write %u func %u, stencil test %u func %u ref %#x mask %#x", g_dump_pass + 1, (unsigned long long)g_draws,
             k.sh[0]->key, k.sh[1] ? k.sh[1]->key : "-", prim, count, inst, di ? " indexed" : "", v.x, v.y, v.width, v.height, sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height, g_origin_ll, tg,
-            k.color.blend_en, (unsigned)k.blend[0].src_rgb, (unsigned)k.blend[0].dst_rgb, (unsigned)k.blend[0].eq_rgb, (unsigned)k.blend[0].src_a, (unsigned)k.blend[0].dst_a, (unsigned)k.blend[0].eq_a,
-            k.chmask.mask, (unsigned)k.poly.cull, (unsigned)k.poly.front);
+            (int)P.key.depth, k.color.blend_en, (unsigned)k.blend[0].src_rgb, (unsigned)k.blend[0].dst_rgb, (unsigned)k.blend[0].eq_rgb, (unsigned)k.blend[0].src_a, (unsigned)k.blend[0].dst_a,
+            (unsigned)k.blend[0].eq_a, k.chmask.mask, (unsigned)k.poly.cull, (unsigned)k.poly.front, (unsigned)k.ds.dt, (unsigned)k.ds.dw, (unsigned)k.ds.df, (unsigned)k.ds.st, (unsigned)k.ds.sf_f,
+            D.st_ref[0], D.st_vmask[0]);
     }
     if (D.tf_on && k.sh[0]->modtf) { g_drawing = 0; return tf_capture(k.sh[0], pprog[0], pst[0], dw, di); }   // drawn and captured (nvn_mtl.m draw)
     return 1;

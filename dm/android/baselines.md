@@ -70,22 +70,22 @@ Numbered in the order they were found, so links to a number stay right:
 6. **The Retroid Pocket 5 cannot hold 60 fps in Odyssey's opening cutscene** (38 fps, GPU 12.9 ms a frame).
 7. **The Pad 3's H.264 decoder takes no input** in `dm/android/tests/t_media` (`[RED] movie: the AVC decoder took no input for 2 s`), before and
    after the fix in problem 1. Not yet tried in a game: an H.264 movie there may show black.
-8. **Link's Awakening draws wrongly on all three devices.** In play the 3D world is black behind the HUD; its movies and two of its HUD icons came out in
-   ring-banded colours (fixed). A pass dump (`dump_now`) of the overworld on the Odin 2 shows two separate faults:
+8. **Fixed: Link's Awakening drew wrongly on all three devices.** Its movies and two of its HUD icons came out in ring-banded colours, and in play the 3D
+   world was black behind the HUD. Pass dumps (`dump_now`) of the overworld on the Odin 2 showed where; its ambient occlusion is still missing:
    - **Fixed: the colours, a raw copy between two formats.** The frame's last target (`s4`, R11G11B10F) holds the right colours; the game then copies it
      into its RGBA8 window texture, and `copy_t2t` in `gfx_vk.c` copied the bits, since its test for a raw copy held for any two formats the replay does
      not convert on the CPU. A format change between float, normalized and sRGB formats is now a blit: [Texture copies that change format convert on
      Vulkan](../../docs/reference/rendering.md#texture-copies-that-change-format-convert-on-vulkan). The movies, the file select and the HUD have their
      colours on the Odin 2.
-   - **The black world: an occlusion of 0.** The scene is drawn (pass 22), but the pass that multiplies it by the ambient occlusion (pass 30, fragment
-     shader `933b6380fb6fc0f0`: occlusion × occlusion × scene) gets 0. The occlusion pass writes 1.0 everywhere (pass 25), and its five-tap blur
-     (pass 26: vertex shader `6e91ec1dc9c02f57`, fragment shader `359bd17463237937`) writes 0 from it. The blur's weights come from the vertex
-     constant buffer in slot 6 (the dump reads 0.070, 0.316, 0.227, 0.316 and 0.070 from guest memory) and reach the fragment shader in the varyings'
-     `z`: either the GPU sees other weights than the dump, or it reads the occlusion target as 0. Not pinned down yet; a Mac dump of the same frame is
-     the reference.
-   - The replay also skips the game's half-size depth-stencil copies: `[RED] [vk] texture copy with a format change or scaling between formats 130 and
-     130: not blittable on this GPU` (`D32_SFLOAT_S8_UINT`). The Mac draws them as a pass (`copy_t2t_draw`); the occlusion pass's stencil mask and the
-     depth of field read them.
+   - **Fixed: the black world, culled full-screen passes.** The scene was drawn (pass 22), but every pass after it kept its cleared value: the occlusion,
+     its blurs and the composite. A dump with each draw's depth and stencil tests showed the blurs and the composite had none, so they were culled: the
+     replay inverted the front face by the device's origin and the queue's raster flip together, which cancel for a game that keeps the lower-left origin
+     for both. It now inverts by the queue's flip alone, as Metal's draws do: [The front face follows the queue's raster flip alone on
+     Vulkan](../../docs/reference/rendering.md#the-front-face-follows-the-queues-raster-flip-alone-on-vulkan). The Ancient Ruins draw at 59.9 fps on the
+     Odin 2.
+   - **Open: no ambient occlusion.** The replay skips the game's half-size depth-stencil copies: `[RED] [vk] texture copy with a format change or scaling between formats 130 and
+     130: not blittable on this GPU` (`D32_SFLOAT_S8_UINT`). The Mac draws them as a pass (`copy_t2t_draw`). The occlusion pass tests its stencil (bit 1)
+     against the copy, so it writes nothing and its target keeps its cleared 1.0; the depth of field reads it too.
 9. **Link's Awakening crashes at boot** on every launch on the Retroid Pocket 5 (7 of 7), now and then on the Pad 3 (3 of 8), never on the Odin 2
    (0 of 10): `CRASH sig=11 pc=main+0x1c180` about 0.1 s in, in the constructor of the camera `MainCamera_1P`. It reads an entry of a 0x58-byte table at
    `main+0x1bcc898` by a 16-bit index that is still 0xFFFF, the default its caller sets at `main+0xbdb68` until a lookup fills it, so the read lands

@@ -1571,6 +1571,21 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** `spv_android.py` `dyn_components` loads the whole vec4 and picks the component with `OpSelect` on the index (`ANDROID_CHAIN` 3). All 9,192 rewritten modules pass `spirv-val --target-env vulkan1.1`.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): vertex shader `16684efcf1fa7d8d` (every layout pane). Found with `DM_VK_DUMP` (every pass's targets written out) and the shader's disassembly.
 
+### The front face follows the queue's raster flip alone on Vulkan
+
+- **Symptom:** Android only, a game that keeps NVN's lower-left window origin: the 3D world black (or missing post-processing) while closed meshes and the HUD draw;
+  single-sided full-screen passes that cull back faces write nothing, so their targets keep their cleared values.
+- **Cause:** the pipeline key inverted the front face by `g_origin_ll ^ g_queue_ll` (the device's origin and the queue's raster flip), the formula of Metal's CPU coverage
+  test (`nvn_cover`), which works in other coordinates. Metal's draws invert by the queue's flip alone; the viewport (flipped by the device's origin) places vertices the
+  same way on both backends, and both judge winding as seen in the framebuffer. Link's Awakening keeps the lower-left origin for its device and its queue, so the two
+  flips cancelled: its back-face culled passes (ambient occlusion, its four blurs, the composite into the frame) were culled whole. Light volumes, closed meshes, still lit
+  the scene, so a pass dump showed the scene drawn and everything after it at its clear value.
+- **Fix:** the key's `ll` is `g_queue_ll` (`gfx_vk_draw.inc`, three places: the key, the pipeline memo and its check). A game that switches its device to upper-left
+  before making its queue (every game so far but two) is unchanged, and so is one that makes its queue first (Xenoblade Chronicles 2).
+- **Check:** Link's Awakening on an Ayn Odin 2: the Ancient Ruins drawn, at 59.9 fps. A pass dump now logs each draw's depth-stencil attachment and its depth and stencil
+  tests, which ruled out a failing stencil test for the blurs.
+- **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 8).
+
 ### Texture copies that change format convert on Vulkan
 
 - **Symptom:** a whole frame, a movie or HUD art in bands of saturated colour that cycle as brightness changes (contour rings), the shapes intact.
