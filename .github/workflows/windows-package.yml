@@ -1,0 +1,56 @@
+# DroidPlay for Windows as one self-contained folder (dm/android/windows/stage.ps1): Python from python-build-standalone with the modules
+# scripts/nxnative_android.py.lock pins, and the tree as a release ships it. The script checks what it staged (--check's Python rows, the icon, the window opened
+# offscreen) and prints the sizes the installer will carry; the folder is kept as this run's artifact for a few days, to try on a PC. Pull requests that touch
+# what goes into it run this; release-assets.yml will call it for a release's installer.
+name: windows-package
+
+on:
+  pull_request:
+    paths:
+      - dm/android/windows/**
+      - scripts/nxnative_android.py
+      - scripts/nxnative_android.py.lock
+      - scripts/build_android_from_nsp.py
+      - .github/workflows/windows-package.yml
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: The version the staged tree's VERSION file says (default git describe)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-package-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  stage:
+    name: DroidPlay for Windows staged and checked
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # git describe names the version from the newest tag
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.7'
+          enable-cache: false
+      - name: Stage DroidPlay and check it
+        env:
+          VERSION: ${{ inputs.version }}   # through the environment, not pasted into the script
+        run: ./dm/android/windows/stage.ps1 -Out "$env:RUNNER_TEMP\DroidPlay" -Version "$env:VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: DroidPlay-staged
+          path: ${{ runner.temp }}/DroidPlay
+          retention-days: 7
+          compression-level: 6
