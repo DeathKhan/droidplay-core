@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - dm/android/windows/**
+      - dm/android/desktop/**
       - scripts/nxnative_android.py
       - scripts/nxnative_android.py.lock
       - scripts/build_android_from_nsp.py
