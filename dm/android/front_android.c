@@ -379,7 +379,7 @@ static void status_draw(void) {
     static const uint32_t bg[] = {0xFF101820, 0xFF101820, 0xFF0E3B1E, 0xFF4A1010, 0xFF101820, 0xFF202020, 0xFF4A1010, 0xFF101820};
     (*e)->CallVoidMethod(e, g_canvas, g_drawColor, (jint)bg[st]);
     float u = (float)(g_ext2.width < g_ext2.height ? g_ext2.width : g_ext2.height) / 20.f, y = 2.2f * u;
-    text("nxnative for Android", u, y, 1.4f * u, 0xFFFFFFFF); y += 1.6f * u;
+    text("DroidPlay", u, y, 1.4f * u, 0xFFFFFFFF); y += 1.6f * u;   // the app's name on the screen a game starts behind, as the launcher and the game apps say it
     static const char *what[] = {"starting", "self test running", "self test PASSED", "self test FAILED", "game running", "host finished", "host crashed: see log.txt", "NVN picture check"};
     char line[256]; snprintf(line, sizeof line, "state: %s", what[st]); text(line, u, y, 0.9f * u, 0xFFE0E0E0); y += 1.2f * u;
     if (st == ST_PASS) { text("Switch code ran natively: x18 slots, TLS, gates, imports, threads", u, y, 0.6f * u, 0xFFB0FFB0); y += 0.9f * u; }
@@ -612,7 +612,7 @@ void android_main(struct android_app *app) {
     snprintf(g_game, sizeof g_game, "%s/games/%s", g_ext, DM_GAME_ID);
     mkdirs(g_ext); mkdirs(g_int);
     log_start();
-    LOG("nxnative for Android: %s (%s), files %s, internal %s", DM_GAME_NAME, DM_GAME_ID, g_game, g_int);
+    LOG("DroidPlay on Android: %s (%s), files %s, internal %s", DM_GAME_NAME, DM_GAME_ID, g_game, g_int);   // a log's first line; its logcat tag stays nxnative (adb logcat -s nxnative)
     env_file(g_ext, "env.txt", 1); env_file(g_game, "launcher.txt", 0); env_file(g_game, "defaults.txt", 0);
     vk_driver_dirs(g_ext, g_int);   // DM_VK_DRIVER: a driver beside env.txt, run from a copy in the internal files
     (*app->activity->vm)->AttachCurrentThread(app->activity->vm, &g_env, NULL);
