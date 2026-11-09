@@ -71,7 +71,9 @@ Numbered in the order they were found, so links to a number stay right:
    times slower than the Odin 2's: a Smash battle made 682 to 943 pipelines in 11 to 12 s on it (1,147 in 3.1 s on the Odin 2, 368 in 12.5 s on the Retroid Pocket
    5), which is where its battle frames of 100 to 370 ms came from. The cache is now also written during play, after every 64 new pipelines and at most every
    15 s, on a thread of its own: [The pipeline cache written during play](../../docs/reference/rendering.md#the-pipeline-cache-written-during-play). Two Smash
-   battles on the Pad 3 afterwards: 32.3 and 34.0 fps, frame p95 37.7 and 38.6 ms (16.8 to 29.7 fps and 73 to 81 ms before; the stage differs from run to run).
+   battles on the Pad 3 afterwards: 32.3 and 34.0 fps, frame p95 37.7 and 38.6 ms (16.8 to 29.7 fps and 73 to 81 ms before; the stage differs from run to run). Pipelines met for the first time are now built in the background, their draws left out for a few frames: from an empty
+   cache, two battles at 40.0 and 40.2 fps against 27.9 and 26.5, frame p95 33 and 35 ms against 96 and 85: [Pipelines met for the first time built in the
+   background](../../docs/reference/rendering.md#pipelines-met-for-the-first-time-built-in-the-background).
 6. **The Retroid Pocket 5 cannot hold 60 fps in Odyssey's opening cutscene** (38 fps, GPU 12.9 ms a frame).
 7. **The Pad 3's H.264 decoder takes no input** in `dm/android/tests/t_media` (`[RED] movie: the AVC decoder took no input for 2 s`), before and
    after the fix in problem 1. Not yet tried in a game: an H.264 movie there may show black.
