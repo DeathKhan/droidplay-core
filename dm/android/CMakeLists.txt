@@ -3,11 +3,12 @@
 #   libdmhost_<GAME>.so  the game's host in the app: one APK carries the host of every game packed on the computer (scripts/build_android_from_nsp.py)
 #   dmhost               a command-line host for adb shell (headless: no window, silent audio unless DM_AUDIO=1), like the Mac's dmhost
 #   libnxloader.so       the NativeActivity's library: starts the host of the game the launcher picked (loader.c)
+#   libadrenotools.so, libhook_impl.so, libmain_hook.so   what DM_VK_DRIVER opens a Vulkan driver of the player's through (vk_driver.c), in every APK beside the hosts
 # Configure with the NDK's toolchain file and the game profile, as the Mac host is built per profile:
 #   cmake -G Ninja -S dm/android -B <build dir> -DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a
 #         -DANDROID_PLATFORM=android-29 -DGAME=<base game title ID> [-DDM_GAMES_DIR=<profiles folder outside dm/games>]
 cmake_minimum_required(VERSION 3.22)
-project(dmhost_android C ASM)
+project(dmhost_android C CXX ASM)
 
 if(NOT GAME)
   message(FATAL_ERROR "GAME is not set: -DGAME=<base game title ID> (dm/games/<id>)")
@@ -74,6 +75,7 @@ set(ANDROID_C
   ${CMAKE_CURRENT_SOURCE_DIR}/media_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/haptics_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/apple_stubs.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk_driver.c
   ${CMAKE_CURRENT_SOURCE_DIR}/gfx_${DM_GFX}.c)
 
 # char is signed, as on Apple arm64 (the host and its third-party code were written there); AArch64 Linux / Android makes plain char unsigned. bcdec read BC4 / BC5 SNORM
@@ -98,7 +100,8 @@ target_compile_options(dmcore PRIVATE
   -ffixed-x18 -fvisibility=hidden -fPIC -march=armv8.2-a+lse)
 target_compile_definitions(dmcore PRIVATE DM_ANDROID=1)
 
-set(DM_LIBS vpx log android aaudio mediandk vulkan m dl)
+# no libvulkan.so: vk_driver.c opens it, or DM_VK_DRIVER's driver in its place
+set(DM_LIBS vpx log android aaudio mediandk m dl)
 
 set(GLUE ${ANDROID_NDK}/sources/android/native_app_glue)
 add_library(dmhost_app SHARED $<TARGET_OBJECTS:dmcore> ${CMAKE_CURRENT_SOURCE_DIR}/front_android.c ${CMAKE_CURRENT_SOURCE_DIR}/nvn_demo.c ${GLUE}/android_native_app_glue.c)
@@ -118,6 +121,30 @@ target_include_directories(dmhost_cli PRIVATE $<TARGET_PROPERTY:dmcore,INTERFACE
 target_compile_options(dmhost_cli PRIVATE -include dm_android.h -ffixed-x18 -O1 -g -Wall)
 target_link_libraries(dmhost_cli ${DM_LIBS})
 target_link_options(dmhost_cli PRIVATE -Wl,-z,max-page-size=16384 -Wl,--error-limit=0)
+
+# libadrenotools (dm/third_party/libadrenotools, BSD 2-Clause), built as its CMake files build it. The host opens libadrenotools.so only when DM_VK_DRIVER is set: the
+# constructor of liblinkernsbypass, linked into it, rewrites the protection of the linker's dlopen page as it loads. The hooks are looked for in the app's native library
+# folder, which the manifests extract (extractNativeLibs)
+set(ADRENOTOOLS ${DM}/third_party/libadrenotools)
+add_library(linkernsbypass STATIC ${ADRENOTOOLS}/lib/linkernsbypass/android_linker_ns.cpp ${ADRENOTOOLS}/lib/linkernsbypass/elf_soname_patcher.cpp)
+target_include_directories(linkernsbypass PUBLIC ${ADRENOTOOLS}/lib/linkernsbypass)
+target_compile_options(linkernsbypass PRIVATE -fPIC -O2 -w)   # (its soname patcher truncates a snprintf on purpose)
+target_link_libraries(linkernsbypass android dl)
+add_library(adrenotools SHARED ${ADRENOTOOLS}/src/driver.cpp)
+target_include_directories(adrenotools PRIVATE ${ADRENOTOOLS}/include)
+target_compile_options(adrenotools PRIVATE -O2)
+target_link_libraries(adrenotools android log linkernsbypass)
+target_link_options(adrenotools PRIVATE -Wl,-s,--exclude-libs,liblinkernsbypass.a -Wl,--no-undefined -Wl,-z,max-page-size=16384)
+add_library(hook_impl SHARED ${ADRENOTOOLS}/src/hook/hook_impl.cpp)
+target_include_directories(hook_impl PRIVATE ${ADRENOTOOLS}/include)
+target_compile_options(hook_impl PRIVATE -O2)
+set_target_properties(hook_impl PROPERTIES CXX_VISIBILITY_PRESET hidden)
+target_link_libraries(hook_impl linkernsbypass log)
+target_link_options(hook_impl PRIVATE -Wl,-s -Wl,--no-undefined -Wl,-z,max-page-size=16384)
+add_library(main_hook SHARED ${ADRENOTOOLS}/src/hook/main_hook.c)
+target_compile_options(main_hook PRIVATE -O2)
+target_link_libraries(main_hook hook_impl)
+target_link_options(main_hook PRIVATE -Wl,-s -Wl,-z,global -Wl,--no-undefined -Wl,-z,max-page-size=16384)
 
 # Host unit tests for adb shell (-DDM_TESTS=ON): the sources and flags of dm/host/tests/Makefile, with the Android stand-ins (plat_android.c)
 option(DM_TESTS "build dm/host/tests for the device" OFF)
@@ -156,9 +183,10 @@ if(DM_TESTS)
   set(GFX_NO_IF ${GFX_C})
   list(REMOVE_ITEM GFX_NO_IF ${DM}/gfx/nvn/hle_nvn.c)
   dm_test(t_nvn SOURCES ${DM}/gfx/tests/t_nvn.c ${DM}/host/crash.c ${DM}/host/hle_bigstack.c ${GFX_NO_IF} ${CMAKE_CURRENT_SOURCE_DIR}/gfx_${DM_GFX}.c
-          ${CMAKE_CURRENT_SOURCE_DIR}/tests/t_android_stubs.c ${DM}/gfx/tests/t_host_stubs.c ${CMAKE_CURRENT_SOURCE_DIR}/apple_stubs.c ${GEN}/asm/nvn_entry.S ${GEN}/asm/nvn_thunks.S)
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/t_android_stubs.c ${DM}/gfx/tests/t_host_stubs.c ${CMAKE_CURRENT_SOURCE_DIR}/apple_stubs.c ${GEN}/asm/nvn_entry.S ${GEN}/asm/nvn_thunks.S
+          ${CMAKE_CURRENT_SOURCE_DIR}/vk_driver.c)
   target_include_directories(t_nvn PRIVATE ${DM}/gfx/nvn/include ${DM}/gfx/nvn ${DM}/gfx/tex ${DM}/third_party/vulkan-headers/include)
   target_compile_options(t_nvn PRIVATE -march=armv8.2-a+lse)
-  target_link_libraries(t_nvn vulkan)
+  target_link_libraries(t_nvn dl)
   target_link_options(t_nvn PRIVATE -Wl,--error-limit=0)
 endif()

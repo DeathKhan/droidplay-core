@@ -1,0 +1,44 @@
+# Adds DroidPlay for Windows' installer and droidnative's source to a release. Install DroidPlay.cmd downloads the source as droidnative-<version>.tar.xz
+# (about 55 MB) or .zip (about 90 MB) rather than the archive GitHub makes of the tag (about 130 MB): GitHub serves release assets from its download network,
+# where a download that is cut off can resume, and these leave out docs/ (screenshots) and .github/, which the app doesn't use. Publishing a release runs this
+# from the release's tag; Run workflow (from main) adds the assets to a release made before the tag had this file.
+name: release-assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release's tag (v0.2.0)
+        required: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  assets:
+    name: Installer and source assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - name: Pack the source and upload it with the installer
+        run: |
+          name="droidnative-${TAG#v}"
+          git archive --format=tar --prefix="$name/" HEAD ':!docs' ':!.github' | xz -9 -T0 > "$name.tar.xz"
+          git archive --format=zip -9 --prefix="$name/" HEAD ':!docs' ':!.github' > "$name.zip"
+          # GitHub turns the space of an asset's name into a dot; the label keeps it
+          cp dm/android/windows/install_droidplay.cmd Install.DroidPlay.cmd
+          ls -l "$name.tar.xz" "$name.zip" Install.DroidPlay.cmd
+          gh release upload "$TAG" "$name.tar.xz" "$name.zip" "Install.DroidPlay.cmd#Install DroidPlay.cmd" --clobber --repo "$GITHUB_REPOSITORY"

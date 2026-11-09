@@ -56,6 +56,8 @@ Numbered in the order they were found, so links to a number stay right:
    VP9 (Smash) take the software decoder and were not affected.
 2. **Brilliant Diamond crashes on the Retroid Pocket 5** in the Adreno 650 driver's shader compiler (`libllvm-qgl.so`, `addr=0x48`), while it builds its first
    pipelines. The newer drivers of the other two take the same SPIR-V. Which shader it is is not known yet: nothing logs each pipeline as it is built.
+   Mesa's Turnip compiles them: with `DM_VK_DRIVER` and Mr. Purple's Turnip T30, the game reaches Eterna City on the Retroid Pocket 5 and draws it right, at
+   11.3 fps ([Another Vulkan driver](README.md#another-vulkan-driver-dm_vk_driver)).
 3. **Fixed: Smash crashed at boot with Android's stock shared font.** The standard shared font was the device's Roboto, which has no TrueType hinting,
    and Smash's font engine needs a hinted font (`main+0x7caa0`, `addr=0x38`). The packer now copies a hinted TrueType font into each game's
    `font/standard.ttf` (Arial Unicode on a Mac, as the iPhone build does), and Smash boots on all three devices: [Android: the standard shared font must
