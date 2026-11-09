@@ -55,7 +55,9 @@ if (-not (Test-Path $Uv)) {
 Say 'getting Python and the app''s modules ready (the first time downloads about 150 MB)'
 & $Uv sync --quiet --script $App; if ($LASTEXITCODE) { throw "uv could not prepare the app's Python (exit $LASTEXITCODE)" }
 $ico = Join-Path $Home_ 'DroidPlay.ico'
-& $Uv run --quiet --script $App --write-icon $ico; if ($LASTEXITCODE) { throw "the app could not write its icon (exit $LASTEXITCODE)" }
+$env:QT_QPA_PLATFORM = 'offscreen'   # the icon is drawn without a window: no display needed, and no DPI warning
+& $Uv run --quiet --script $App --write-icon $ico; $code = $LASTEXITCODE; Remove-Item Env:QT_QPA_PLATFORM
+if ($code) { throw "the app could not write its icon (exit $code)" }
 
 $sh = New-Object -ComObject WScript.Shell
 foreach ($l in $Links) {
