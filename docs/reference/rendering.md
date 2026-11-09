@@ -1675,7 +1675,23 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   `defaults.txt` and `front_android.c` reads after `launcher.txt`, without overriding it or `env.txt` (a game app sets them in `GameStart.java`). Skyward Sword HD lists
   `DM_VK_WB_ABSORB=1`.
 - **Check:** Skyward Sword HD in Skyloft: 30 fps before, 59.7 on a OnePlus Pad 3 and 59.3 on an Ayn Odin 2 after, the picture unchanged. Each switch alone on the Pad 3:
-  `DM_VK_WB_ABSORB` 59.7 fps, `DM_VK_LINWB_SNAP` 56.3, `DM_VK_UP_RANGE` 30.
+  `DM_VK_WB_ABSORB` 59.7 fps, `DM_VK_LINWB_SNAP` 56.3, `DM_VK_UP_RANGE` 30. The Odin 2's figure was one run: later runs spread from 33 to 57 fps until the write-back's
+  staging was pooled too ([next entry](#a-1080p-linear-render-targets-write-back-staged-in-a-buffer-of-its-own-every-frame)).
+- **Found on:** [The Legend of Zelda: Skyward Sword HD](../../dm/games/01002DA013484000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 11).
+### A 1080p linear render target's write-back staged in a buffer of its own every frame
+
+- **Symptom:** Android only: a game with a frame-sized linear render target switches its present interval between 1 and 2 in play, and settles at 30 fps in some runs
+  and near 60 in others; its long frames show `submit+present` far above the GPU time and no uploads, and `DM_VK_STG_STAT=1` counts about one `vkAllocateMemory` and
+  one `vkFreeMemory` a frame, with requests given a buffer of their own `over 4 MB`.
+- **Cause:** staging (`gfx_vk.c`, slices of pooled blocks) cut requests up to 4 MB from 8 MB blocks, and a larger one got a buffer of its own. Skyward Sword HD
+  writes its 1920×1080 RGBA8 target (8.3 MB) back every frame, so every frame the render thread's `vkAllocateMemory` zeroed 8 MB (13.6% of that thread on an Ayn
+  Odin 2), and the completion thread took the first-touch faults of reading the new pages and freed them, 7 to 8 ms in all before the chunk's fence, which the game's
+  next frame waits on. `DM_VK_WB_ABSORB` (above) took away the upload that followed the write-back, not this.
+- **Fix:** blocks of 16 MiB, and a request as large as a block is cut from one (a 1920×1080 RGBA16F target, 16.6 MB, fits too). At most 128 MiB of blocks, the same
+  eight as before, and blocks left idle are still freed (`sp_trim`).
+- **Check:** Skyward Sword HD in Skyloft on an Ayn Odin 2: 53.4, 32.9 and 56.9 fps before (frame p95 32 to 36 ms, 42 to 128 interval switches a run), 60.0, 59.9 and
+  59.9 after (p95 17.6 to 18.8 ms, 4 switches), write-backs landing in 5.6 ms a frame on average instead of 7 to 8, and no staging buffer of its own in a run. On a
+  OnePlus Pad 3, 57.5 fps before and 60.0 after. Odyssey, Brilliant Diamond, Animal Crossing and Link's Awakening unchanged on both, and Smash on the Pad 3.
 - **Found on:** [The Legend of Zelda: Skyward Sword HD](../../dm/games/01002DA013484000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 11).
 ### The pipeline cache written during play
 

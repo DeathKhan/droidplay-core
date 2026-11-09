@@ -313,6 +313,10 @@ static void cb_barrier(void) {
 // At most SP_NBLK blocks exist (SP_KEEP); a request over SP_MAXREQ, or one made while every block is taken and the cap is reached, gets a buffer of its own as before, freed
 // in chunk_done. Blocks the free list held through a whole window of SP_TRIM chunk completions (it never fell below that many) were not needed: they are freed, one a
 // completion after its fence (sp_trim), so a loading burst's blocks do not stay (a window is about 4 s of Breath of the Wild at 56 chunks a frame and 20 fps).
+// Blocks were 8 MB and requests over 4 MB had a buffer of their own: Skyward Sword HD's 1920x1080 RGBA8 linear target (8.3 MB, written back every frame) did, its
+// vkAllocateMemory zeroing 8 MB on the render thread (13.6% of it on an Ayn Odin 2), and on the completion thread the first-touch faults of reading those pages and their free,
+// 7 to 8 ms a frame before the chunk's fence: its long frames' submit+present, and so its present interval falling to 2. Blocks are now 16 MiB and a request as large as a
+// block is cut from one (a 1920x1080 RGBA16F target, 16.6 MB, fits), at most 128 MiB of them: the same 8 blocks.
 // A slice is handed out by value (buffer, offset, mapped pointer, the write-back's name for its buffer). stg_take returned a pointer into C->stg, which realloc moves:
 // vt_upload_, copy_b2t, copy_t2b and mtl_read_texels called cb() after it, and cb() -> rp_end -> lin_writeback -> stg_take grows C->stg when a pass was open (stage_textures'
 // uploads end a pass begun before), so they wrote through and copied from a freed stg_t, and copy_t2b and mtl_read_texels took its index (s - C->stg) after cb(). A slice taken
@@ -321,7 +325,7 @@ static void cb_barrier(void) {
 // DM_VK_STG_POOL=0 (env.txt): a buffer per request, as before. DM_VK_STG_STAT=1: a line every 300 frames with the staging vkAllocateMemory / vkFreeMemory calls a frame and
 // the pool's counts (mtl_mem_stat)
 typedef struct { VkBuffer b; VkDeviceSize off; uint8_t *p; int st; } stg_sl;   // a slice: its buffer and its offset there (bufferOffset; a write-back's wb_t.off), its mapped bytes, the write-back's wb_t.st; p NULL: none
-enum { SP_BLOCK = 8u << 20, SP_MAXREQ = 4u << 20, SP_KEEP = 64u << 20, SP_NBLK = SP_KEEP / SP_BLOCK, SP_TRIM = 4096, SP_ST = 1 << 24 };   // SP_MAXREQ: Breath of the Wild's 512x512 RGBA8 linear target (1 MiB) and its uploads stay pooled
+enum { SP_BLOCK = 16u << 20, SP_MAXREQ = SP_BLOCK, SP_KEEP = 128u << 20, SP_NBLK = SP_KEEP / SP_BLOCK, SP_TRIM = 4096, SP_ST = 1 << 24 };   // SP_MAXREQ: a 1920x1080 RGBA8 or RGBA16F linear target (8.3 / 16.6 MB) and its uploads stay pooled
 static pthread_mutex_t g_sp_mu = PTHREAD_MUTEX_INITIALIZER; static stg_t g_sp_free[SP_NBLK]; static int g_sp_nfree, g_sp_nblk, g_sp_low;   // under g_sp_mu: the free list, the blocks alive, the free list's least length this window
 static int g_sp_on = -1; static uint64_t g_sp_slices, g_sp_big, g_sp_full, g_sp_made; static _Atomic uint64_t g_sp_trimmed;   // slices cut, requests over SP_MAXREQ, requests with the pool at its cap, blocks made / trimmed
 static int stg_pool_on(void) {
@@ -378,7 +382,7 @@ static void sp_done(chunk *c) {
 }
 // the completion thread, in chunk_thread once the chunk's NVN fence, write-backs (g_inflight_wb), g_seq_done and busy are published: every SP_TRIM completions, the blocks
 // the free list held all along leave it, and one of them is freed a completion. Freed in chunk_done, a trim's vkDestroyBuffer + vkFreeMemory of up to SP_NBLK blocks
-// (kgsl_sharedmem_free and an munmap of 2,048 pages each) ran before the chunk's fence and write-backs counted as done, so every sync on them waited for all of those frees
+// (kgsl_sharedmem_free and an munmap of 4,096 pages each) ran before the chunk's fence and write-backs counted as done, so every sync on them waited for all of those frees
 // at once; here the game's fence wait, submit_wait / seq_wait and cur() are released first, and one block's free delays at most the next chunk's completion
 static void sp_trim(void) {
     static stg_t gone[SP_NBLK]; static int ngone; static unsigned win;   // completion thread only: blocks taken off the free list, not freed yet (still in g_sp_nblk, so at most SP_NBLK exist)

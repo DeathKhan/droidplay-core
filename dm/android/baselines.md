@@ -105,7 +105,10 @@ Numbered in the order they were found, so links to a number stay right:
     linear render target s19 1920x1080 (format 0x25) written back to guest memory`) and uploading it again (`texture uploads 0 first + 2 re-uploads,
     15.8 MB`), with submit and present taking up to 36 ms while the GPU takes 5 ms on the Odin 2. Its profile now turns on `DM_VK_WB_ABSORB` (59.7 fps
     on the Pad 3, 59.3 on the Odin 2): [A linear render target uploaded again after its own write-back, every
-    frame](../../docs/reference/rendering.md#a-linear-render-target-uploaded-again-after-its-own-write-back-every-frame). Link's Awakening's overworld
+    frame](../../docs/reference/rendering.md#a-linear-render-target-uploaded-again-after-its-own-write-back-every-frame). That Odin 2 figure was one run:
+    later runs spread from 33 to 57 fps, the write-back's 8.3 MB staging buffer being made and freed every frame. It is pooled now (60 fps in three runs of
+    three on the Odin 2, 60.0 on the Pad 3): [A 1080p linear render target's write-back staged in a buffer of its own every
+    frame](../../docs/reference/rendering.md#a-1080p-linear-render-targets-write-back-staged-in-a-buffer-of-its-own-every-frame). Link's Awakening's overworld
     likewise falls to 31 fps on the Pad 3: the game switched interval 175 times in one run there, against 4 on the Odin 2.
 
 ## Reading the numbers
