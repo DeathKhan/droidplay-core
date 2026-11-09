@@ -1040,19 +1040,29 @@ def latest_release():   # the newest release on GitHub: its tag and its page. Ra
     return d['tag_name'], d['html_url']
 
 
-class UpdateBar(QWidget):   # under the top bar, on every page, while a newer release is out and the player hasn't put it off
+def uv_install():   # DroidPlay as Install DroidPlay.cmd installed it before 0.5.0: uv runs it from %LOCALAPPDATA%\DroidPlay\droidnative
+    la = os.environ.get('LOCALAPPDATA')
+    return os.name == 'nt' and bool(la) and REPO == Path(la, 'DroidPlay', 'droidnative').resolve()
+
+
+class UpdateBar(QWidget):   # under the top bar, on every page, while a newer release is out and the player hasn't put it off; or, once, the installer
     def __init__(self, win):
         super().__init__(); self.win = win; self.tag = self.url = None; self.setObjectName('updatebar'); self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet('QWidget#updatebar { background: rgba(61,220,132,0.10); border-bottom: 1px solid rgba(61,220,132,0.25); }')
         lay = QHBoxLayout(self); lay.setContentsMargins(28, 10, 28, 10); lay.setSpacing(14)
         self.text = label(''); self.text.setStyleSheet('font-size: 14px; font-weight: 600'); lay.addWidget(self.text); lay.addStretch()
-        get = QPushButton('Download'); get.clicked.connect(lambda: self.url and QDesktopServices.openUrl(QUrl(self.url))); lay.addWidget(get)
+        self.get = QPushButton('Download'); self.get.clicked.connect(lambda: self.url and QDesktopServices.openUrl(QUrl(self.url))); lay.addWidget(self.get)
         later = QPushButton('Not now'); later.setObjectName('ghost'); later.clicked.connect(self.later); lay.addWidget(later)
         self.hide()
     def show_release(self, tag, url):
-        self.tag, self.url = tag, url
+        self.tag, self.url = tag, url; self.get.setText('Download')
         self.text.setText(f'DroidPlay {tag.lstrip("v")} is out. Download its installer from the release page; your games, builds and settings stay.'); self.show()
-    def later(self): self.win.st.setValue('update/later', self.tag); self.hide()   # until the release after it
+    def show_switch(self):   # once, in the copy Install DroidPlay.cmd installed: Setup replaces it (droidplay.iss removes the old folder and shortcuts)
+        self.tag, self.url = None, 'https://github.com/enjoyerofslop/droidplay-core/releases/latest'; self.get.setText('Get the installer')
+        self.text.setText('DroidPlay has an installer now: it installs like any Windows app, with an entry in Settings › Apps, and replaces this copy. '
+                          'Your games, builds and settings stay.'); self.show()
+    def later(self):   # a release until the one after it; the installer for good
+        self.win.st.setValue('update/later' if self.tag else 'switch/later', self.tag or '1'); self.hide()
 
 
 # ---------------- The window ----------------
@@ -1093,6 +1103,7 @@ class Window(QMainWindow):
         self.settings.run(then=lambda rows: self.go('settings') if any(not r['ok'] for r in rows) else None)
         if os.name == 'nt': self.dark_title()
         self.settings.show_update(None)
+        if uv_install() and not self.st.value('switch/later', ''): self.updatebar.show_switch()
         QTimer.singleShot(5000, self.check_updates); self.update_t = QTimer(self); self.update_t.timeout.connect(self.check_updates); self.update_t.start(24 * 3600 * 1000)
 
     def check_updates(self, asked=False):   # at launch and once a day; Settings' Check for updates asks too. Quiet when it can't reach GitHub, unless asked
