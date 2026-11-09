@@ -880,7 +880,7 @@ class PerformancePage(QWidget):
         if self.proc and self.proc.state() != QProcess.NotRunning: self.proc.kill(); self.b_run.setText('Watch the log'); return
         s = self.win.serial()
         if not s: self.win.toast('Connect a phone first (Phones)'); return
-        self.proc = QProcess(self); self.proc.setProgram('adb'); self.proc.setArguments(['-s', s, 'logcat', '-T', '200', '-s', 'nxnative'])
+        self.proc = QProcess(self); self.proc.setProgram('adb'); self.proc.setArguments(['-s', s, 'logcat', '-T', '200', '-s', 'DroidPlay', 'nxnative'])   # the app's tag; nxnative from an app older than 0.5.0
         self.proc.readyReadStandardOutput.connect(self.read); self.proc.start(); self.b_run.setText('Stop watching')
     def read(self):
         if not self.proc: return
