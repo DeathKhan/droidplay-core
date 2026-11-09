@@ -154,6 +154,15 @@ def log_facts(logcat, ready):
     return out
 
 
+# The ready line from the host's own log when logcat lost it: Android 16 drops lines from an app that logs fast (Link's Awakening logs each file open twice on the
+# OnePlus Pad 3), and log.txt keeps them all. Only lines carrying the host's clock (fs open [N s]) give a time; shift turns it into seconds from the launch
+def ready_in_log(text, ready, shift):
+    for line in text.splitlines():
+        m = re.search(r'\[([0-9.]+)s\]', line)
+        if m and re.search(ready, line): return round(float(m.group(1)) + shift, 2)
+    return None
+
+
 def run_one(serial, folder, gid, route, n, out, args):
     d = out / f'{gid}_{route["name"]}_r{n}'; d.mkdir(parents=True, exist_ok=True)
     sh(serial, f'am force-stop {PKG}')
@@ -213,6 +222,7 @@ def run_one(serial, folder, gid, route, n, out, args):
     if env_before.strip(): adb(serial, 'push', str(write_tmp(d / 'env_before.txt', env_before)), f'{EXT}/env.txt')
     else: sh(serial, f'rm -f {EXT}/env.txt')
     facts = log_facts((d / 'logcat.txt').read_text(errors='replace'), route['ready'])
+    if route['ready'] and facts['ready_s'] is None: facts['ready_s'] = ready_in_log((d / 'log.txt').read_text(errors='replace'), route['ready'], facts['shift'])
     rows = frames((d / 'frames.tsv').read_text(errors='replace'))
     for r in rows.values():
         if '@t_s' in r: r['@t_s'] += facts['shift']

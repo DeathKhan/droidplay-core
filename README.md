@@ -35,6 +35,8 @@ maintainer's choice: Android work belongs here, not there. Everything below the 
 | Animal Crossing: New Horizons 3.0.3 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Runs at 30 fps (as on the Switch) in the new game's airport on all three, and outside the player's house on the Odin 2 and Pad 3; not played through |
 | Super Mario Odyssey 1.4.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | The Start menu at 60 fps, the opening cutscene at 60 (38 on the Retroid Pocket 5), and play in the Cap Kingdom at 60 on the Odin 2, past the hint video that used to crash it (the host's AVC decoder, fixed) |
 | Super Smash Bros. Ultimate 13.0.5 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Boots to its opening movie at 60 fps on all three, with the hinted shared font the packer now ships (Android's Roboto made it crash); battles at 40–59 fps on the Odin 2, 13–30 fps on the other two (pipelines built during play) |
+| The Legend of Zelda: Link's Awakening 1.1.0 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | **Draws wrongly:** the movies and some HUD icons in banded colours, the 3D world black in play (60 fps on the Odin 2, 31 on the Pad 3). **Crashes at boot** on every launch on the Retroid Pocket 5, now and then on the Pad 3 |
+| The Legend of Zelda: Skyward Sword HD 1.0.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | The opening movie at 55–60 fps (41 on the Retroid Pocket 5); Skyloft plays at 30 fps with grey terrain on the Odin 2 and Pad 3 |
 | The Legend of Zelda: Breath of the Wild 1.9.0 | Ayn Odin 2 | Runs with a correct picture at about 20 fps (CPU-bound in the Vulkan replay) † |
 | Super Mario Bros. Wonder 1.2.1 | POCO X5 5G (Adreno 619) | Playable: about 30 fps at render scale 0.8 † |
 | Super Mario 3D World + Bowser's Fury 1.2.2 | POCO X5 5G | Bowser's Fury runs with correct colours; one launch stopped at a black loading screen † |
@@ -43,8 +45,8 @@ maintainer's choice: Android work belongs here, not there. Everything below the 
 
 † Tested before droidnative merged nxnative's `main` (2026-11-08); not run since.
 
-The first four rows are from the [Android baselines](dm/android/baselines.md) of 2026-11-08: the same scripted runs on each device, with frame times, the devices'
-drivers, and the known problems in the order they block play.
+The first six rows are from the [Android baselines](dm/android/baselines.md) of 2026-11-08: the same scripted runs on each device, with frame times, the devices'
+drivers, and the known problems with what is known of their causes.
 
 Every other game in the [games table](dm/games/README.md#games) has a profile and can be packed the same way, but has not been run on Android. A game without a
 profile can still be packed as an *experimental build*: most likely it does not boot, but it is the starting point for porting it.

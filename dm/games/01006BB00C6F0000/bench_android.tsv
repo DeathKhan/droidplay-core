@@ -1,0 +1,4 @@
+# Android benchmark routes for scripts/bench_android.py: name <TAB> DM_KEYS or - <TAB> save or - <TAB> window start s <TAB> window length s <TAB> ready pattern or - <TAB> description [<TAB> KEY=VALUE;KEY=VALUE]
+# ready (boot): the opening movie opens; (ruins): the overworld's level loads after the file select (DM_FS=1 logs both)
+boot	-	-	30	30	movie/opening\.webm	a fresh save: the opening movie (VP9, decoded into the game's texture); no input
+ruins	8:A*3/2,16:L+R~0.4*2/5,18.5:A*2/5	saves/ruins	35	30	level/Field/Field\.lvb	a save at the Ancient Ruins after the fifth dungeon (techhit's save, GBAtemp thread 549404): A skips the opening movie, L+R at the title, A for File 1, then Link standing in the overworld

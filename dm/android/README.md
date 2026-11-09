@@ -168,7 +168,7 @@ python3 scripts/bench_android.py <NSP folder> [<NSP folder> ...] [-s <serial> ..
   - a description
   - optionally, switches the route needs (`DM_FIXED_TIME` for a scene that follows the clock, `DM_SHARED_FONT`, `DM_KBD`)
 
-  The first routes are Super Mario Odyssey's Start menu and opening cutscene, Brilliant Diamond's language menu and Eterna City, Animal Crossing's airport and island, and Smash's opening movie and a battle. Results are in [baselines.md](baselines.md).
+  The first routes are Super Mario Odyssey's Start menu and opening cutscene, Brilliant Diamond's language menu and Eterna City, Animal Crossing's airport and island, Smash's opening movie and a battle, Link's Awakening's opening movie and overworld, and Skyward Sword HD's opening movie and Skyloft. Results are in [baselines.md](baselines.md).
 - **Each run:**
   1. waits for the device to cool down
   2. copies the route's save into a folder of the run's own under the app's external files (`files/bench_runs/`), with `DM_SAVE` pointing there, so the device's own saves aren't touched
