@@ -23,7 +23,7 @@ try:
     from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap  # pyright: ignore[reportMissingImports]
     from PySide6.QtSvg import QSvgRenderer  # pyright: ignore[reportMissingImports]
     from PySide6.QtWidgets import (  # pyright: ignore[reportMissingImports]
-                                   QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
+                                   QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
                                    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                    QProgressBar, QPushButton, QRadioButton, QScrollArea, QSplitter, QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
                                    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -485,6 +485,7 @@ class LibraryPage(QWidget):
         if state == 'tools': self.win.go('setup'); return   # the checklist's Install tools
         if state in ('play', 'install') and not s: self.win.toast(self.win.no_phone()); return
         if state == 'play':
+            if not self.first_start_ok(g, s): return
             bg(lambda: adb_run(s, 'shell', 'am', 'start', '-n', f'{PKG}/.Launcher', '--es', 'game', g.id, '--ez', 'play', 'true'),
                lambda r: self.win.toast(f'Starting {g.name} on {self.win.phone_name()}' if not isinstance(r, Exception) and r[0] else f'Could not start it: {r}'))
         elif state == 'install': self.run(g, ['--push-only'], 'Install')
@@ -506,7 +507,22 @@ class LibraryPage(QWidget):
             if not s: self.win.toast(self.win.no_phone()); return
             if self.win.phone_legacy and not self.legacy_ok(s): return
             args += ['--serial', s]
-        self.win.builds.start(f'{what} {g.name}', args + extra, after=after or self.after_task)
+        done = after or self.after_task
+        def installed():   # it went onto that phone: the next Play there is a first start, with its shaders to prepare
+            self.win.st.setValue(f'firststart/{s}/{g.id}', True); done()
+        self.win.builds.start(f'{what} {g.name}', args + extra, after=installed if '--serial' in args else done)
+    def first_start_ok(self, g, s):   # the first Play since the game went onto this phone: say the screen stays black a while, so it isn't taken for a crash
+        key = f'firststart/{s}/{g.id}'
+        if not self.win.st.value(key, False, type=bool) or self.win.st.value('firststart/never', False, type=bool): return True
+        box = QMessageBox(QMessageBox.Information, 'The first start', '<b>The first start takes a minute or two.</b>', parent=self)
+        box.setInformativeText(f'{self.win.phone_name()} prepares {g.name}\'s shaders first, and stays on the loading screen meanwhile (80 seconds for Brilliant '
+                               'Diamond on a Galaxy S25 Edge, 39 on a OnePlus Pad 3). The phone may get warm. Later starts take a few seconds.')
+        box.setStyleSheet('QLabel#qt_msgbox_informativelabel { min-width: 460px; }')   # Qt sizes a message box to its title line: the text wrapped in a narrow column
+        never = QCheckBox("Don't show this again"); box.setCheckBox(never)
+        go = box.addButton('Play', QMessageBox.AcceptRole); box.addButton(QMessageBox.Cancel); box.setDefaultButton(go); box.exec()
+        if never.isChecked(): self.win.st.setValue('firststart/never', True)
+        if box.clickedButton() is not go: return False
+        self.win.st.remove(key); return True
     def game_app(self, g):   # the game as an app of its own (build_android_from_nsp.py --game-apk): no phone, and the launcher app on the phones is left as it is
         ex = (g.info.get('extracted') or {}).get(self.win.st.value(f'ver/{g.id}', '') or g.newest) or {}
         rom = ex.get('romfs_bytes'); data = f'its {gb_text(rom)} of game data' if rom else 'its game data'
