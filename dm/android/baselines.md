@@ -70,12 +70,13 @@ Numbered in the order they were found, so links to a number stay right:
 6. **The Retroid Pocket 5 cannot hold 60 fps in Odyssey's opening cutscene** (38 fps, GPU 12.9 ms a frame).
 7. **The Pad 3's H.264 decoder takes no input** in `dm/android/tests/t_media` (`[RED] movie: the AVC decoder took no input for 2 s`), before and
    after the fix in problem 1. Not yet tried in a game: an H.264 movie there may show black.
-8. **Link's Awakening draws wrongly on all three devices.** Its movies and two of its HUD icons come out in ring-banded colours, and in play the 3D world
-   is black behind the HUD. A pass dump (`dump_now`) of the overworld on the Odin 2 shows two separate faults:
-   - **The colours: a raw copy between two formats.** The frame's last target (`s4`, R11G11B10F) holds the right colours; the game then copies it into
-     its RGBA8 window texture. `copy_t2t` in `gfx_vk.c` takes the raw `vkCmdCopyImage` path whenever `s->conv == d->conv && s->px == d->px`, which
-     holds for any two formats the replay does not convert on the CPU (both are 0), so the packed-float bits land in the window as bytes. A raw copy
-     should be kept for the same format (or the same CPU conversion), and a format change should be a blit.
+8. **Link's Awakening draws wrongly on all three devices.** In play the 3D world is black behind the HUD; its movies and two of its HUD icons came out in
+   ring-banded colours (fixed). A pass dump (`dump_now`) of the overworld on the Odin 2 shows two separate faults:
+   - **Fixed: the colours, a raw copy between two formats.** The frame's last target (`s4`, R11G11B10F) holds the right colours; the game then copies it
+     into its RGBA8 window texture, and `copy_t2t` in `gfx_vk.c` copied the bits, since its test for a raw copy held for any two formats the replay does
+     not convert on the CPU. A format change between float, normalized and sRGB formats is now a blit: [Texture copies that change format convert on
+     Vulkan](../../docs/reference/rendering.md#texture-copies-that-change-format-convert-on-vulkan). The movies, the file select and the HUD have their
+     colours on the Odin 2.
    - **The black world: an occlusion of 0.** The scene is drawn (pass 22), but the pass that multiplies it by the ambient occlusion (pass 30, fragment
      shader `933b6380fb6fc0f0`: occlusion × occlusion × scene) gets 0. The occlusion pass writes 1.0 everywhere (pass 25), and its five-tap blur
      (pass 26: vertex shader `6e91ec1dc9c02f57`, fragment shader `359bd17463237937`) writes 0 from it. The blur's weights come from the vertex
