@@ -127,8 +127,8 @@ modules the script names at its top; `python scripts/nxnative_android.py` works 
    that it is from the internet and unsigned: **More info**, then **Run anyway**). It installs [uv](https://docs.astral.sh/uv/) for you, puts the newest release
    in `%LOCALAPPDATA%\DroidPlay` with Python and the app's modules, adds DroidPlay to the Start menu and the desktop, and opens it. The release comes from its
    assets (about 55 MB, or 90 MB where Windows' own tar can't read xz files, then about 150 MB of Python and modules the first time), and a download that is cut
-   off carries on from where it stopped when you run the installer again. Run it again to update; `Install DroidPlay.cmd uninstall` removes it
-   (`dm/android/windows/install_droidplay.cmd` is the same file). Or by hand: install uv
+   off carries on from where it stopped when you run the installer again. Run it again to update, with DroidPlay closed (it stops if DroidPlay is open);
+   `Install DroidPlay.cmd uninstall` removes it (`dm/android/windows/install_droidplay.cmd` is the same file). Or by hand: install uv
    (`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`), get droidnative (`git clone https://github.com/enjoyerofslop/droidnative`)
    and, in its folder, `uv run scripts\nxnative_android.py`.
 2. In **Settings**, pick your `prod.keys`, then **Install what's missing**: it downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder
