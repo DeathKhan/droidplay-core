@@ -859,10 +859,11 @@ static _Atomic uint64_t g_sync_ns;
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
-    if(o->fenced==3) { if(nvn_sync_wait(o,0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; uint64_t t0=now_ns(); int ok=nvn_sync_wait(o,timeout); atomic_fetch_add(&g_sync_ns,now_ns()-t0); return ok?NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED:NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
+    if(o->fenced==3) { if(nvn_sync_wait(o,0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; uint64_t t0=now_ns(); dm_host_work++; int ok=nvn_sync_wait(o,timeout); dm_host_work--; atomic_fetch_add(&g_sync_ns,now_ns()-t0); return ok?NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED:NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
     if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
+    // A blocking wait for the GPU is a kernel wait on the Switch: the thread is off its core meanwhile (dm_host_work: a thread it holds back runs, hle_thread.c thr_runnable)
+    uint64_t t0 = now_ns(); dm_host_work++; int ok = w(o->fence, timeout); dm_host_work--; atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
     { static _Atomic uint64_t n, ns, acq, lag; uint64_t d = now_ns() - t0, k = atomic_fetch_add(&n, 1) + 1; atomic_fetch_add(&ns, d); if (o->fenced == 2) atomic_fetch_add(&acq, 1);
       atomic_fetch_add(&lag, mtl_last_fence() - o->fence);   // submissions made since the fence: 0 = waits for the newest
       if (!(k & 255)) LOG("[nvn] SyncWait blocked %llu times: mean %.2f ms, window acquires %llu, mean submissions behind the newest %.2f", (unsigned long long)k, (double)atomic_load(&ns) / 1e6 / (double)k,
@@ -919,7 +920,7 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { nvn_queue_finish((queue_t *)q); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { dm_host_work++; nvn_queue_finish((queue_t *)q); dm_host_work--; }   // a GPU wait, off the guest core (nvnSyncWait)
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
@@ -1573,6 +1574,9 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     *idx = o->ntex ? o->next++ % o->ntex : 0;
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
     uint64_t at = *idx < 4 ? o->avail[*idx] : 0, now = dm_detclock_enabled() ? guest_ns() : now_ns(), wait = at > now ? at - now : 0, pace_ns = 0;
+    // The waits below are a kernel wait on the Switch, where the thread leaves its core to lower-priority threads of that core; on the host they are sleeps in host code, which
+    // counted as running: Super Mario Odyssey's scene-initialization and resource loader threads, woken by the main thread, waited for it a whole frame (hle_thread.c wake_defer)
+    dm_host_work++;
     if (!dm_detclock_enabled()) {   // Register the acquire thread as a time-constraint thread (no longer registered only when it "arrived early": it must also declare itself when it is constantly behind in the hot state)
         static uint64_t rt_period; uint64_t period = present_period(o), rtp = rt_period_ns(o, period);
         if (rtp && rt_period != rtp) { rt_period = rtp; set_time_constraint(rtp); }
@@ -1597,6 +1601,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); nvn_queue_present_wait(tk); nvn_queue_present_release(tk); o->ticket[*idx]=0; g_pq_wait_ns += now_ns() - w0; }
+    dm_host_work--;
 #if DM_ANDROID
     static int safe = -1; if (safe < 0) safe = getenv("DM_VK_SAFE") != NULL;   // DM_VK_SAFE: the replay's earlier syncs, to bisect a regression (gfx_vk.c vk_safe)
     if (s) { uint64_t *pf = safe ? NULL : win_pfence(w); nvn_sync_release((sync_t *)s); ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = pf && *idx >= 0 && *idx < 4 ? pf[*idx] : mtl_last_fence(); }

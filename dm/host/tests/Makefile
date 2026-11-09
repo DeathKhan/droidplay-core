@@ -41,6 +41,7 @@ run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_to
 	$(B)/t_pollwait
 	$(B)/t_preempt
 	$(B)/t_preempt --all-peers
+	$(B)/t_wake_defer
 	$(B)/t_pctl
 	$(B)/t_net_eventfd
 	$(B)/t_sf
@@ -260,11 +261,14 @@ $(B)/t_pollwait: t_pollwait.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_pollwait.c t_condvar_stub.c
 $(B)/t_preempt: t_preempt.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_preempt.c t_condvar_stub.c
+$(B)/t_wake_defer: t_wake_defer.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_wake_defer.c t_condvar_stub.c
 .PHONY: preempt
-preempt: $(B)/t_preempt
+preempt: $(B)/t_preempt $(B)/t_wake_defer
 	$(B)/t_preempt
 	$(B)/t_preempt --all-peers
-run: $(B)/t_preempt
+	$(B)/t_wake_defer
+run: $(B)/t_preempt $(B)/t_wake_defer
 # the Vorbis tests build their own packets and need no game profile (they build without GAME)
 $(B)/t_vorbis: t_vorbis.c ../../third_party/stb_vorbis/stb_vorbis.c | $(B)
 	$(CLANG) -O1 -g -Wno-unused-function -Wno-tautological-compare -o $@ t_vorbis.c
@@ -352,7 +356,7 @@ include ../../sanitizers/sanitizers.mk
 asan:
 	@$(call san_fresh,$(B)/asan,$(ASAN_FLAGS))
 	$(ASAN_ENV) $(MAKE) B=$(B)/asan SAN="$(ASAN_FLAGS)" run
-TSAN_T = t_audio t_audio_stats t_audio_device t_thread_leak t_oe t_fs_commit_list t_fs_case t_save_sync t_condvar t_condvar_old t_preempt t_system_event t_notify_sched t_altstack t_sync_wait
+TSAN_T = t_audio t_audio_stats t_audio_device t_thread_leak t_oe t_fs_commit_list t_fs_case t_save_sync t_condvar t_condvar_old t_preempt t_wake_defer t_system_event t_notify_sched t_altstack t_sync_wait
 tsan-threads:
 	@$(call san_fresh,$(B)/tsan,$(TSAN_FLAGS))
 	$(TSAN_ENV) $(MAKE) B=$(B)/tsan SAN="$(TSAN_FLAGS)" tsan-threads-run
@@ -369,6 +373,7 @@ tsan-threads-run: $(addprefix $(B)/,$(TSAN_T))
 	$(B)/t_condvar_old
 	$(B)/t_preempt
 	$(B)/t_preempt --all-peers
+	$(B)/t_wake_defer
 	$(B)/t_system_event
 	$(B)/t_notify_sched
 	$(B)/t_notify_sched --all-peers
