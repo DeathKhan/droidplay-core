@@ -281,6 +281,10 @@ class Phone(Base):
         writes = [c for c in flat if not c.startswith('shell [ -e ')]   # the one-game layout is only looked for
         self.assertFalse(any(f'{ba.REMOTE}/game/' in c or c.endswith(f'{ba.REMOTE}/game') for c in writes), writes)
 
+    def test_launcher_files_end_lines_with_newline_alone(self):   # on Windows too: the desktop app reads game.json by lines, and the \r of \r\n split its JSON
+        ba.push_game('S', GID, self.game, self.patched, None, self.font, self.tmp / 'aoc', 'DM_LANG=en-US\n', self.tmp, self.tmp / 'logs', {'title_id': GID, 'name': 'x'})
+        for f in ('android_game.json', 'android_defaults.txt'): self.assertNotIn(b'\r', (self.tmp / f).read_bytes(), f)
+
     def test_one_game_install_of_the_same_game_is_moved(self):
         self.remote = {f'{ba.REMOTE}/game/code/main.fixups.tsv': True, 'sha': hashlib.sha256(b'nacp').hexdigest()}
         flat = self.push()

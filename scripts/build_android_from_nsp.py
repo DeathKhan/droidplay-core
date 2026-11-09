@@ -315,8 +315,8 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, wor
         if src and Path(src).is_dir(): stage_link(stage / name, Path(src).resolve())
     for f in ('icon.jpg', 'control.nacp'):
         if (game / f).is_file(): stage_link(stage / f, (game / f).resolve())
-    (stage / 'defaults.txt').write_text(defaults, encoding='utf-8')
-    (stage / 'game.json').write_text(json.dumps({**meta, 'package': pkg}, indent=1), encoding='utf-8')
+    (stage / 'defaults.txt').write_text(defaults, encoding='utf-8', newline='\n')   # \n on Windows too, as the phone's files are
+    (stage / 'game.json').write_text(json.dumps({**meta, 'package': pkg}, indent=1), encoding='utf-8', newline='\n')
     files = sorted(Path(r, f).relative_to(stage).as_posix() for r, _, fs in os.walk(stage, followlinks=True) for f in fs)
     (stage / 'files.txt').write_text(''.join(f + '\n' for f in files + ['files.txt']), encoding='utf-8', newline='\n')
     rom_bytes = Path(str(rom)).stat().st_size
@@ -667,9 +667,9 @@ def push_game(serial, gid, game, patched, spv, font, aoc, defaults, work, logs, 
     # game.json; env.txt is the player's and stays as it is (a key it sets wins over the settings screen)
     for f in ('icon.jpg', 'control.nacp'):
         if (game / f).is_file(): adb(serial, 'push', game / f, f'{dst}/{f}')
-    dflt = work / 'android_defaults.txt'; dflt.write_text(defaults, encoding='utf-8')
+    dflt = work / 'android_defaults.txt'; dflt.write_text(defaults, encoding='utf-8', newline='\n')   # \n on Windows too: the desktop app reads game.json by lines
     adb(serial, 'push', dflt, f'{dst}/defaults.txt')
-    gj = work / 'android_game.json'; gj.write_text(json.dumps(meta, indent=1), encoding='utf-8')
+    gj = work / 'android_game.json'; gj.write_text(json.dumps(meta, indent=1), encoding='utf-8', newline='\n')
     adb(serial, 'push', gj, f'{dst}/game.json')
     part('permissions'); open_tree(serial, dst)
 

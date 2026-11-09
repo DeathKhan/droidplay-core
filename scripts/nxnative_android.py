@@ -1084,7 +1084,8 @@ class Window(QMainWindow):
         if not s: self.phone_games = {}; self.library.refresh_status(); self.phones.show_phone('', {}, False); return
         def look():
             _, pkg = adb_run(s, 'shell', f'dumpsys package {PKG} | grep -E "lastUpdateTime|versionName" | head -2')
-            _, ls = adb_run(s, 'shell', f'for d in {REMOTE}/games/*/; do [ -f "$d/code/main.fixups.tsv" ] || continue; echo "@$d"; cat "$d/game.json" 2>/dev/null | tr -d "\\n"; echo; echo "#$(ls "$d/glslc_capture" 2>/dev/null | wc -l)"; done; '
+            # game.json on one line, its \r too: a build on Windows wrote it with \r\n, and splitlines() below cut the JSON at each \r
+            _, ls = adb_run(s, 'shell', f'for d in {REMOTE}/games/*/; do [ -f "$d/code/main.fixups.tsv" ] || continue; echo "@$d"; cat "$d/game.json" 2>/dev/null | tr -d "\\r\\n"; echo; echo "#$(ls "$d/glslc_capture" 2>/dev/null | wc -l)"; done; '
                                         f'[ -f {REMOTE}/game/code/main.fixups.tsv ] && echo LEGACY')
             games, legacy, cur = {}, False, None
             for l in ls.splitlines():
@@ -1111,11 +1112,12 @@ class Window(QMainWindow):
                 if len(c) < 2: continue
                 d = {'serial': c[0], 'state': c[1], 'model': next((x[6:] for x in c if x.startswith('model:')), '').replace('_', ' ')}
                 if d['state'] == 'device':   # in one call: Android's version, the model's market name where the maker sets one (devices -l has its code: OPD2415 for a OnePlus Pad 3), the phone's own name
+                    # and the model as the phone spells it: devices -l turns what isn't a letter or a digit into _, so a Galaxy's SM-S937U1 came out as SM S937U1
                     got_p, p = adb_run(d['serial'], 'shell', 'getprop ro.build.version.release; getprop ro.product.marketname; getprop ro.vendor.oplus.market.name; '
-                                       'settings get global device_name', timeout=8)
-                    v = [x.strip() for x in p.splitlines()] + [''] * 4 if got_p else [''] * 4
-                    d['android'], d['model'] = v[0], v[1] or v[2] or d['model']
-                    d['name'] = v[3] if v[3] not in ('', 'null') else d['model']
+                                       'getprop ro.product.model; settings get global device_name', timeout=8)
+                    v = [x.strip() for x in p.splitlines()] + [''] * 5 if got_p else [''] * 5
+                    d['android'], d['model'] = v[0], v[1] or v[2] or v[3] or d['model']
+                    d['name'] = v[4] if v[4] not in ('', 'null') else d['model']
                 devs.append(d)
             return devs if ok else out
         def got(r):
