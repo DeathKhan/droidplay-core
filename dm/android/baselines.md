@@ -62,9 +62,11 @@ Numbered in the order they were found, so links to a number stay right:
    and Smash's font engine needs a hinted font (`main+0x7caa0`, `addr=0x38`). The packer now copies a hinted TrueType font into each game's
    `font/standard.ttf` (Arial Unicode on a Mac, as the iPhone build does), and Smash boots on all three devices: [Android: the standard shared font must
    be hinted](../../docs/reference/services.md#android-the-standard-shared-font-must-be-hinted).
-4. **Smash and Super Mario Odyssey crash now and then at boot.** Smash at `main+0x385201c` (`addr=0x50`), even with the font, on all three devices (about one
-   launch in six). Odyssey only on the Odin 2, three times in about 20 launches, all in its first seconds of loading: twice in its loader thread as the mode-select
-   layout loads (`main+0x95d414` with `addr=0`, once `svcBreak`), once at `main+0x954fb8`; never in 18 launches on the other two.
+4. **Smash crashes now and then at boot; Odyssey's crash is fixed.** Smash at `main+0x385201c` (`addr=0x50`), even with the font, on all three devices (about one
+   launch in six). Odyssey crashed on the Odin 2 three times in about 20 launches, all in its first seconds of loading: twice in its loader thread as the mode-select
+   layout loads (`main+0x95d414` with `addr=0`, once `svcBreak`), once at `main+0x954fb8`; never in 18 launches on the other two then, but later in about one launch in
+   four on the Retroid Pocket 5. Fixed with `core_preempt on` in its profile: [A thread woken by a higher-priority thread of its core runs before that one
+   blocks](../../docs/reference/threads.md#a-thread-woken-by-a-higher-priority-thread-of-its-core-runs-before-that-one-blocks).
 5. **Fixed: the pipeline cache was saved only when the app paused** (`vkb_pipeline_cache_save` on `APP_CMD_PAUSE`). The list of pipelines to make again at start
    (`pipeline.cache.keys4`) is written as each one is made, but the driver's compiled binaries are in the cache, so after a stop by force (the benchmark, or a player
    swiping the app away) the next start made the whole list again without them, in the background while the game played. The Pad 3's driver builds them about six
