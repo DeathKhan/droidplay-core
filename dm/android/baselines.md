@@ -74,7 +74,7 @@ Numbered in the order they were found, so links to a number stay right:
 7. **The Pad 3's H.264 decoder takes no input** in `dm/android/tests/t_media` (`[RED] movie: the AVC decoder took no input for 2 s`), before and
    after the fix in problem 1. Not yet tried in a game: an H.264 movie there may show black.
 8. **Fixed: Link's Awakening drew wrongly on all three devices.** Its movies and two of its HUD icons came out in ring-banded colours, and in play the 3D
-   world was black behind the HUD. Pass dumps (`dump_now`) of the overworld on the Odin 2 showed where; its ambient occlusion is still missing:
+   world was black behind the HUD, without ambient occlusion. Pass dumps (`dump_now`) of the overworld on the Odin 2 showed where:
    - **Fixed: the colours, a raw copy between two formats.** The frame's last target (`s4`, R11G11B10F) holds the right colours; the game then copies it
      into its RGBA8 window texture, and `copy_t2t` in `gfx_vk.c` copied the bits, since its test for a raw copy held for any two formats the replay does
      not convert on the CPU. A format change between float, normalized and sRGB formats is now a blit: [Texture copies that change format convert on
@@ -86,9 +86,10 @@ Numbered in the order they were found, so links to a number stay right:
      for both. It now inverts by the queue's flip alone, as Metal's draws do: [The front face follows the queue's raster flip alone on
      Vulkan](../../docs/reference/rendering.md#the-front-face-follows-the-queues-raster-flip-alone-on-vulkan). The Ancient Ruins draw at 59.9 fps on the
      Odin 2.
-   - **Open: no ambient occlusion.** The replay skips the game's half-size depth-stencil copies: `[RED] [vk] texture copy with a format change or scaling between formats 130 and
-     130: not blittable on this GPU` (`D32_SFLOAT_S8_UINT`). The Mac draws them as a pass (`copy_t2t_draw`). The occlusion pass tests its stencil (bit 1)
-     against the copy, so it writes nothing and its target keeps its cleared 1.0; the depth of field reads it too.
+   - **Fixed: no ambient occlusion.** The replay skipped the game's half-size depth-stencil copies (`[RED] [vk] texture copy with a format change or
+     scaling between formats 130 and 130: not blittable on this GPU`): no Adreno blits `D32_SFLOAT_S8_UINT`. The occlusion pass tests its stencil (bit 1)
+     against the copy, so it wrote nothing and its target kept its cleared 1.0. The copies are now drawn: [Depth-stencil copies a blit cannot make, drawn on
+     Vulkan](../../docs/reference/rendering.md#depth-stencil-copies-a-blit-cannot-make-drawn-on-vulkan).
 9. **Link's Awakening crashes at boot** on every launch on the Retroid Pocket 5 (7 of 7), now and then on the Pad 3 (3 of 8), never on the Odin 2
    (0 of 10): `CRASH sig=11 pc=main+0x1c180` about 0.1 s in, in the constructor of the camera `MainCamera_1P`. It reads an entry of a 0x58-byte table at
    `main+0x1bcc898` by a 16-bit index that is still 0xFFFF, the default its caller sets at `main+0xbdb68` until a lookup fills it, so the read lands

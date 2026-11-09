@@ -1571,6 +1571,22 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** `spv_android.py` `dyn_components` loads the whole vec4 and picks the component with `OpSelect` on the index (`ANDROID_CHAIN` 3). All 9,192 rewritten modules pass `spirv-val --target-env vulkan1.1`.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): vertex shader `16684efcf1fa7d8d` (every layout pane). Found with `DM_VK_DUMP` (every pass's targets written out) and the shader's disassembly.
 
+### Depth-stencil copies a blit cannot make, drawn on Vulkan
+
+- **Symptom:** Android only: `[RED] [vk] texture copy with a format change or scaling between formats 130 and 130: not blittable on this GPU`, and whatever reads the
+  copy's destination wrong: an effect that tests its stencil draws nothing (Link's Awakening: no ambient occlusion), or a depth-based one reads stale depth.
+- **Cause:** NVN copies a depth-stencil texture into a smaller one (Link's Awakening: its 1024×576 target to 512×288 and 256×144 every frame). Vulkan's only scaling
+  copy is a blit, and the Adreno drivers give `D32_SFLOAT_S8_UINT` neither `BLIT_SRC` nor `BLIT_DST`, so `copy_t2t` skipped it.
+- **Fix:** `ds_copy_draw` (`gfx_vk_dscopy.inc`) draws the copy into the destination as its depth-stencil attachment, as the Mac's `copy_t2t_draw` does: each fragment
+  takes its source texel's depth as `gl_FragDepth` from a depth view, and its stencil from a stencil view, written through `VK_EXT_shader_stencil_export` where the
+  device has it; without it, a draw writes depth and stencil 0, then a draw per bit discards where the source's bit is clear and writes that bit alone (write mask
+  `1 << bit`, reference 0xff). Nearest texels; a mirrored copy reads its source backwards. The shaders are the replay's first of its own (`dm/android/shaders`, built
+  by the NDK's `glslc`); its descriptor sets are the chunk's own, handed out again when the chunk completes. `DM_VK_STENCIL_EXPORT=0` (a diagnostic) takes the per-bit
+  draws on a device with the extension.
+- **Check:** Link's Awakening on an Ayn Odin 2: both copies drawn, the ambient occlusion target no longer its cleared 1.0 (mean 232 of 255 in the Ancient Ruins, contact
+  shadows at the pillars' feet), 58.5 fps.
+- **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 8).
+
 ### The front face follows the queue's raster flip alone on Vulkan
 
 - **Symptom:** Android only, a game that keeps NVN's lower-left window origin: the 3D world black (or missing post-processing) while closed meshes and the HUD draw;
