@@ -94,8 +94,8 @@ adbd may not create folders there, so the folder tree is made first by a mkdir s
 ### A game app
 
 `--game-apk` builds one game as an app of its own, to install on any device without this computer or the launcher: package `org.nxnative.game.t<title ID>`
-(`tools/build_apk.py game_package`), the game's name and icon, `apk/AndroidManifest.game.xml`. Several install side by side, apart from the nxnative app, each with its own
-saves. Nothing goes into the host library, so the nxnative app is left as it was.
+(`tools/build_apk.py game_package`), the game's name and icon, `apk/AndroidManifest.game.xml`. Several install side by side, apart from the DroidPlay app, each with its own
+saves. Nothing goes into the host library, so the DroidPlay app is left as it was.
 
 - **What the APK carries:** the game's host alone (the NativeActivity's library; no loader) and the game's files under `assets/game/`, laid out as `games/<id>/` with a
   `files.txt` list. Its entry is `java GameStart`, which unpacks everything but the RomFS to `Android/data/<package>/files/games/<id>/` at the first start and after an

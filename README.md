@@ -88,7 +88,7 @@ droidnative stays in step with nxnative: [CONTRIBUTING.md](CONTRIBUTING.md#droid
 ```
  Your computer (Windows, macOS or Linux)                         Your Android phone
  ───────────────────────────────────────                         ─────────────────────────────────────
- NSP / XCI files + prod.keys                                     nxnative app (org.nxnative.android)
+ NSP / XCI files + prod.keys                                     DroidPlay app (org.nxnative.android)
           │                                                        ├─ Launcher: the games on the phone,
           ▼                                                        │    each game's settings, Play
  Desktop app: scripts/nxnative_android.py                          │
@@ -146,8 +146,8 @@ copied to the phone again when the phone already holds the same one.
 
 ## The Android app
 
-- **Launcher.** Opening **nxnative** shows the games on the phone with their icon, name and version (a game whose host the installed app lacks is marked as needing an
-  app update). Picking a game opens its **settings screen**, grouped into Game and Controls: console mode (handheld is lighter), game language, game timing, render
+- **Launcher.** Opening **DroidPlay** (its package is still `org.nxnative.android`) shows the games on the phone with their icon, name and version (a game whose
+  host the installed app lacks is marked as needing an app update). Picking a game opens its **settings screen**, grouped into Game and Controls: console mode (handheld is lighter), game language, game timing, render
   scale where the game supports it, the frame-rate counter, rumble and its strength. **Play** starts the game. Lines like `DM_RENDER_SCALE=0.8` in
   `Android/data/org.nxnative.android/files/env.txt` win over the screen (they show greyed out).
 - **In the game.** Touch controls are drawn over the picture in three layouts (2D, 3D and Tap, switched with the round button at the top); touches no control takes go

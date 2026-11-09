@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The adaptive icon's monochrome layer (themed icons, Android 13 and later): the foreground's controller as one silhouette, which the launcher tints; the
+     buttons and the play glyph are cut out of it (even-odd), so it reads without the foreground's colours. The same grid and scale as ic_launcher_fg.xml -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <group android:pivotX="512" android:pivotY="512" android:scaleX="0.1144" android:scaleY="0.1144" android:translateX="-458" android:translateY="-458">
+        <path android:fillColor="#FF000000" android:fillType="evenOdd"
+            android:pathData="M415,322 L415,702 L335,702 A80,80 0 0 1 255,622 L255,402 A80,80 0 0 1 335,322 Z
+                M299,432 a36,36 0 1 0 72,0 a36,36 0 1 0 -72,0 z M320,556 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M320,624 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z
+                M286,590 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M354,590 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z"/>
+        <path android:fillColor="#FF000000" android:fillType="evenOdd"
+            android:pathData="M609,322 L689,322 A80,80 0 0 1 769,402 L769,622 A80,80 0 0 1 689,702 L609,702 Z
+                M674,398 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M674,466 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M640,432 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z
+                M708,432 a15,15 0 1 0 30,0 a15,15 0 1 0 -30,0 z M653,590 a36,36 0 1 0 72,0 a36,36 0 1 0 -72,0 z"/>
+        <path android:fillColor="#FF000000" android:fillType="evenOdd"
+            android:pathData="M439,334 h146 a26,26 0 0 1 26,26 v304 a26,26 0 0 1 -26,26 h-146 a26,26 0 0 1 -26,-26 v-304 a26,26 0 0 1 26,-26 z M490,476 L490,548 L550,512 Z"/>
+    </group>
+</vector>

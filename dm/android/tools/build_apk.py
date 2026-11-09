@@ -5,7 +5,8 @@
 #   [--lib <lib*.so> ...] [--demo <folder>] --keystore <.jks> -o <out.apk> [--label <app name>] [--icon <icon.jpg or .png>] [--build-tools 36.0.0] [--platform android-35]
 # --lib: another library for lib/arm64-v8a/, in either kind of app: libadrenotools.so and its hooks libhook_impl.so and libmain_hook.so, which DM_VK_DRIVER opens a Vulkan
 #   driver of the player's through (dm/android/vk_driver.c)
-# The app is "nxnative" with the adaptive icon in apk/res: its launcher shows the games' own icons and names. --label and --icon name it otherwise.
+# The app is "DroidPlay" (package org.nxnative.android) with DroidPlay's adaptive icon in apk/res: its launcher shows the games' own icons and names. --label and
+# --icon name it otherwise.
 # A game app instead: build_apk.py --sdk <SDK> --game-app <title ID> --so libdmhost_<title ID>.so --game-dir <folder> [--romfs <RomFS.img>] --keystore <.jks> -o <out.apk>
 #   --label <name> --icon <icon.jpg>: one game in an app of its own (apk/AndroidManifest.game.xml, package game_package(<title ID>)), entered through GameStart with no
 #   launcher or loader. --game-dir is the game's folder as the launcher's games/<title ID>/ holds it, packed into assets/game/; --romfs packs the RomFS image there as a
@@ -27,14 +28,14 @@ def run(*a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--sdk', required=True); ap.add_argument('--selftest', help='the self test module (the nxnative app; not a game app)')
-    ap.add_argument('--so', action='append', required=True, help='a game host, libdmhost_<title ID>.so (once per game)'); ap.add_argument('--loader', help='libnxloader.so (the nxnative app; not a game app)')
+    ap.add_argument('--sdk', required=True); ap.add_argument('--selftest', help='the self test module (the launcher app; not a game app)')
+    ap.add_argument('--so', action='append', required=True, help='a game host, libdmhost_<title ID>.so (once per game)'); ap.add_argument('--loader', help='libnxloader.so (the launcher app; not a game app)')
     ap.add_argument('--lib', action='append', default=[], help='another native library for lib/arm64-v8a/ (libadrenotools.so and its hooks)')
     ap.add_argument('--game-app', metavar='TITLE_ID', help='a game app: that game alone, entered through GameStart (its host is the one --so)')
     ap.add_argument('--game-dir', help="a game app's files, the launcher's games/<title ID>/ layout, for assets/game/"); ap.add_argument('--romfs', help="a game app's RomFS image, stored in assets/game/")
     ap.add_argument('--demo', help='folder for assets/demo: the synthetic shaders and their SPIR-V (tests/synth_shaders.py, tools/spv_android.py)')
     ap.add_argument('--keystore', required=True); ap.add_argument('-o', '--out', required=True)
-    ap.add_argument('--label', help="the app's name in the launcher (default nxnative)"); ap.add_argument('--icon', help="the app's launcher icon: a JPEG or PNG (the game's icon.jpg)")
+    ap.add_argument('--label', help="the app's name in the launcher (default DroidPlay)"); ap.add_argument('--icon', help="the app's launcher icon: a JPEG or PNG (the game's icon.jpg)")
     ap.add_argument('--build-tools', default='36.0.0'); ap.add_argument('--platform', default='android-35')
     a = ap.parse_args()
     for so in a.so:
@@ -46,7 +47,7 @@ def main():
     if a.game_app:
         if len(set(a.so)) != 1 or os.path.basename(a.so[0]) != f'libdmhost_{a.game_app.upper()}.so': sys.exit(f'--game-app {a.game_app} takes one --so, libdmhost_{a.game_app.upper()}.so')
         if not a.game_dir or not os.path.isfile(os.path.join(a.game_dir, 'game.json')): sys.exit('--game-app needs --game-dir with the game\'s files (game.json among them)')
-    elif not (a.loader and a.selftest): sys.exit('the nxnative app needs --loader and --selftest')
+    elif not (a.loader and a.selftest): sys.exit('the launcher app needs --loader and --selftest')
     bt = os.path.join(a.sdk, 'build-tools', a.build_tools); exe = '.exe' if os.name == 'nt' else ''; bat = '.bat' if os.name == 'nt' else ''
     jar = os.path.join(a.sdk, 'platforms', a.platform, 'android.jar')
     if not os.path.exists(a.keystore):
@@ -58,19 +59,19 @@ def main():
         with open(os.path.join(HERE, '..', 'apk', 'AndroidManifest.game.xml' if a.game_app else 'AndroidManifest.xml'), encoding='utf-8') as f: manifest = f.read()
         if a.game_app: manifest = manifest.replace('@PACKAGE@', game_package(a.game_app)).replace('@LIB@', f'dmhost_{a.game_app.upper()}')
         # the label always: the application element's is replaced whole, and an app with none shows its package name (org.nxnative.android)
-        attrs, res = f' android:label={quoteattr(a.label or "nxnative")}', []
+        attrs, res = f' android:label={quoteattr(a.label or "DroidPlay")}', []
         if a.icon:
             ext = os.path.splitext(a.icon)[1].lower()
             if ext not in ('.jpg', '.jpeg', '.png'): sys.exit(f'--icon must be a JPEG or PNG: {a.icon}')
             rd = os.path.join(d, 'res', 'drawable'); os.makedirs(rd); shutil.copyfile(a.icon, os.path.join(rd, 'icon' + ('.jpg' if ext == '.jpeg' else ext)))
             run(aapt2, 'compile', '--dir', os.path.join(d, 'res'), '-o', os.path.join(d, 'res.zip')); res = ['-R', os.path.join(d, 'res.zip'), '--auto-add-overlay']
             attrs += ' android:icon="@drawable/icon" android:roundIcon="@drawable/icon"'
-        else:   # the app's own adaptive icon (apk/res: the mark on ink, vector drawables, with a monochrome layer for themed icons)
+        else:   # the app's own adaptive icon (apk/res: DroidPlay's controller on its light green, vector drawables, with a monochrome layer for themed icons)
             run(aapt2, 'compile', '--dir', os.path.join(HERE, '..', 'apk', 'res'), '-o', os.path.join(d, 'res.zip')); res = ['-R', os.path.join(d, 'res.zip'), '--auto-add-overlay']
             attrs += ' android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"'
         if attrs:
-            if '<application android:label="nxnative"' not in manifest: sys.exit('AndroidManifest.xml: no <application android:label="nxnative"> to name the app in')
-            manifest = manifest.replace('<application android:label="nxnative"', '<application' + attrs, 1)
+            if '<application android:label="DroidPlay"' not in manifest: sys.exit('AndroidManifest.xml: no <application android:label="DroidPlay"> to name the app in')
+            manifest = manifest.replace('<application android:label="DroidPlay"', '<application' + attrs, 1)
         mf = os.path.join(d, 'AndroidManifest.xml')
         with open(mf, 'w', encoding='utf-8') as f: f.write(manifest)
         run(aapt2, 'link', '-o', base, '--manifest', mf, '-I', jar, *res, '--min-sdk-version', '29', '--target-sdk-version', '34')
