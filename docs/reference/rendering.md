@@ -1717,6 +1717,14 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   59.9 after (p95 17.6 to 18.8 ms, 4 switches), write-backs landing in 5.6 ms a frame on average instead of 7 to 8, and no staging buffer of its own in a run. On a
   OnePlus Pad 3, 57.5 fps before and 60.0 after. Odyssey, Brilliant Diamond, Animal Crossing and Link's Awakening unchanged on both, and Smash on the Pad 3.
 - **Found on:** [The Legend of Zelda: Skyward Sword HD](../../dm/games/01002DA013484000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 11).
+### An absorbed write-back compared whole every frame
+
+- **Symptom:** Android only: with `DM_VK_WB_ABSORB=1`, a frame-sized linear render target still costs its completion thread milliseconds a frame (`ms landing and noting them` in the `[vk] frame …` line), before the chunk's fence the game waits on.
+- **Cause:** `ab_note` compared every row of guest memory with the GPU's copy after each write-back, to keep a target the CPU had written from being adopted: for Skyward Sword HD's 1920×1080 RGBA8 target, two more reads of 8.3 MB every frame.
+- **Fix:** before the write-back lands, `ab_clean` asks the dirty tracker whether any whole page of the target was written since its last note (`g_abg`, the stamp each note took). If none was, guest memory still holds that write-back, the snapshot the pass took equals it, and the write-back makes guest memory the GPU's copy by itself, so `ab_note` compares only the rows with bytes in the edge pages a neighbour may write. nx2android ([github.com/shirai91/nx2android](https://github.com/shirai91/nx2android), 70139b2) syncs only what the CPU wrote from the same write-protect tracking. `DM_VK_AB_CLEAN=0` (env.txt) compares every row, as before.
+- **Check:** Skyward Sword HD in Skyloft on an Ayn Odin 2, two runs each way from the same install: landing and noting the write-backs took 4.51 and 4.55 ms a frame against 5.21 and 5.27 with `DM_VK_AB_CLEAN=0` (frames 900 to 3000), 2,995 of 2,998 notes compared in their edge rows alone, none refused, none differing; 60.0 fps every run.
+- **Found on:** [The Legend of Zelda: Skyward Sword HD](../../dm/games/01002DA013484000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 11).
+
 ### The pipeline cache written during play
 
 - **Symptom:** Android only: a game that stutters while it builds pipelines does it again at every start after the app was stopped by force (swiped away, updated, the

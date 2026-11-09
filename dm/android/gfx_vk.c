@@ -607,21 +607,47 @@ static int wb_absorb_on(void) { static int v = -1; if (v < 0) { const char *e = 
 typedef struct { uint64_t ser, img, gen; const uint8_t *store; uint8_t *edge[2]; uint32_t edge_n[2]; } ab_rec;
 enum { NAB = 64 };
 static ab_rec g_ab[NAB]; static int g_nab; static _Atomic int g_nab_n; static pthread_mutex_t g_ab_mu = PTHREAD_MUTEX_INITIALIZER;   // g_nab_n: read without the lock first (ab_take)
-static _Atomic uint64_t g_ab_noted, g_ab_differ, g_ab_taken, g_ab_refused;
+static _Atomic uint64_t g_ab_noted, g_ab_differ, g_ab_taken, g_ab_refused, g_ab_clean;
+// Whether the CPU left a noted target's storage alone since its last note: then guest memory still holds that write-back in every whole page, the snapshot the next pass took
+// equals it, and that pass's write-back makes guest memory the GPU's copy there by itself, so ab_note compares only the rows in the edge pages (which a neighbour's write may
+// change). The full compare read the 8.3 MB of Skyward Sword HD's target twice more every frame on the completion thread, before the chunk's fence. nx2android
+// (github.com/shirai91/nx2android, 70139b2) syncs only the blocks the CPU wrote, read from the same write-protect tracking. Kept apart from g_ab, which ab_take empties when
+// the replay adopts a note. Asked before wb_apply, whose prepare makes the pages it writes dirty. DM_VK_AB_CLEAN=0 (env.txt): every row compared, as before
+typedef struct { uint64_t ser, gen; const uint8_t *store; } ab_gen;
+static ab_gen g_abg[NAB]; static int g_nabg;   // under g_ab_mu: each noted serial's last note stamp
+static int ab_clean_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_AB_CLEAN"); v = !(e && *e == '0'); } return v; }
 static void edge_rng(uintptr_t a, uintptr_t e, uintptr_t r[2][2], uintptr_t *ia, uintptr_t *ie) {   // [a, e)'s bytes in the host pages it shares with other data; [ia, ie): its whole pages
     uintptr_t pg = (uintptr_t)getpagesize();
     *ia = (a + pg - 1) & ~(pg - 1); *ie = e & ~(pg - 1);
     if (*ie <= *ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; *ia = *ie = 0; return; }
     r[0][0] = a; r[0][1] = *ia; r[1][0] = *ie; r[1][1] = e;
 }
-static void ab_note(const wb_t *w, const uint8_t *s) {   // the completion thread, right after w landed: before any later write of the chunk, its posts and its NVN fence
+static int ab_clean(const wb_t *w) {   // the completion thread, before w lands: no whole page of its storage written since its last note (ab_note compares only the edge rows)
+    if (!ab_clean_on()) return 0;
+    uint64_t gen = 0; pthread_mutex_lock(&g_ab_mu);
+    for (int i = 0; i < g_nabg; i++) if (g_abg[i].ser == w->ser && g_abg[i].store == w->dst) { gen = g_abg[i].gen; break; }
+    pthread_mutex_unlock(&g_ab_mu);
+    if (!gen) return 0;
+    uintptr_t r[2][2], ia, ie; edge_rng((uintptr_t)w->dst, (uintptr_t)w->dst + (uintptr_t)w->tsize, r, &ia, &ie);
+    return ie > ia && !nvn_dirty_since((const void *)ia, ie - ia, gen);
+}
+static void ab_note(const wb_t *w, const uint8_t *s, int clean) {   // the completion thread, right after w landed: before any later write of the chunk, its posts and its NVN fence
     uint64_t st = nvn_dirty_now(); nvn_dirty_protect(w->dst, (size_t)w->tsize);   // stamp, protect, then read (as vt_upload_): a later CPU write faults and is newer than st
     uintptr_t r[2][2], ia, ie; edge_rng((uintptr_t)w->dst, (uintptr_t)w->dst + (uintptr_t)w->tsize, r, &ia, &ie);
     ab_rec e; memset(&e, 0, sizeof e); e.ser = w->ser; e.img = w->img; e.gen = st; e.store = w->dst;
     for (int k = 0; k < 2; k++) if (r[k][1] > r[k][0]) { e.edge_n[k] = (uint32_t)(r[k][1] - r[k][0]); if (!(e.edge[k] = malloc(e.edge_n[k]))) goto drop; memcpy(e.edge[k], (const void *)r[k][0], e.edge_n[k]); }
     // after the edge bytes: a CPU write to the texture's own bytes before the copy differs here; one after it differs at ab_take
-    for (size_t y = 0; y < w->rows; y++) if (memcmp(w->dst + y * w->dst_pitch, s + y * w->src_pitch, w->row_bytes)) { atomic_fetch_add(&g_ab_differ, 1); goto drop; }
+    for (size_t y = 0; y < w->rows; y++) {
+        uintptr_t a = (uintptr_t)(w->dst + y * w->dst_pitch), z = a + w->row_bytes;   // clean (ab_clean): only a row with bytes in an edge page
+        if (clean && !(z > r[0][0] && a < r[0][1]) && !(z > r[1][0] && a < r[1][1])) continue;
+        if (memcmp(w->dst + y * w->dst_pitch, s + y * w->src_pitch, w->row_bytes)) { atomic_fetch_add(&g_ab_differ, 1); goto drop; }
+    }
+    if (clean) atomic_fetch_add(&g_ab_clean, 1);
     pthread_mutex_lock(&g_ab_mu);
+    {   int k = 0; while (k < g_nabg && g_abg[k].ser != e.ser) k++;
+        if (k == g_nabg && g_nabg == NAB) { k = 0; for (int j = 1; j < NAB; j++) if (g_abg[j].gen < g_abg[k].gen) k = j; }   // full: the oldest goes (its next write-back is compared whole)
+        if (k == g_nabg) g_nabg++;
+        g_abg[k] = (ab_gen){e.ser, st, e.store}; }
     int i = 0; while (i < g_nab && g_ab[i].ser != e.ser) i++;
     if (i == g_nab && g_nab == NAB) { i = 0; for (int k = 1; k < NAB; k++) if (g_ab[k].gen < g_ab[i].gen) i = k; }   // full: the oldest note goes (that texture is uploaded again)
     if (i < g_nab) { free(g_ab[i].edge[0]); free(g_ab[i].edge[1]); } else g_nab++;
@@ -688,9 +714,9 @@ static void chunk_done(chunk *c) {
     }
     for (int i = 0; i < c->nwb; i++) { const wb_t *w = &c->wb[i]; const uint8_t *s = (w->st >= SP_ST ? c->sb[w->st - SP_ST].p : w->st >= 0 ? c->stg[w->st].p : c->ar[-1 - w->st].p) + w->off;
         if (w->lin && wb_revert_on()) rv_check(w, s);   // before it lands: guest memory still holds what the CPU wrote during the pass
-        uint64_t t0 = w->lin ? clock_gettime_nsec_np(CLOCK_MONOTONIC) : 0; int wrote = wb_apply(w, s);
+        uint64_t t0 = w->lin ? clock_gettime_nsec_np(CLOCK_MONOTONIC) : 0; int clean = w->lin == 2 && wb_absorb_on() ? ab_clean(w) : 0, wrote = wb_apply(w, s);
         if (w->lin) atomic_fetch_add(!w->snap || !lsnap_on() ? &g_lwb_whole : wrote ? &g_lwb_diff : &g_lwb_same, 1);
-        if (w->lin == 2 && wrote && wb_absorb_on()) ab_note(w, s);   // right after it: before a later write-back or post of the chunk
+        if (w->lin == 2 && wrote && wb_absorb_on()) ab_note(w, s, clean);   // right after it: before a later write-back or post of the chunk
         if (w->lin) atomic_fetch_add(&g_lwb_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0);
         snap_give(w->snap, w->snap_cap); snap_give(w->dsnap, w->snap_cap); }   // a storage buffer's snapshot: snap_cap 0, freed
     if (c->npq) prof_collect(c);
@@ -1929,10 +1955,10 @@ void mtl_ubd_stats(uint64_t *a, uint64_t *b) { *a = *b = 0; }
 void mtl_ubp_stats(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = *c = 0; }
 void mtl_ubp_why(uint64_t w[5]) { memset(w, 0, 5 * sizeof *w); }
 void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] frame %llu: resident %llu MB, textures %u, uploads %llu (%llu again), %llu MB uploaded; linear render targets: snapshots %llu "
-    "(%llu not taken: a write was pending), write-backs whole %llu / changed bytes only %llu (%llu KB) / nothing changed %llu (%.1f ms landing and noting them), own write-backs absorbed %llu (noted %llu, guest differed %llu, refused %llu) (cumulative)",
+    "(%llu not taken: a write was pending), write-backs whole %llu / changed bytes only %llu (%llu KB) / nothing changed %llu (%.1f ms landing and noting them), own write-backs absorbed %llu (noted %llu, %llu of them compared in their edge rows alone, guest differed %llu, refused %llu) (cumulative)",
     frame, mb, g_tex.n, (unsigned long long)g_pkg_uploads, (unsigned long long)g_pkg_reuploads, (unsigned long long)(g_up_bytes >> 20), (unsigned long long)g_lsnap, (unsigned long long)g_lsnap_stale,
     (unsigned long long)atomic_load(&g_lwb_whole), (unsigned long long)atomic_load(&g_lwb_diff), (unsigned long long)(atomic_load(&g_lwb_bytes) >> 10), (unsigned long long)atomic_load(&g_lwb_same),
-    atomic_load(&g_lwb_ns) / 1e6, (unsigned long long)atomic_load(&g_ab_taken), (unsigned long long)atomic_load(&g_ab_noted), (unsigned long long)atomic_load(&g_ab_differ), (unsigned long long)atomic_load(&g_ab_refused));
+    atomic_load(&g_lwb_ns) / 1e6, (unsigned long long)atomic_load(&g_ab_taken), (unsigned long long)atomic_load(&g_ab_noted), (unsigned long long)atomic_load(&g_ab_clean), (unsigned long long)atomic_load(&g_ab_differ), (unsigned long long)atomic_load(&g_ab_refused));
     if (wb_revert_on()) rv_stat(frame);
     LOG("[vk] guest reads of draws: waited for the current submission %llu, for submissions in flight %llu, no wait %llu; uniform updates and small copies: %llu / %llu / %llu; submissions %llu (cumulative)",
         (unsigned long long)g_view_cur, (unsigned long long)g_view_fly, (unsigned long long)g_view_free, (unsigned long long)g_mem_cur, (unsigned long long)g_mem_fly, (unsigned long long)g_mem_free,
