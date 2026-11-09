@@ -1625,8 +1625,16 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 
 - **Symptom:** the whole picture darker and more saturated than the Switch's.
 - **Cause:** the render pass attached each colour target in its image's format, ignoring the format of the view the game binds it with. Wonder's last pass writes its RGBA8 window texture through an RGBA8_SRGB view, so the linear values were stored unencoded (the same as [the Metal finding](../../dm/games/010015100B514000/README.md)).
-- **Fix:** `rp_prepare` makes the attachment view in `view_format` (the images of uncompressed colour formats are mutable).
+- **Fix:** `rp_prepare` makes the attachment view in `view_format` (an uncompressed colour image is made for its own format and its sRGB twin: [Colour images keep Adreno's framebuffer compression](#colour-images-keep-adrenos-framebuffer-compression)).
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md).
+
+### Colour images keep Adreno's framebuffer compression
+
+- **Symptom:** Android only: GPU time up to a third higher than it needs to be, and a colour target's memory exactly its texels (`[vk] colour target 1600x900 format 37 (MUTABLE_FORMAT): 5.49 MB of memory for 5.49 MB of texels`).
+- **Cause:** every uncompressed colour image was made with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`, so that a view could take any format of its texel size (an NVN texture view's own format). Given that, Adreno's driver leaves the image without UBWC, its lossless framebuffer compression, and every pass stores and loads its targets uncompressed.
+- **Fix:** `vt_create` gives an uncompressed colour image that is not a storage image a format list (`VK_KHR_image_format_list`) of its format and its sRGB twin (`srgb_twin`: RGBA8, BGRA8, ABGR8, R8 and RG8), and `MUTABLE_FORMAT` only when there is a twin. A view in any other format reads the image's own (`[RED] [vk] texture view in format … which lists only its own and its sRGB twin`). Storage images keep `MUTABLE_FORMAT` with no list: a shader declares their format. Found by nx2android ([github.com/shirai91/nx2android](https://github.com/shirai91/nx2android), a1b4f54). `DM_VK_UBWC=0` (env.txt) makes them as before.
+- **Check:** the same targets now take room for the compression's metadata (`5.60 MB of memory for 5.49 MB of texels`). GPU time a frame (p50) on an Ayn Odin 2, kept against `DM_VK_UBWC=0`: Super Mario Odyssey's opening 4.30 against 5.57 ms, Brilliant Diamond's Eterna City 6.22 against 8.41, Animal Crossing's island 8.59 against 9.80, Skyward Sword HD's Skyloft 3.64 against 5.59, Link's Awakening's Ancient Ruins 5.91 against 5.83. On a OnePlus Pad 3: Odyssey 8.05 against 9.33 ms, Animal Crossing 15.09 against 15.59. The runs' last screenshots match apart from animation. No red line in any of the six test games.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md), with the other test games in the [Android baselines](../../dm/android/baselines.md).
 
 ### Compressed render targets through an uncompressed shadow on Vulkan
 
@@ -1656,6 +1664,22 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** the range is taken from the indices as they are written; storage buffer snapshots are copied from guest memory, not from the arena.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): 78 → 27 ms of replay CPU a frame in a level.
 
+### Storage buffer write-backs read from cached memory on Vulkan
+
+- **Symptom:** Android only, on Mesa's Turnip: a third of the phone's own driver's frame rate with a faster GPU, and the `vk-done` thread busy in `top -H`.
+  The game writes storage buffers from its shaders. `NVN submit+present` in the `timing up to frame` lines is most of the frame, `vk-done` is on a CPU nearly all
+  the time, and the replay thread sleeps in `cur()`, waiting for a free chunk.
+- **Cause:** the arena took the first host-visible coherent memory type. A storage buffer or buffer image a shader writes lives in the arena, and the completion thread
+  reads it back to copy the bytes the GPU changed into guest memory (`chunk_done` → `wb_apply`, compared with its snapshot a byte at a time where a word differs). Qualcomm's
+  driver on an Ayn Odin 2 offers the arena's buffers a single host-visible type, cached and coherent (types 0 and 6, flags `0x1` and `0xf`); Turnip lists a write-combined
+  type first (types 0 to 2: `0x7`, then `0xf`), so every read of the write-backs went to DRAM, the completion thread fell behind, and all four chunks stayed in flight.
+- **Fix:** `ar_mem_type` (`gfx_vk_draw.inc`) prefers a host-visible, coherent and cached type for the arena, as staging does, and falls back to the first host-visible
+  coherent one; the log names the type (`[vk] arena: memory type`). `DM_VK_ARENA_CACHED=0` takes the first host-visible coherent type, as before.
+- **Check:** Pokémon Brilliant Diamond's `eterna` route (`scripts/bench_android.py`) on an Ayn Odin 2 with Mr. Purple's Turnip T30 (`DM_VK_DRIVER`): 20.4 and
+  21.0 fps before (submit+present p50 about 44 ms, 19 command buffers a frame, `vk-done` 78% of a CPU; simpleperf: 37 ms a frame in `wb_apply` and its `memcpy`),
+  60.0 fps after (submit+present 13.4 ms, `vk-done` 27%), GPU time 6.1 → 5.9 ms. On the system driver both settings take type 6: 60.0 fps either way.
+- **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md).
+
 ### Linear render targets written back to guest memory
 
 - **Symptom:** Android only: what a game reads on the CPU from textures it draws into is zeros or stale. Breath of the Wild: Link sinks into grass up to his knees while he stands still, and the grass presses in a pass dump carry the presser's world height (`c3[3].z` about 200–270 instead of below 1) with a flat slope.
@@ -1675,7 +1699,23 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   `defaults.txt` and `front_android.c` reads after `launcher.txt`, without overriding it or `env.txt` (a game app sets them in `GameStart.java`). Skyward Sword HD lists
   `DM_VK_WB_ABSORB=1`.
 - **Check:** Skyward Sword HD in Skyloft: 30 fps before, 59.7 on a OnePlus Pad 3 and 59.3 on an Ayn Odin 2 after, the picture unchanged. Each switch alone on the Pad 3:
-  `DM_VK_WB_ABSORB` 59.7 fps, `DM_VK_LINWB_SNAP` 56.3, `DM_VK_UP_RANGE` 30.
+  `DM_VK_WB_ABSORB` 59.7 fps, `DM_VK_LINWB_SNAP` 56.3, `DM_VK_UP_RANGE` 30. The Odin 2's figure was one run: later runs spread from 33 to 57 fps until the write-back's
+  staging was pooled too ([next entry](#a-1080p-linear-render-targets-write-back-staged-in-a-buffer-of-its-own-every-frame)).
+- **Found on:** [The Legend of Zelda: Skyward Sword HD](../../dm/games/01002DA013484000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 11).
+### A 1080p linear render target's write-back staged in a buffer of its own every frame
+
+- **Symptom:** Android only: a game with a frame-sized linear render target switches its present interval between 1 and 2 in play, and settles at 30 fps in some runs
+  and near 60 in others; its long frames show `submit+present` far above the GPU time and no uploads, and `DM_VK_STG_STAT=1` counts about one `vkAllocateMemory` and
+  one `vkFreeMemory` a frame, with requests given a buffer of their own `over 4 MB`.
+- **Cause:** staging (`gfx_vk.c`, slices of pooled blocks) cut requests up to 4 MB from 8 MB blocks, and a larger one got a buffer of its own. Skyward Sword HD
+  writes its 1920×1080 RGBA8 target (8.3 MB) back every frame, so every frame the render thread's `vkAllocateMemory` zeroed 8 MB (13.6% of that thread on an Ayn
+  Odin 2), and the completion thread took the first-touch faults of reading the new pages and freed them, 7 to 8 ms in all before the chunk's fence, which the game's
+  next frame waits on. `DM_VK_WB_ABSORB` (above) took away the upload that followed the write-back, not this.
+- **Fix:** blocks of 16 MiB, and a request as large as a block is cut from one (a 1920×1080 RGBA16F target, 16.6 MB, fits too). At most 128 MiB of blocks, the same
+  eight as before, and blocks left idle are still freed (`sp_trim`).
+- **Check:** Skyward Sword HD in Skyloft on an Ayn Odin 2: 53.4, 32.9 and 56.9 fps before (frame p95 32 to 36 ms, 42 to 128 interval switches a run), 60.0, 59.9 and
+  59.9 after (p95 17.6 to 18.8 ms, 4 switches), write-backs landing in 5.6 ms a frame on average instead of 7 to 8, and no staging buffer of its own in a run. On a
+  OnePlus Pad 3, 57.5 fps before and 60.0 after. Odyssey, Brilliant Diamond, Animal Crossing and Link's Awakening unchanged on both, and Smash on the Pad 3.
 - **Found on:** [The Legend of Zelda: Skyward Sword HD](../../dm/games/01002DA013484000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 11).
 ### The pipeline cache written during play
 

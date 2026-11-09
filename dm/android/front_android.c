@@ -614,6 +614,7 @@ void android_main(struct android_app *app) {
     log_start();
     LOG("nxnative for Android: %s (%s), files %s, internal %s", DM_GAME_NAME, DM_GAME_ID, g_game, g_int);
     env_file(g_ext, "env.txt", 1); env_file(g_game, "launcher.txt", 0); env_file(g_game, "defaults.txt", 0);
+    vk_driver_dirs(g_ext, g_int);   // DM_VK_DRIVER: a driver beside env.txt, run from a copy in the internal files
     (*app->activity->vm)->AttachCurrentThread(app->activity->vm, &g_env, NULL);
     app->onAppCmd = on_cmd; app->onInputEvent = on_input;
     // The screen stays on while the game's window is up, as the launcher's does: Android counts only its own input events as activity, so a cutscene, a game

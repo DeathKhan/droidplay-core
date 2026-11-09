@@ -1,26 +1,32 @@
 # The desktop app of the Android port: pack your games for the nxnative app, install them on your phones and watch them run.
-#   python scripts/nxnative_android.py        (needs PySide6: pip install PySide6)
+#   uv run scripts/nxnative_android.py        (uv brings Python and the modules the block below names; or a Python that has them: pip install PySide6 lz4 capstone fonttools)
 # It drives scripts/build_android_from_nsp.py (its --progress json events, --info, --check, --push-only, --apk-only, --migrate) and adb:
 #   Library      your games (the NSP folders you added): the picked one large, Play (on the phone picked at the top), its options and Manage; the collection below
 #   Builds       the running build: its stages, progress and messages (the bar at the bottom of every page follows it); a build started from a console
 #                shows here too, from the journal the script writes (<data>/builds/*.jsonl)
 #   Phones       adb devices over USB and Wi-Fi (pair, connect, discover), the app and the games on each, saves backed up to the computer
 #   Performance  the game's log (adb logcat) with the frame time, GPU and CPU figures it prints, a frame's GPU passes
-#   Settings     your keys, and what the build needs on this computer with how to get what is missing
+#   Settings     your keys, and what the build needs on this computer with how to get what is missing; on Windows, Install what's missing (--setup)
+# /// script
+# # Below 3.15: lz4 has no wheels for it yet, and a player's computer has no compiler to build one. The packing script runs in this same Python.
+# # PySide6-Essentials has every Qt module the app uses (Core, Gui, Widgets, Svg) without PySide6's add-ons and web engine, a few hundred MB less to download.
+# requires-python = ">=3.12,<3.15"
+# dependencies = ["PySide6-Essentials", "lz4", "capstone>=5,<6", "fonttools", "backports.zstd; python_version < '3.14'"]
+# ///
 import json, os, re, shutil, subprocess, sys, time, uuid
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QByteArray, QObject, QProcess, QProcessEnvironment, QRectF, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal  # pyright: ignore[reportMissingImports]   (PySide6 is the desktop app's alone; the lint job does not install it)
-    from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap  # pyright: ignore[reportMissingImports]
+    from PySide6.QtCore import QByteArray, QObject, QProcess, QProcessEnvironment, QRectF, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, Signal  # pyright: ignore[reportMissingImports]   (PySide6 is the desktop app's alone; the lint job does not install it)
+    from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap  # pyright: ignore[reportMissingImports]
     from PySide6.QtSvg import QSvgRenderer  # pyright: ignore[reportMissingImports]
     from PySide6.QtWidgets import (  # pyright: ignore[reportMissingImports]
                                    QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
                                    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
-                                   QProgressBar, QPushButton, QScrollArea, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QToolButton,
+                                   QProgressBar, QPushButton, QRadioButton, QScrollArea, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QToolButton,
                                    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 except ImportError:
-    sys.exit(f'nxnative_android needs PySide6: {sys.executable} -m pip install PySide6')
+    sys.exit(f'DroidPlay (nxnative_android.py) needs PySide6: uv run {__file__}, or {sys.executable} -m pip install PySide6')
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / 'scripts' / 'build_android_from_nsp.py'
@@ -33,6 +39,13 @@ LANGUAGES = [('en-US', 'American English'), ('en-GB', 'British English'), ('ja',
              ('es', 'Spanish'), ('it', 'Italian'), ('nl', 'Dutch'), ('fr-CA', 'Canadian French'), ('pt', 'Portuguese'), ('ru', 'Russian'), ('ko', 'Korean'),
              ('zh-Hant', 'Traditional Chinese'), ('zh-Hans', 'Simplified Chinese'), ('pt-BR', 'Brazilian Portuguese')]
 NOWINDOW = 0x08000000 if os.name == 'nt' else 0   # CREATE_NO_WINDOW: no console flashing up for each adb call
+# The Python that builds and the script's --check and --info run on. On Windows the Start menu shortcut opens this app on pythonw.exe, which has no console, so
+# each console tool a build runs on it (java, dotnet, cmake, ninja, adb…) would open a window of its own, dozens in a build. The python.exe beside it, started from
+# this windowless app (QProcess, NOWINDOW), gets one hidden console that every tool shares, and their output still reaches the Builds page.
+def console_python():
+    exe = Path(sys.executable); con = exe.with_name('python.exe')
+    return str(con) if os.name == 'nt' and exe.name.lower() == 'pythonw.exe' and con.is_file() else sys.executable
+PYTHON = console_python()
 
 # ---- the palette: a dark room lit by the game's own colours; colour only where it means something ----
 INK = '#0b0b0c'          # the room
@@ -69,6 +82,26 @@ def icon(name, color=TEXT2, size=20):
     return QIcon(pm)
 
 
+# The window is DroidPlay for Windows and Linux: DroidPlay on a Mac is a separate app (github.com/enjoyerofslop/droidplay), whose name and icon it shares.
+# DroidPlay's icon, from the Mac app's layers (droidplay App/AppIcon.icon: the plate, the Joy-Cons and the play glyph) on its light green, flattened for the window
+# and the taskbar: the Mac draws the glass and shadows itself
+APP_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9ee8ad"/>'
+           '<stop offset="1" stop-color="#47ba75"/></linearGradient></defs><rect width="1024" height="1024" rx="228" fill="url(#g)"/>'
+           '<g transform="translate(512 512) scale(1.5161) translate(-512 -512)"><rect x="413" y="334" width="198" height="356" rx="26" fill="#3a3f4b" stroke="#4a505e" stroke-width="4"/>'
+           '<path d="M415,322 L415,702 L335,702 A80,80 0 0 1 255,622 L255,402 A80,80 0 0 1 335,322 Z" fill="#00b8d9"/>'
+           '<g fill="#0a5f70"><circle cx="335" cy="432" r="36"/><circle cx="335" cy="556" r="15"/><circle cx="335" cy="624" r="15"/><circle cx="301" cy="590" r="15"/>'
+           '<circle cx="369" cy="590" r="15"/></g><path d="M609,322 L689,322 A80,80 0 0 1 769,402 L769,622 A80,80 0 0 1 689,702 L609,702 Z" fill="#ff4f5e"/>'
+           '<g fill="#8a1d27"><circle cx="689" cy="398" r="15"/><circle cx="689" cy="466" r="15"/><circle cx="655" cy="432" r="15"/><circle cx="723" cy="432" r="15"/>'
+           '<circle cx="689" cy="590" r="36"/></g><path d="M490,476 L490,548 L550,512 Z" fill="#fff" stroke="#fff" stroke-width="26" stroke-linejoin="round"/></g></svg>')
+
+
+def app_icon():   # every size Windows and the Linux desktops ask for, drawn from APP_SVG
+    out, r = QIcon(), QSvgRenderer(QByteArray(APP_SVG.encode()))
+    for s in (16, 24, 32, 48, 64, 128, 256):
+        pm = QPixmap(s, s); pm.fill(Qt.transparent); p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing); r.render(p); p.end(); out.addPixmap(pm)
+    return out
+
+
 STYLE = f"""
 * {{ font-family: '{FONT}', 'Segoe UI', sans-serif; color: {TEXT}; }}
 QMainWindow, #page {{ background: {INK}; }}
@@ -98,6 +131,9 @@ QPushButton#arrow {{ background: rgba(20,20,22,0.85); border: 1px solid rgba(255
 QLineEdit, QComboBox {{ background: #09090a; border: 1px solid {LINE}; border-radius: 8px; padding: 7px 10px; font-size: 13px; selection-background-color: #3a3a40; }}
 QLineEdit:focus, QComboBox:focus {{ border: 1px solid rgba(255,255,255,0.28); }}
 QComboBox QAbstractItemView {{ background: {LIFT}; border: 1px solid {LINE}; selection-background-color: #2e2e33; }}
+QRadioButton {{ font-size: 14px; font-weight: 600; spacing: 10px; }}
+QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 9px; border: 2px solid {TEXT3}; background: transparent; }}
+QRadioButton::indicator:checked {{ border: 2px solid {CREAM}; background: {CREAM}; }}
 QMenu {{ background: {LIFT}; border: 1px solid {LINE}; border-radius: 10px; padding: 6px; }}
 QMenu::item {{ padding: 8px 18px; border-radius: 6px; font-size: 13px; }}
 QMenu::item:selected {{ background: #2e2e33; }}
@@ -159,12 +195,15 @@ def alive(pid):
 def journal_title(argv):   # what a build from the console does, from its command line
     if '--apk-only' in argv: return 'Update the app'
     if '--migrate' in argv: return 'Move the old install'
+    if '--setup' in argv: return 'Set up this computer'
     folder = next((x for x in argv if not x.startswith('-') and Path(x).is_dir()), None)
     name = None
     if folder:
         try: name = next((m.get('name') for _, (_, m) in ba.library().items() if m.get('nsp_dir') == str(Path(folder).resolve())), None)
         except Exception: pass
-    return ('Update the shaders of ' if '--update-shaders' in argv else 'Install ' if '--push-only' in argv else 'Build ') + (name or (Path(folder).name if folder else 'a game'))
+    what = ('Build the game app of ' if '--game-apk' in argv or '--xapk' in argv else 'Update the shaders of ' if '--update-shaders' in argv
+            else 'Install ' if '--push-only' in argv else 'Build ')
+    return what + (name or (Path(folder).name if folder else 'a game'))
 
 
 def label(text, name=None, wrap=False):
@@ -177,6 +216,9 @@ def gb_text(n): return f'{n / 2**30:.1f} GB' if n and n >= 2**30 else f'{(n or 0
 
 
 def esc(s): return s.replace('&', '&amp;').replace('<', '&lt;')
+
+
+def reveal(path): QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))   # a folder in Explorer, Finder or the Linux desktop's file manager (os.startfile is Windows' alone)
 
 
 def clock_text(sec): sec = int(sec or 0); return f'{sec // 60}:{sec % 60:02d}' if sec >= 60 else f'{sec} s'
@@ -210,6 +252,7 @@ class Game:
     def new_shaders(self, on_phone):   # run-time shaders the phone saved beyond the ones on this computer (a provisional profile's only: build_android_from_nsp.py pull_captures)
         return max(0, (on_phone.get(self.id) or {}).get('captures', 0) - self.captures) if self.provisional else 0
     def status(self, on_phone, phone):   # (text, colour, state): state picks what Play does
+        if self.info.get('needs_keys'): return 'Needs your prod.keys to read it: pick them in Settings', ERR, 'keys'
         if self.error: return f'Could not read the folder: {self.error}', ERR, 'none'
         if not self.profile: return 'No profile: experimental build only', ERR, 'survey'
         x = 'Experimental (provisional profile, may not boot) · ' if self.provisional else ''   # an experimental build's profile, guessed from the survey
@@ -338,19 +381,27 @@ class LibraryPage(QWidget):
         self.reload()
 
     def folders(self): return [f for f in (self.win.st.value('folders', []) or []) if f]
-    def reload(self):
+    def reload(self):   # one read of the games at a time (each runs --info per folder): one asked for while it runs, as a build's stage ends do, runs once after it
+        if getattr(self, 'reading', False): self.again = True; return
         fs = list(self.folders()); seen = {str(Path(f).resolve()) for f in fs}   # resolved: a folder behind a link (Downloads moved to another drive) is the same folder
+        names = {}   # a game packed on this computer keeps its name while its folder cannot be read (no keys yet), rather than the folder's (DroidPlay's are all "android")
         for gid, (_, meta) in ba.library().items():   # packed on this computer from a folder not in the list
-            if meta.get('nsp_dir') and str(Path(meta['nsp_dir']).resolve()) not in seen: fs.append(meta['nsp_dir']); seen.add(str(Path(meta['nsp_dir']).resolve()))
+            if not meta.get('nsp_dir'): continue
+            names[str(Path(meta['nsp_dir']).resolve())] = meta.get('name')
+            if str(Path(meta['nsp_dir']).resolve()) not in seen: fs.append(meta['nsp_dir']); seen.add(str(Path(meta['nsp_dir']).resolve()))
         if not fs: self.render(); return
+        keys = self.win.keys()   # NSP and XCI files are encrypted: --info reads them with the keys (a NUP or a dump folder needs none)
         def read():
             out = {}
             for f in fs:
                 if not Path(f).is_dir(): continue
-                try: out[f] = self.win.script_json('--info', f)
-                except Exception as e: out[f] = {'error': str(e).strip().splitlines()[-1] if str(e).strip() else 'could not be read', 'name': Path(f).name}
+                try: out[f] = self.win.script_json('--info', f, *(['-k', keys] if keys else []))
+                except Exception as e:
+                    msg = str(e).strip().splitlines()[-1].removeprefix('[RED] ') if str(e).strip() else 'could not be read'
+                    out[f] = {'error': msg, 'needs_keys': not keys and 'prod.keys' in msg, 'name': names.get(str(Path(f).resolve())) or Path(f).name}
             return out
         def got(r):
+            self.reading = False
             if isinstance(r, Exception): self.win.toast(f'Reading the games failed: {r}'); r = {}
             self.games, ids = {}, set()
             for f, i in r.items():   # one card per game, from the first folder that holds it
@@ -358,7 +409,8 @@ class LibraryPage(QWidget):
                 if g.id and g.id in ids: continue
                 ids.add(g.id); self.games[f] = g
             self.render()
-        bg(read, got)
+            if getattr(self, 'again', False): self.again = False; self.reload()
+        self.reading = True; bg(read, got)
     def render(self):
         while self.rl.count() > 1:
             w = self.rl.takeAt(0).widget()
@@ -385,7 +437,8 @@ class LibraryPage(QWidget):
         if not g: self.hero.show_game(None, '', TEXT3); self.hero.play.setEnabled(False); self.hero.opts.setEnabled(False); return
         text, color, state = g.status(self.win.phone_games, self.win.phone_name())
         self.hero.show_game(g, text, color); self.hero.opts.setEnabled(bool(g.profile))
-        self.hero.play.setText({'play': '  Play', 'install': '  Install on phone', 'build': '  Build and install', 'survey': '  Experimental build', 'none': '  Not supported'}[state])
+        self.hero.play.setText({'play': '  Play', 'install': '  Install on phone', 'build': '  Build and install', 'survey': '  Experimental build', 'keys': '  Pick your prod.keys',
+                                'none': '  Not supported'}[state])
         self.hero.play.setEnabled(state != 'none')
     def current(self): return self.games.get(self.picked)
     def slide(self, d): sb = self.scroll.horizontalScrollBar(); sb.setValue(sb.value() + d * (Card.W + 20) * 2)
@@ -403,6 +456,7 @@ class LibraryPage(QWidget):
         if not g: return
         state = g.status(self.win.phone_games, self.win.phone_name())[2]
         s = self.win.serial()
+        if state == 'keys': self.win.go('settings'); return
         if state in ('play', 'install') and not s: self.win.toast('Connect a phone first (Phones)'); return
         if state == 'play':
             bg(lambda: adb_run(s, 'shell', 'am', 'start', '-n', f'{PKG}/.Launcher', '--es', 'game', g.id, '--ez', 'play', 'true'),
@@ -410,23 +464,47 @@ class LibraryPage(QWidget):
         elif state == 'install': self.run(g, ['--push-only'], 'Install')
         elif state == 'build': self.run(g, [], 'Build') if s else self.run(g, ['--no-push'], 'Build')
         elif state == 'survey':   # no profile: the script surveys the game, guesses a provisional profile and packs a best-effort APK (not installed: it may not boot)
-            box = QMessageBox(QMessageBox.Warning, 'Experimental build', f'{g.name} has no profile in nxnative, so it is not supported yet. '
+            box = QMessageBox(QMessageBox.Warning, 'Experimental build', f'{g.name} has no profile in DroidPlay Core, so it is not supported yet. '
                               'The build extracts the game, writes a survey of it (survey.md in its folder), guesses a provisional profile and packs an APK that '
                               'will most likely not boot. Nothing is installed on the phone. It is the starting point for porting the game.', parent=self)
             go = box.addButton('Build anyway', QMessageBox.AcceptRole); box.setDefaultButton(box.addButton(QMessageBox.Cancel)); box.exec()
             if box.clickedButton() is go: self.run(g, ['--no-push'], 'Experimental build')
-    def run(self, g, extra, what):
+    def run(self, g, extra, what, after=None):
         keys = self.win.st.value('keys', '')
         if not keys or not Path(keys).is_file(): self.win.toast('Pick your prod.keys in Settings first'); self.win.go('settings'); return
         args = [g.folder, '-k', keys, '-l', self.win.st.value(f'lang/{g.id}', 'en-US') or 'en-US']
         v = self.win.st.value(f'ver/{g.id}', '')
         if v: args += ['-p', v]
         s = self.win.serial()
-        if '--no-push' not in extra:
+        if '--no-push' not in extra and '--game-apk' not in extra:   # a game app needs no phone
             if not s: self.win.toast('Connect a phone first (Phones)'); return
             if self.win.phone_legacy and not self.legacy_ok(s): return
             args += ['--serial', s]
-        self.win.builds.start(f'{what} {g.name}', args + extra, after=self.after_task)
+        self.win.builds.start(f'{what} {g.name}', args + extra, after=after or self.after_task)
+    def game_app(self, g):   # the game as an app of its own (build_android_from_nsp.py --game-apk): no phone, and the launcher app on the phones is left as it is
+        ex = (g.info.get('extracted') or {}).get(self.win.st.value(f'ver/{g.id}', '') or g.newest) or {}
+        rom = ex.get('romfs_bytes'); data = f'its {gb_text(rom)} of game data' if rom else 'its game data'
+        d = QDialog(self); d.setWindowTitle(f'Game app: {g.name}'); d.setStyleSheet(STYLE + f'QDialog {{ background: {PANEL}; }}'); d.setMinimumWidth(560)
+        lay = QVBoxLayout(d); lay.setContentsMargins(24, 24, 24, 24); lay.setSpacing(10)
+        lay.addWidget(label(f'{g.name} as an app of its own, with its own icon and saves, opening straight into the game on any arm64 device with Vulkan. '
+                            'Several games install side by side, without the launcher app.', 'meta', wrap=True))
+        lay.addSpacing(6)
+        apk = QRadioButton('APK'); lay.addWidget(apk)
+        beside = ('as a .romfs file beside the APK, which takes no extra space on the same drive: copy both to the device, put the .romfs anywhere (an SD card '
+                  'too) and pick it when the app first opens')
+        lay.addWidget(label(f'{gb_text(rom)} of game data is more than an APK holds (2 GB), so the data goes {beside}.' if rom and rom >= ba.GAME_APP_LIMIT else
+                            f'One file with {data} inside, while it fits under 2 GB with the game\'s code; otherwise the data goes {beside}.', 'muted', wrap=True))
+        xapk = QRadioButton('XAPK'); lay.addWidget(xapk)
+        lay.addWidget(label(f'One file, with {data} as the app\'s OBB file, for an XAPK installer app on the device. It holds a full copy of the data, so it takes '
+                            'that much more space on this computer.', 'muted', wrap=True))
+        (xapk if self.win.st.value('game_app_kind', 'apk') == 'xapk' else apk).setChecked(True)
+        lay.addSpacing(6); lay.addWidget(label(f'It goes in the game\'s folder, {g.folder}, beside the other kind if that was built too.', 'muted', wrap=True))
+        bb = QDialogButtonBox(QDialogButtonBox.Cancel); bb.addButton('Build', QDialogButtonBox.AcceptRole); bb.accepted.connect(d.accept); bb.rejected.connect(d.reject); lay.addWidget(bb)
+        if not d.exec(): return
+        x = xapk.isChecked(); self.win.st.setValue('game_app_kind', 'xapk' if x else 'apk')
+        made = f'{ba.safe_name(g.name) or g.id}.{"xapk" if x else "apk"}'
+        def done(): self.after_task(); reveal(g.folder); self.win.toast(f'{made} is in the game\'s folder')
+        self.run(g, ['--game-apk'] + (['--xapk'] if x else []), 'Build the game app of', after=done)
     def after_task(self): self.win.refresh_phone(); self.reload()
     def legacy_ok(self, s):   # the phone holds the one-game install (files/game) and its save: installing moves it to the launcher, and the app copies the save on its next start
         b = QMessageBox(QMessageBox.Warning, 'This phone has a save', f'{self.win.phone_name()} has the app from before the launcher, with its game and save. Installing updates the app '
@@ -455,6 +533,7 @@ class LibraryPage(QWidget):
         def act(text, fn, on=True): a = self.menu.addAction(text, fn); a.setEnabled(on); return a
         act('Build and install', lambda: self.run(g, [], 'Build'), bool(g.profile and s))
         act('Build only', lambda: self.run(g, ['--no-push'], 'Build'), bool(g.profile))
+        act('Build a game app…', lambda: self.game_app(g), bool(g.profile))
         act('Install on phone (no build)', lambda: self.run(g, ['--push-only'], 'Install'), bool(g.profile and g.host and s))
         n = g.new_shaders(self.win.phone_games)
         act(f'Update shaders from the phone ({n} new)' if n else 'Update shaders from the phone', lambda: self.run(g, ['--update-shaders'], 'Update shaders'), bool(g.provisional and g.host and s))
@@ -462,7 +541,7 @@ class LibraryPage(QWidget):
         act('Update the app on the phone', lambda: self.win.builds.start('Update the app', ['--apk-only', '--serial', s], after=self.after_task), bool(s and ba.library()))
         act('Remove from the phone…', lambda: self.win.phones.remove_game(g.id, g.name), bool(s and g.id in self.win.phone_games))
         self.menu.addSeparator()
-        act('Open the game folder', lambda: os.startfile(g.folder) if os.name == 'nt' else None)
+        act('Open the game folder', lambda: reveal(g.folder))
         act('Remove from the collection…', lambda: self.remove(g))
     def remove(self, g):
         if QMessageBox.question(self, 'Remove', f'Remove {g.name} from the collection? Its files are not deleted.') != QMessageBox.Yes: return
@@ -483,7 +562,7 @@ class BuildsPage(QWidget):
         self.tree = QTreeWidget(); self.tree.setHeaderLabels(['Stage', 'Progress', 'Time', 'Result']); self.tree.setColumnWidth(0, 300); self.tree.setColumnWidth(1, 300)
         self.tree.setRootIsDecorated(False); lay.addWidget(self.tree, 2)
         self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setFont(QFont('Cascadia Mono', 9)); lay.addWidget(self.log, 3)
-        row = QHBoxLayout(); b = QPushButton('Open the app folder'); b.setObjectName('ghost'); b.clicked.connect(lambda: os.startfile(str(ba.data_dir())) if os.name == 'nt' else None)
+        row = QHBoxLayout(); b = QPushButton('Open the app folder'); b.setObjectName('ghost'); b.clicked.connect(lambda: reveal(ba.data_dir()))
         row.addWidget(b); row.addStretch(); lay.addLayout(row)
         self.live = None   # (the running stage's row, its detail, its fraction or -1)
         self.jt = QTimer(self); self.jt.timeout.connect(self.follow); self.jt.timeout.connect(self.tick); self.jt.start(1000)
@@ -523,7 +602,7 @@ class BuildsPage(QWidget):
     def start(self, title, args, after=None):
         if self.busy() or self.ext: QMessageBox.warning(self, 'Busy', 'A build is running: wait for it or stop it'); return
         self.live = None; self.title = title; self.head.setText(title); self.sub.setText('starting…'); self.tree.clear(); self.items = {}; self.log.clear(); self.after = after; self.buf = ''
-        self.proc = QProcess(self); self.proc.setProgram(sys.executable); self.proc.setArguments([str(SCRIPT), *args, '--progress', 'json'])
+        self.proc = QProcess(self); self.proc.setProgram(PYTHON); self.proc.setArguments([str(SCRIPT), *args, '--progress', 'json'])
         bid = uuid.uuid4().hex; self.ids.add(bid)
         env = QProcessEnvironment.systemEnvironment(); env.insert('PYTHONUTF8', '1'); env.insert('PYTHONUNBUFFERED', '1'); env.insert('NXNATIVE_BUILD_ID', bid); self.proc.setProcessEnvironment(env)
         self.proc.setProcessChannelMode(QProcess.MergedChannels); self.proc.readyRead.connect(self.read); self.proc.finished.connect(self.finished)
@@ -644,7 +723,7 @@ class PhonesPage(QWidget):
         if r >= 0 and self.table.item(r, 0): self.win.set_serial(self.table.item(r, 0).text())
     def show_phone(self, pkg, games, legacy):
         self.ph.setText(self.win.phone_name() or 'No phone'); self.games.clear()
-        self.app.setText(('The nxnative app · ' + ' · '.join(x.strip() for x in pkg.splitlines())) if 'lastUpdateTime' in pkg else 'The nxnative app is not installed')
+        self.app.setText(('The DroidPlay app · ' + ' · '.join(x.strip() for x in pkg.splitlines())) if 'lastUpdateTime' in pkg else 'The DroidPlay app is not installed')
         for gid, meta in games.items():
             it = QListWidgetItem(f'{meta.get("name") or gid}     {gid} · {meta.get("display") or meta.get("version") or "?"}'); it.setData(Qt.UserRole, gid); self.games.addItem(it)
         if legacy: self.games.addItem('A one-game install (files/game, before the launcher): Move the old one-game install puts it in the launcher, its save copied over')
@@ -815,18 +894,22 @@ class SettingsPage(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(48, 32, 48, 24); lay.setSpacing(16)
         lay.addWidget(label('Settings', 'h1'))
         keys = QHBoxLayout(); keys.addWidget(label('Your prod.keys', 'meta')); self.keys = QLineEdit(win.st.value('keys', '')); self.keys.setPlaceholderText('the keys dumped from your Switch')
-        self.keys.editingFinished.connect(lambda: win.st.setValue('keys', self.keys.text().strip())); keys.addWidget(self.keys, 1)
+        self.keys.editingFinished.connect(lambda: self.set_keys(self.keys.text().strip())); keys.addWidget(self.keys, 1)
         b = QPushButton('Choose…'); b.clicked.connect(self.pick_keys); keys.addWidget(b); lay.addLayout(keys)
         lay.addSpacing(8)
         head = QHBoxLayout(); head.addWidget(label('Requirements', 'h2')); head.addStretch(); b = QPushButton('Check again'); b.setObjectName('ghost'); b.clicked.connect(lambda *_: self.run()); head.addWidget(b)
+        self.setup = QPushButton("Install what's missing"); self.setup.clicked.connect(self.install); self.setup.hide(); head.addWidget(self.setup); self.rows = []
         lay.addLayout(head)
-        lay.addWidget(label(f'The build runs with {sys.executable}: install missing Python modules into it.', 'muted', wrap=True))
+        lay.addWidget(label(f'The build runs with {PYTHON}: install missing Python modules into it.', 'muted', wrap=True))
         self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(['', 'What', 'Detail / how to get it']); self.table.verticalHeader().hide(); self.table.setShowGrid(False)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch); self.table.setColumnWidth(0, 36); self.table.setColumnWidth(1, 220); self.table.setWordWrap(True)
         lay.addWidget(self.table, 1)
     def pick_keys(self):
         f, _ = QFileDialog.getOpenFileName(self, 'Your prod.keys', '', 'Keys (*.keys);;All files (*)')
-        if f: self.keys.setText(f); self.win.st.setValue('keys', f)
+        if f: self.keys.setText(f); self.set_keys(f)
+    def set_keys(self, f):   # the library reads NSP and XCI games with the keys: read it again when they change
+        if f == (self.win.st.value('keys', '') or ''): return
+        self.win.st.setValue('keys', f); self.win.library.reload()
     def run(self, then=None):
         def got(rows):
             if isinstance(rows, Exception): rows = [{'name': 'check', 'ok': False, 'detail': str(rows), 'fix': ''}]
@@ -835,20 +918,42 @@ class SettingsPage(QWidget):
                 mark = QTableWidgetItem('●'); mark.setForeground(QColor(READY if r['ok'] else ERR)); mark.setTextAlignment(Qt.AlignCenter); self.table.setItem(i, 0, mark)
                 self.table.setItem(i, 1, QTableWidgetItem(r['name'])); self.table.setItem(i, 2, QTableWidgetItem(r['detail'] + (f'\n→ {r["fix"]}' if r['fix'] else '')))
             self.table.resizeRowsToContents()
+            self.rows = rows; self.setup.setVisible(bool(self.installable()))
             if then: then(rows)
         bg(lambda: self.win.script_json('--check'), got)
+    def installable(self):   # the failing rows --setup installs: Windows only so far, and not the Python modules (uv run brings those, or pip)
+        return [r['name'] for r in self.rows if not r['ok'] and r['name'] != 'check' and not r['name'].startswith('Python')] if os.name == 'nt' else []
+    def install(self):   # build_android_from_nsp.py --setup, once the player has seen what it downloads and, for the Android SDK's parts, accepted Google's licence
+        missing = self.installable()
+        if not missing: return
+        sdk_rows = set(ba.sdk_packages(Path('.'))) | {'Android SDK'}
+        parts = (['JDK 21, Microsoft\'s build (about 190 MB)'] if any(n.startswith('JDK') for n in missing) else []) + \
+                (['.NET SDK 10 (about 290 MB)'] if '.NET SDK 10' in missing else []) + \
+                (['the Android SDK: its command-line tools, platform-tools, platform, build-tools, NDK and CMake (about 1.1 GB to download, 4 GB installed)']
+                 if 'Android SDK' in missing else   # with no SDK found, --check lists none of its parts but adb
+                 [f'the Android SDK\'s {", ".join(n for n in missing if n in sdk_rows)}'] if any(n in sdk_rows for n in missing) else [])
+        sdk = any(n in sdk_rows for n in missing)
+        b = QMessageBox(QMessageBox.Question, "Install what's missing", 'Setup downloads and installs:\n\n• ' + '\n• '.join(parts) +
+                        f'\n\nThe JDK and the .NET SDK go into {ba.data_dir() / "tools"}, for this app alone; the Android SDK goes where Android Studio keeps it.', QMessageBox.Cancel, self)
+        if sdk: b.setInformativeText('The Android SDK comes from Google: installing its parts means accepting the Android SDK License, '
+                                     'https://developer.android.com/studio/terms. Its usage metrics stay off.')
+        go = b.addButton('Accept and install' if sdk else 'Install', QMessageBox.AcceptRole); b.setDefaultButton(QMessageBox.Cancel); b.exec()
+        if b.clickedButton() is not go: return
+        self.win.builds.start('Set up this computer', ['--setup'] + (['--accept-android-licenses'] if sdk else []),
+                              after=lambda: (ba.tool_paths(), self.run(), self.win.refresh_devices()))   # this app's PATH takes the new tools too (adb)
+        self.win.go('builds')
 
 
 # ---------------- The window ----------------
 class Window(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle('nxnative'); self.setMinimumSize(1000, 620)
+        super().__init__(); self.setWindowTitle('DroidPlay'); self.setWindowIcon(app_icon()); self.setMinimumSize(1000, 620)
         a = QApplication.primaryScreen().availableGeometry(); self.resize(min(1440, a.width() - 40), min(900, a.height() - 40))
-        self.st = QSettings('nxnative', 'android'); self.devs = []; self.phone_games = {}; self.phone_legacy = False; self.models = {}
+        self.st = QSettings('nxnative', 'android'); self.devs = []; self.phone_games = {}; self.phone_legacy = False; self.models = {}   # the old name: the settings stay
         central = QWidget(); central.setObjectName('page'); root = QVBoxLayout(central); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0); self.setCentralWidget(central)
         # the top bar: the wordmark, the pages, the phone, search, + Build game
         top = QWidget(); top.setObjectName('topbar'); top.setAttribute(Qt.WA_StyledBackground, True); tl = QHBoxLayout(top); tl.setContentsMargins(28, 14, 28, 14); tl.setSpacing(6)
-        tl.addWidget(label('nxnative', 'wordmark'))
+        tl.addWidget(label('DroidPlay', 'wordmark'))
         self.navs = {}; group = QButtonGroup(self); group.setExclusive(True)
         for key, text, ic in (('library', 'Library', 'library'), ('builds', 'Builds', 'builds'), ('phones', 'Phones', 'phone'), ('perf', 'Performance', 'perf'), ('settings', 'Settings', 'settings')):
             b = QToolButton(); b.setObjectName('nav'); b.setText(f' {text}'); b.setIcon(icon(ic, TEXT2, 18)); b.setIconSize(QSize(18, 18)); b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -899,8 +1004,9 @@ class Window(QMainWindow):
         if d not in fs: self.st.setValue('folders', fs + [d])
         self.go('library'); self.library.reload(); self.toast('Reading the game… then Build and install puts it on your phone')
     def stop_build(self): self.builds.stop()
+    def keys(self): k = self.st.value('keys', '') or ''; return k if k and Path(k).is_file() else None
     def script_json(self, *args):
-        r = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=NOWINDOW, env=dict(os.environ, PYTHONUTF8='1'))
+        r = subprocess.run([PYTHON, str(SCRIPT), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=NOWINDOW, env=dict(os.environ, PYTHONUTF8='1'))
         if r.returncode: raise RuntimeError((r.stderr or r.stdout).strip()[-500:])
         return json.loads(r.stdout)
     def serial(self): return self.phone.currentData() or None
@@ -962,7 +1068,14 @@ class Window(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv); app.setApplicationName('nxnative'); app.setStyle('Fusion'); app.setStyleSheet(STYLE)
+    if '--write-icon' in sys.argv[:-1]:   # the Windows installer's shortcuts take DroidPlay's icon as an .ico file (dm/android/windows/install_droidplay.cmd)
+        app = QApplication(sys.argv[:1]); path = sys.argv[sys.argv.index('--write-icon') + 1]
+        if not app_icon().pixmap(256, 256).save(path, 'ICO'): sys.exit(f'could not write {path}')
+        return
+    if os.name == 'nt':   # a taskbar button of its own, with DroidPlay's name and icon, not grouped with every other Python window
+        try: import ctypes; ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('io.github.enjoyerofslop.droidplay.desktop')
+        except Exception: pass
+    app = QApplication(sys.argv); app.setApplicationName('DroidPlay'); app.setWindowIcon(app_icon()); app.setStyle('Fusion'); app.setStyleSheet(STYLE)
     w = Window(); w.show(); sys.exit(app.exec())
 
 

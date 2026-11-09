@@ -141,7 +141,7 @@ public class Launcher extends Activity {
         LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setBackgroundColor(INK); root.setPadding(px(40), px(24), px(40), px(24));
         LinearLayout bar = new LinearLayout(this); bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.addView(new Mark(this), new LinearLayout.LayoutParams(px(26), px(26)));
-        TextView word = text("nxnative", 18, TEXT, 700); word.setLetterSpacing(-0.02f); word.setPadding(px(12), 0, 0, 0);
+        TextView word = text("DroidPlay", 18, TEXT, 700); word.setLetterSpacing(-0.02f); word.setPadding(px(12), 0, 0, 0);
         bar.addView(word, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         final String running = runningGame();
         if (running != null) {
@@ -157,7 +157,7 @@ public class Launcher extends Activity {
         if (gs.isEmpty()) {
             LinearLayout empty = new LinearLayout(this); empty.setOrientation(LinearLayout.VERTICAL); empty.setGravity(Gravity.CENTER_VERTICAL);
             TextView h = text("No games on this phone yet", 22, TEXT, 700); h.setLetterSpacing(-0.02f); empty.addView(h);
-            TextView t = text("Pack one on your computer with the nxnative desktop app: it copies the game here and updates this app.", 14, TEXT2, 400);
+            TextView t = text("Pack one on your computer with DroidPlay: it copies the game here and updates this app.", 14, TEXT2, 400);
             t.setPadding(0, px(8), 0, px(20)); t.setLineSpacing(0, 1.3f); t.setMaxWidth(px(440)); empty.addView(t);
             TextView st = pill("Run the self test", LIFT, TEXT);
             st.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { selftest(); } });
@@ -401,7 +401,7 @@ public class Launcher extends Activity {
         try {
             for (File f : src) copyTree(f, new File(to, f.getName()), xa, f.getName());
             writeText(new File(to, "xattrs.tsv"), xa.toString());
-            writeText(new File(to, "README.txt"), "nxnative save backup: the app's internal save folders as they were. Copy this folder to backups/restore/ on the phone to put them back.\n");
+            writeText(new File(to, "README.txt"), "DroidPlay save backup: the app's internal save folders as they were. Copy this folder to backups/restore/ on the phone to put them back.\n");
         } catch (IOException e) { Log.w(TAG, "backup: " + e); toast("Backup failed: " + e.getMessage()); return null; }
         Log.i(TAG, "saves backed up to " + to);
         return to.getPath();
@@ -536,16 +536,27 @@ public class Launcher extends Activity {
             else if (a == android.view.MotionEvent.ACTION_UP || a == android.view.MotionEvent.ACTION_CANCEL) x.animate().scaleX(1).scaleY(1).setDuration(160).start();
             return false; } });
     }
-    // The app's mark (apk/res/drawable/ic_launcher_fg.xml, the same shapes on its 108-unit grid): two halves of a controller, one solid and one drawn
+    // DroidPlay's icon beside the wordmark: the light green square and the controller of apk/res/drawable/ic_launcher_fg.xml, on the same 1024-unit grid as DroidPlay's
+    // Mac icon (the controller scaled by 1.5161 about the centre, as there)
     static final class Mark extends View {
         final android.graphics.Paint p = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
-        Mark(android.content.Context c) { super(c); }
+        final android.graphics.Path joyL = new android.graphics.Path(), joyR = new android.graphics.Path(), play = new android.graphics.Path();
+        Mark(android.content.Context c) {
+            super(c);
+            joyL.addRoundRect(new android.graphics.RectF(255, 322, 415, 702), new float[] {80, 80, 0, 0, 0, 0, 80, 80}, android.graphics.Path.Direction.CW);
+            joyR.addRoundRect(new android.graphics.RectF(609, 322, 769, 702), new float[] {0, 0, 80, 80, 80, 80, 0, 0}, android.graphics.Path.Direction.CW);
+            play.moveTo(490, 476); play.lineTo(490, 548); play.lineTo(550, 512); play.close();
+        }
+        void dots(android.graphics.Canvas c, int color, float[] xyr) { p.setColor(color); for (int i = 0; i < xyr.length; i += 3) c.drawCircle(xyr[i], xyr[i + 1], xyr[i + 2], p); }
         @Override protected void onDraw(android.graphics.Canvas c) {
-            float s = Math.min(getWidth(), getHeight()) / 66f; c.save(); c.scale(s, s); c.translate(-21, -21);   // the 66-unit safe area, filling the view
-            p.setStyle(android.graphics.Paint.Style.FILL); p.setColor(CREAM); c.drawRoundRect(32, 31, 52, 77, 10, 10, p);
-            p.setColor(INK); c.drawCircle(42, 43, 4.2f, p);
-            p.setStyle(android.graphics.Paint.Style.STROKE); p.setStrokeWidth(3); p.setColor(CREAM); c.drawRoundRect(57.5f, 32.5f, 74.5f, 75.5f, 8.5f, 8.5f, p);
-            p.setStyle(android.graphics.Paint.Style.FILL); c.drawCircle(66, 64, 4.2f, p);
+            float s = Math.min(getWidth(), getHeight()) / 1024f; c.save(); c.scale(s, s);
+            p.setStyle(android.graphics.Paint.Style.FILL); p.setShader(new android.graphics.LinearGradient(0, 0, 0, 1024, 0xFF9EE8AD, 0xFF47BA75, android.graphics.Shader.TileMode.CLAMP));
+            c.drawRoundRect(0, 0, 1024, 1024, 228, 228, p); p.setShader(null);
+            c.translate(512, 512); c.scale(1.5161f, 1.5161f); c.translate(-512, -512);
+            p.setColor(0xFF3A3F4B); c.drawRoundRect(413, 334, 611, 690, 26, 26, p);
+            p.setColor(0xFF00B8D9); c.drawPath(joyL, p); dots(c, 0xFF0A5F70, new float[] {335, 432, 36, 335, 556, 15, 335, 624, 15, 301, 590, 15, 369, 590, 15});
+            p.setColor(0xFFFF4F5E); c.drawPath(joyR, p); dots(c, 0xFF8A1D27, new float[] {689, 398, 15, 689, 466, 15, 655, 432, 15, 723, 432, 15, 689, 590, 36});
+            p.setColor(0xFFFFFFFF); p.setStyle(android.graphics.Paint.Style.FILL_AND_STROKE); p.setStrokeWidth(26); p.setStrokeJoin(android.graphics.Paint.Join.ROUND); c.drawPath(play, p);
             c.restore();
         }
     }

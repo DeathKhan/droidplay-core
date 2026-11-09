@@ -3,7 +3,7 @@
 
 void *objc_autoreleasePoolPush(void);
 void objc_autoreleasePoolPop(void *);
-// droidnative: Metal enqueues its presents and paces them elsewhere, so it has nothing to do here; Android's replays define their own (gfx_vk.c, gfx_null.c)
+// DroidPlay Core: Metal enqueues its presents and paces them elsewhere, so it has nothing to do here; Android's replays define their own (gfx_vk.c, gfx_null.c)
 __attribute__((weak)) void mtl_present_pace(void) {}
 
 // Ready continuations of NVN queues share the renderer's one ordered Metal queue.
@@ -166,7 +166,7 @@ static void *nq_worker(void *unused) {
             }
             nq_cost_end(cost); gfx_leave(); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
         }
-        if(n->kind==NQ_PRESENT) mtl_present_pace();   // droidnative: a pacing sleep, out of g_sub_mu (nvn_obj.h)
+        if(n->kind==NQ_PRESENT) mtl_present_pace();   // DroidPlay Core: a pacing sleep, out of g_sub_mu (nvn_obj.h)
         pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; j->receipt->present=present; } if(fence) { q->physical=fence; if(n->event) nq_event_issued(n->event,fence,n->mode,n->value); } if(n->receipt) nq_put(n->receipt); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
     }
     return NULL;

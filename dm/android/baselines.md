@@ -1,7 +1,7 @@
 # Android baselines
 
-The first baselines of droidnative on more than one device: six Switch 1 games on three Snapdragon devices, run the same way on each with
-`scripts/bench_android.py` (the same save, scripted input and measuring window). The first four were measured 2026-11-08 on droidnative `main` at `f4f7abb3`
+The first baselines of DroidPlay Core (then droidnative) on more than one device: six Switch 1 games on three Snapdragon devices, run the same way on each with
+`scripts/bench_android.py` (the same save, scripted input and measuring window). The first four were measured 2026-11-08 on its `main` at `f4f7abb3`
 with PR #1 (the present's vsync sleep outside the submission lock) and PR #3 (the game window keeps the screen on); The Legend of Zelda: Link's Awakening
 and Skyward Sword HD the same evening on `main` at `ee18169a`. Each game was packed by `build_android_from_nsp.py`. They are a starting point for fixes,
 not a verdict: every known problem below that is not marked fixed is open.
@@ -56,6 +56,8 @@ Numbered in the order they were found, so links to a number stay right:
    VP9 (Smash) take the software decoder and were not affected.
 2. **Brilliant Diamond crashes on the Retroid Pocket 5** in the Adreno 650 driver's shader compiler (`libllvm-qgl.so`, `addr=0x48`), while it builds its first
    pipelines. The newer drivers of the other two take the same SPIR-V. Which shader it is is not known yet: nothing logs each pipeline as it is built.
+   Mesa's Turnip compiles them: with `DM_VK_DRIVER` and Mr. Purple's Turnip T30, the game reaches Eterna City on the Retroid Pocket 5 and draws it right, at
+   11.3 fps ([Another Vulkan driver](README.md#another-vulkan-driver-dm_vk_driver)).
 3. **Fixed: Smash crashed at boot with Android's stock shared font.** The standard shared font was the device's Roboto, which has no TrueType hinting,
    and Smash's font engine needs a hinted font (`main+0x7caa0`, `addr=0x38`). The packer now copies a hinted TrueType font into each game's
    `font/standard.ttf` (Arial Unicode on a Mac, as the iPhone build does), and Smash boots on all three devices: [Android: the standard shared font must
@@ -103,7 +105,10 @@ Numbered in the order they were found, so links to a number stay right:
     linear render target s19 1920x1080 (format 0x25) written back to guest memory`) and uploading it again (`texture uploads 0 first + 2 re-uploads,
     15.8 MB`), with submit and present taking up to 36 ms while the GPU takes 5 ms on the Odin 2. Its profile now turns on `DM_VK_WB_ABSORB` (59.7 fps
     on the Pad 3, 59.3 on the Odin 2): [A linear render target uploaded again after its own write-back, every
-    frame](../../docs/reference/rendering.md#a-linear-render-target-uploaded-again-after-its-own-write-back-every-frame). Link's Awakening's overworld
+    frame](../../docs/reference/rendering.md#a-linear-render-target-uploaded-again-after-its-own-write-back-every-frame). That Odin 2 figure was one run:
+    later runs spread from 33 to 57 fps, the write-back's 8.3 MB staging buffer being made and freed every frame. It is pooled now (60 fps in three runs of
+    three on the Odin 2, 60.0 on the Pad 3): [A 1080p linear render target's write-back staged in a buffer of its own every
+    frame](../../docs/reference/rendering.md#a-1080p-linear-render-targets-write-back-staged-in-a-buffer-of-its-own-every-frame). Link's Awakening's overworld
     likewise falls to 31 fps on the Pad 3: the game switched interval 175 times in one run there, against 4 on the Odin 2.
 
 ## Reading the numbers

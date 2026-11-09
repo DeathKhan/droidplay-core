@@ -6,6 +6,7 @@
 #   python scripts/build_android_from_nsp.py --apk-only [--serial ...]                                  the app with every game host built on this computer, installed
 #   python scripts/build_android_from_nsp.py --migrate --title <title ID> [--serial ...]               a one-game install's folder (files/game) into files/games/<title ID>
 #   python scripts/build_android_from_nsp.py --check | --info <NSP folder>                              requirements / the game's details, as JSON (the desktop app)
+#   python scripts/build_android_from_nsp.py --setup [--accept-android-licenses]                         install what --check finds missing (Windows: dm/android/tools/host_setup.py)
 #   python scripts/build_android_from_nsp.py <NSP folder> -k <prod.keys> --game-apk [--xapk] [--out <folder>]   the game in an app of its own, to install anywhere (make_game_app)
 #   --progress json: newline-delimited JSON events on stdout (build_ipa_from_nsp.py Progress), for the desktop app (scripts/nxnative_android.py)
 #   Every build also writes those events to a journal, <data>/builds/<time>-<pid>.jsonl (start and exit events around them), whatever its --progress: the desktop app
@@ -27,13 +28,14 @@
 #      A one-game install of the same game (files/game, the layout before the launcher) is moved there instead of copied again, and its save is copied by the app
 # The picture comes from the Vulkan replay of NVN (dm/android/gfx_vk.c).
 # Needs: Python with lz4, capstone, fonttools and backports.zstd (not on Python 3.14), the .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (ANDROID_HOME or --sdk), adb, keytool (a JDK).
-import argparse, contextlib, datetime, hashlib, json, os, re, shutil, subprocess, sys, tarfile
+import argparse, contextlib, datetime, functools, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'scripts'))
 try: import fcntl  # noqa: F401
 except ImportError: sys.path.append(str(REPO / 'dm/android/tools/compat'))   # Windows: build_ipa_from_nsp.py loads tree_tar.py, which imports fcntl (compat/fcntl.py)
+if os.name == 'nt': os.environ.setdefault('DM_REWRITE_J', '1')   # patch_nso.py's parallel scans fork their workers with SIGTERM blocked, which Windows cannot: one there
 import build_ipa_from_nsp as bi   # noqa: E402
 from build_ipa_from_nsp import BuildError, say   # noqa: E402
 
@@ -50,6 +52,9 @@ STANDARD_FONTS = ['/System/Library/Fonts/Supplemental/Arial Unicode.ttf', '/Syst
                   '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf']
 REMOTE = f'/sdcard/Android/data/{PKG}/files'
 BUILD_TOOLS, PLATFORM = '36.0.0', 'android-35'   # build_apk.py's defaults
+# libadrenotools and its hooks (dm/android/CMakeLists.txt), in every APK: DM_VK_DRIVER opens a Vulkan driver of the player's through them (dm/android/vk_driver.c), so trying
+# one needs no other build. Built beside the loader, and kept with it in the library
+VK_DRIVER_LIBS = ('libadrenotools.so', 'libhook_impl.so', 'libmain_hook.so')
 # Games played on an Android phone (their notes say how): the desktop app shows the others as not tested there
 ANDROID_TESTED = {'010015100B514000'}
 
@@ -100,21 +105,58 @@ def sdk_dir(arg):
     raise BuildError('Android SDK not found: give --sdk or set ANDROID_HOME')
 
 
+sys.path.append(str(REPO / 'dm/android/tools')); import host_setup   # noqa: E402  # pyright: ignore[reportMissingImports]  (--setup; dm/android/tools, put on the path here)
+NDK, CMAKE = '28.2.13676358', '3.22.1'   # what --setup installs, and the CI builds with; a build takes the newest NDK and CMake the SDK has
+
+
+def sdk_packages(sdk):   # check()'s rows for the SDK's parts → (sdkmanager's name, a file it puts there), for --setup
+    exe = '.exe' if os.name == 'nt' else ''
+    return {'adb': ('platform-tools', sdk / 'platform-tools' / f'adb{exe}'), f'platform {PLATFORM}': (f'platforms;{PLATFORM}', sdk / 'platforms' / PLATFORM / 'android.jar'),
+            f'build-tools {BUILD_TOOLS}': (f'build-tools;{BUILD_TOOLS}', sdk / 'build-tools' / BUILD_TOOLS), 'NDK': (f'ndk;{NDK}', sdk / 'ndk' / NDK),
+            'CMake': (f'cmake;{CMAKE}', sdk / 'cmake' / CMAKE)}
+
+
+def tool_paths():   # the JDK and .NET SDK --setup installed, and the SDK's adb, on PATH for this run and what it starts (the desktop app imports this script for it too)
+    try: sdk = sdk_dir(None)
+    except BuildError: sdk = None
+    host_setup.add_tool_paths(data_dir() / 'tools', sdk)
+
+
+tool_paths()
+
+
 def newest(d, what):
     vs = sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: [int(x) if x.isdigit() else 0 for x in p.name.split('.')]) if d.is_dir() else []
     if not vs: raise BuildError(f'no {what} in {d}')
     return vs[-1]
 
 
-def build_nx_extract(work, logs, env):   # build_ipa_from_nsp.py's, with Windows' .exe
-    out = work / 'tools/nx_extract'
-    exe = out / ('nx_extract.exe' if os.name == 'nt' else 'nx_extract')
-    bi.run(['dotnet', 'build', REPO / 'dm/tools/nx_extract', '-c', 'Release', '-o', out, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
-    if not exe.exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-    return exe
+def build_nx_extract(work, logs, env):
+    """build_ipa_from_nsp.py's, with Windows' .exe, and built once per version of its source into <data>/tools/nx_extract-<digest>, which every run then takes:
+    the desktop app reads each game with --info, so a build per folder per read was a dotnet build each time, several at once writing the project's obj/.
+    work is unused (that script's builder put it there)"""
+    src = REPO / 'dm/tools/nx_extract'; name = 'nx_extract.exe' if os.name == 'nt' else 'nx_extract'
+    h = hashlib.sha256()
+    for p in sorted(src.rglob('*')):
+        rel = p.relative_to(src)
+        if p.is_file() and not {'bin', 'obj'} & set(rel.parts): h.update(rel.as_posix().encode() + b'\0' + p.read_bytes() + b'\0')
+    out = data_dir() / 'tools' / f'nx_extract-{h.hexdigest()[:16]}'
+    if (out / name).is_file(): return out / name
+    with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:   # built outside and copied in, as that script does: MSBuild breaks on an apostrophe in the path
+        bi.run(['dotnet', 'build', src, '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
+        if not (Path(t) / name).exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
+        part = out.with_name(f'{out.name}.{os.getpid()}'); bi.rmtree(part); shutil.copytree(t, part)
+        try: os.replace(part, out)
+        except OSError: bi.rmtree(part)   # another run put the same build there meanwhile
+    return out / name
 
 
-def build_host(sdk, game_id, work, logs, env):   # → (the game's host, the loader, the NDK)
+# build_ipa_from_nsp.py builds nx_extract itself wherever it reads packages (package_reader, which scan() uses) and in the survey, and looks for an executable named
+# nx_extract, which on Windows is nx_extract.exe: every NSP folder stopped there. This script's builder takes its place for the whole run.
+bi.build_nx_extract = lambda repo, work, logs, env: build_nx_extract(work, logs, env)
+
+
+def build_host(sdk, game_id, work, logs, env):   # → (the game's host, the loader, the NDK); VK_DRIVER_LIBS beside them
     ndk = newest(sdk / 'ndk', 'NDK'); cm = newest(sdk / 'cmake', 'CMake') / 'bin'
     exe = '.exe' if os.name == 'nt' else ''
     bdir = work / 'android_host'
@@ -127,7 +169,7 @@ def build_host(sdk, game_id, work, logs, env):   # → (the game's host, the loa
     bi.run([cm / f'cmake{exe}', '-G', 'Ninja', '-S', REPO / 'dm/android', '-B', bdir, f'-DCMAKE_MAKE_PROGRAM={cm / ("ninja" + exe)}',
             f'-DCMAKE_TOOLCHAIN_FILE={ndk / "build/cmake/android.toolchain.cmake"}', '-DANDROID_ABI=arm64-v8a', '-DANDROID_PLATFORM=android-29',
             f'-DGAME={game_id}', f'-DPython3_EXECUTABLE={sys.executable}'], logs / 'android_cmake.log', env=env)
-    bi.run([cm / f'ninja{exe}', '-C', bdir, 'dmhost_app', 'nxloader'], logs / 'android_host.log', env=env)
+    bi.run([cm / f'ninja{exe}', '-C', bdir, 'dmhost_app', 'nxloader', *[n[3:-3] for n in VK_DRIVER_LIBS]], logs / 'android_host.log', env=env)
     return bdir / f'libdmhost_{game_id}.so', bdir / 'libnxloader.so', ndk
 
 
@@ -189,12 +231,17 @@ def build_shaders(sv, dirs, work, logs, env, g, dlc_roms=()):
 
 
 # ---------------- The library of game hosts ----------------
-def library_add(gid, so, loader, selftest, meta):   # the game's host, and the loader and self test of the latest build (they do not depend on the game)
+def library_add(gid, so, loader, selftest, meta):   # the game's host, and the loader, VK_DRIVER_LIBS and self test of the latest build (they do not depend on the game)
     lib = data_dir(); d = lib / 'hosts' / gid; d.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(so, d / so.name)
     (d / 'meta.json').write_text(json.dumps(dict(meta, built=datetime.datetime.now().isoformat(timespec='seconds')), indent=1), encoding='utf-8')
     (lib / 'loader').mkdir(exist_ok=True); shutil.copyfile(loader, lib / 'loader' / loader.name)
+    for f in driver_libs(loader.parent): shutil.copyfile(f, lib / 'loader' / f.name)
     st = lib / 'selftest'; shutil.rmtree(st, ignore_errors=True); shutil.copytree(selftest, st)
+
+
+def driver_libs(d):   # VK_DRIVER_LIBS in a folder: a library made before they were built has none, and its APK goes without (DM_VK_DRIVER then logs that they are missing)
+    return [d / n for n in VK_DRIVER_LIBS if (d / n).is_file()]
 
 
 def library():   # {title ID: (host, meta)} of the hosts built on this computer
@@ -269,7 +316,7 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, wor
     icon = game / 'icon.jpg'
     bi.PROG.set(step='packing the APK' + (' with the RomFS inside' if inside else ''))
     bi.run([sys.executable, REPO / 'dm/android/tools/build_apk.py', '--sdk', sdk, '--game-app', g.id, '--so', so, '--game-dir', stage,
-            *(['--romfs', str(rom)] if inside else []), '--keystore', KEYSTORE, '-o', apk, '--label', meta.get('name') or g.id,
+            *[x for f in driver_libs(Path(so).parent) for x in ('--lib', f)], *(['--romfs', str(rom)] if inside else []), '--keystore', KEYSTORE, '-o', apk, '--label', meta.get('name') or g.id,
             *(['--icon', icon] if icon.is_file() else [])], logs / 'android_game_apk.log', env=env)
     Path(f'{apk}.idsig').unlink(missing_ok=True)   # apksigner's v4 signature, for adb's incremental installs only: clutter beside an app to share
     if xapk:
@@ -303,7 +350,7 @@ def make_apk(sdk, logs, env):   # the app with every host in the library → its
     KEYSTORE.parent.mkdir(parents=True, exist_ok=True)
     apk = lib / 'nxnative.apk'
     bi.run([sys.executable, REPO / 'dm/android/tools/build_apk.py', '--sdk', sdk, '--loader', loader, *[x for so, _ in hosts.values() for x in ('--so', so)],
-            '--selftest', st, '--keystore', KEYSTORE, '-o', apk], logs / 'android_apk.log', env=env)
+            *[x for f in driver_libs(loader.parent) for x in ('--lib', f)], '--selftest', st, '--keystore', KEYSTORE, '-o', apk], logs / 'android_apk.log', env=env)
     names = [m.get('name') or gid for gid, (_, m) in hosts.items()]
     say(f'app: {", ".join(names)} ({apk})')
     return apk
@@ -324,7 +371,11 @@ def adb(serial, *a, log=None, check=True):
     cmd = ['adb'] + (['-s', serial] if serial else []) + [str(x) for x in a]
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', env=dict(os.environ, MSYS_NO_PATHCONV='1'))
     if log: log.write_text(r.stdout + r.stderr)
-    if r.returncode and check: raise BuildError(f'{" ".join(cmd)} failed: {(r.stdout + r.stderr).strip()[-400:]}')
+    # the exit status too: a step that printed nothing left only "failed:" (droidplay-core issue #37), with no way to tell a missing program (127), adb losing the phone (255)
+    # and a command that failed (1)
+    if r.returncode and check:
+        out = (r.stdout + r.stderr).strip()
+        raise BuildError(f'{" ".join(cmd)} failed (exit status {r.returncode}): {out[-400:] if out else "no output"}')
     return r.stdout
 
 
@@ -341,6 +392,39 @@ def remote_files(serial, d):
 def remote_size(serial, f):
     n = adb(serial, 'shell', f'stat -c %s {sh_quote(f)} 2>/dev/null', check=False).strip()
     return int(n) if n.isdigit() else None
+
+
+# A phone that fills up in the middle of an install fails at whatever step comes next, often with nothing printed (droidplay-core issue #37: the folder script, after an install
+# that ran out of room). The large copies check the room first, and a failed install on a nearly full phone says how full it is
+ROOM_SPARE = 256 << 20   # left free besides a copy's own bytes: Android, the app's saves and its log need room too
+LOW_ROOM = 1 << 30       # a failed install on a phone with less than this free names the free space as the likely cause
+
+
+def size_text(n): return f'{n / 1e9:.1f} GB' if n >= 1e9 else f'{max(n, 0) / 1e6:.0f} MB'
+
+
+def remote_free(serial, d):   # bytes free on the phone's storage where folder d is, or None
+    row = adb(serial, 'shell', f'df -k {sh_quote(d)} 2>/dev/null | tail -n 1', check=False).split()
+    return int(row[3]) * 1024 if len(row) >= 4 and row[3].isdigit() else None
+
+
+def need_room(serial, d, need, what):
+    free = remote_free(serial, d)
+    if free is None or free >= need + ROOM_SPARE: return
+    raise BuildError(f'the phone has {size_text(free)} free: {what} needs {size_text(need)}, plus {size_text(ROOM_SPARE)} left free for Android and the app. '
+                     f'Free up {size_text(need + ROOM_SPARE - free)} on the phone, then install again')
+
+
+def says_when_phone_full(f):   # a failed step's error, plus the phone's free space when that is low (a full phone fails steps that print nothing)
+    @functools.wraps(f)
+    def run(serial, *a, **k):
+        try: return f(serial, *a, **k)
+        except BuildError as e:
+            free = remote_free(serial, REMOTE)
+            if free is None or free >= LOW_ROOM or 'free up' in str(e).lower(): raise
+            raise BuildError(f'{e}\nThe phone has only {size_text(free)} free, which is likely why: free up space on the phone '
+                             f'(a game\'s RomFS.img.partial is a copy cut short, kept so the next install goes on from it), then install again') from e
+    return run
 
 
 @contextlib.contextmanager
@@ -380,6 +464,7 @@ def push_tar(serial, local, parent, name, files, log, sync):
                 bi.PROG.set(done=i)
         remote = f'{parent}/.{name}.tar'
         try:
+            need_room(serial, dst, 2 * tar.stat().st_size, f'{name} ({len(send):,} files in one archive, unpacked beside itself)')
             with counting('sending', tar.stat().st_size, 'B', lambda: remote_size(serial, remote)):
                 adb(serial, 'push', tar, remote, log=log)
             have = len(rows) - len(send)   # the files kept from an earlier copy are counted by the phone too
@@ -422,6 +507,9 @@ def push_resumable(serial, local, remote, log):
         if theirs != [ours]: say(f'{remote}: the part on the phone ({have:,} bytes) differs from this file: sent again from the start'); have = 0
         else: say(f'{remote}: {have:,} of {size:,} bytes on the phone already: going on from there')
     if not have: adb(serial, 'shell', f': > {sh_quote(part)}')
+    if have < size:   # the part grows to the whole file, and each piece is on the phone twice for a moment (as itself, then appended)
+        folder, file = remote.rsplit('/', 1)
+        need_room(serial, folder, size - have + min(CHUNK, size - have), f'{file} ({size_text(size - have)} left to send)')
     piece, tmp = log.with_suffix('.piece'), remote + '.piece'
     with counting('sending', size, 'B', lambda: (lambda a, b: None if a is None else a + (b or 0))(remote_size(serial, part), remote_size(serial, tmp))):
         with open(local, 'rb') as f:
@@ -436,16 +524,25 @@ def push_resumable(serial, local, remote, log):
     adb(serial, 'shell', f'mv -f {sh_quote(part)} {sh_quote(remote)}')
 
 
+MKDIRS_DONE = 'nxnative_mkdirs_done'   # the last line push_dir's folder script prints
+
+
 def push_dir(serial, local, parent, name, log, sync=False):
     files = [f for f in local.rglob('*') if f.is_file()]
     if len(files) > TAR_FILES: return push_tar(serial, local, parent, name, files, log, sync)
     # <local folder> → <parent>/<name>: adb push copies a folder by its own name into the remote parent ("<folder>/." makes "/./" paths that adb cannot create
     # subfolders under on Windows); a folder named otherwise is pushed under its own name and renamed. adbd may not create folders under Android/data (its FUSE
     # mount refuses them: "secure_mkdirs() failed"), while the shell may: the whole tree is made first by a mkdir script run in the shell
+    need_room(serial, parent, sum(f.stat().st_size for f in files), name)
     dirs = [f'{parent}/{local.name}'] + [f'{parent}/{local.name}/{d.relative_to(local).as_posix()}' for d in sorted(local.rglob('*')) if d.is_dir()]
+    # set -e: the script's status was its last mkdir's, so one that failed in the middle went unnoticed until adb push stopped on the missing folder. The closing
+    # line is checked too: an adb without the shell protocol reports 0 whatever the command did, and an empty script succeeds
     script = log.with_suffix('.mkdirs.sh')
-    script.write_text(''.join(f'mkdir -p {sh_quote(d)}\n' for d in dirs), newline='\n')
-    adb(serial, 'push', script, '/data/local/tmp/nxnative_mkdirs.sh'); adb(serial, 'shell', 'sh', '/data/local/tmp/nxnative_mkdirs.sh')
+    script.write_text('set -e\n' + ''.join(f'mkdir -p {sh_quote(d)}\n' for d in dirs) + f'echo {MKDIRS_DONE}\n', newline='\n')
+    adb(serial, 'push', script, '/data/local/tmp/nxnative_mkdirs.sh')
+    out = adb(serial, 'shell', 'sh', '/data/local/tmp/nxnative_mkdirs.sh')
+    if MKDIRS_DONE not in out:
+        raise BuildError(f'the folders for {name} were not made on the phone: the folder script stopped early, ' + (f'printing {out.strip()[-300:]}' if out.strip() else 'printing nothing'))
     with counting('sending', len(files), 'files', lambda: remote_files(serial, dirs[0])):
         adb(serial, 'push', *(['--sync'] if sync else []), local, f'{parent}/', log=log)
     if local.name != name:
@@ -488,7 +585,7 @@ def install(serial, apk, logs):   # an update (-r): the app's data, saves includ
     try: adb(serial, 'install', '-r', apk, log=logs / 'adb_install.log')
     except BuildError as e:
         if 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' in str(e):
-            raise BuildError(f'the nxnative app on the phone was signed with another key than {KEYSTORE}. Uninstalling it deletes its saves and game files: '
+            raise BuildError(f'the DroidPlay app ({PKG}) on the phone was signed with another key than {KEYSTORE}. Uninstalling it deletes its saves and game files: '
                              f'back up {REMOTE} and the saves first (the launcher\'s Back up saves), then uninstall it by hand and run this again') from e
         raise
 
@@ -513,6 +610,7 @@ def migrate_legacy(serial, gid, nacp_local=None):
     return True
 
 
+@says_when_phone_full
 def push_game(serial, gid, game, patched, spv, font, aoc, defaults, work, logs, meta):
     """The game's files → files/games/<gid>/ (the RomFS with --sync: a repeat copies only what changed)"""
     dst = f'{REMOTE}/games/{gid}'
@@ -524,6 +622,9 @@ def push_game(serial, gid, game, patched, spv, font, aoc, defaults, work, logs, 
         bi.PROG.set(step=f'{step or name} · part {parts.index(name) + 1} of {len(parts)}'); bi.PROG.set(done=parts.index(name), total=len(parts), unit='parts')
     part('the one-game install', 'looking for the one-game install'); migrate_legacy(serial, gid, game / 'control.nacp')
     adb(serial, 'shell', 'rm', '-rf', f'{dst}/code', f'{dst}/font', f'{dst}/{patched.name}'); adb(serial, 'shell', 'mkdir', '-p', dst)
+    # an install cut short (the phone full, the cable out) can leave a folder's archive (push_tar) or a RomFS piece (push_resumable) behind: gigabytes that kept the
+    # phone full, and that no install reuses. RomFS.img.partial stays, as the next copy goes on from it
+    adb(serial, 'shell', f'rm -f {sh_quote(dst)}/.*.tar {sh_quote(dst + "/RomFS.img.piece")}', check=False)
     part('font'); push_dir(serial, font, dst, 'font', logs / 'adb_push_font.log')
     part('code'); push_dir(serial, patched, dst, 'code', logs / 'adb_push_code.log')
     if spv: part('shaders', 'shaders (only the changed files)'); push_dir(serial, spv, dst, 'spv', logs / 'adb_push_spv.log', sync=True)
@@ -562,7 +663,9 @@ def tool_version(cmd):
 
 def check(sdk_arg):
     rows = []
-    def row(name, ok, detail, fix=''): rows.append({'name': name, 'ok': bool(ok), 'detail': detail, 'fix': '' if ok else fix})
+    def row(name, ok, detail, fix=''):
+        if os.name == 'nt' and fix and not name.startswith('Python'): fix = "Install what's missing (the desktop app's Settings), or build_android_from_nsp.py --setup"
+        rows.append({'name': name, 'ok': bool(ok), 'detail': detail, 'fix': '' if ok else fix})
     for m, pip in (('lz4.block', 'lz4'), ('capstone', 'capstone'), ('fontTools', 'fonttools'), ('PySide6', 'PySide6')):
         row(f'Python module {pip}', bi._importable(m), sys.executable, f'{sys.executable} -m pip install {pip}')
     z = bi._importable('compression.zstd') or bi._importable('backports.zstd')
@@ -577,7 +680,7 @@ def check(sdk_arg):
     if sdk:
         for what, d in (('NDK', sdk / 'ndk'), ('CMake', sdk / 'cmake')):
             try: row(what, True, str(newest(d, what)))
-            except BuildError as e: row(what, False, str(e), f'sdkmanager "{"ndk;28.2.13676358" if what == "NDK" else "cmake;3.22.1"}"')
+            except BuildError as e: row(what, False, str(e), f'sdkmanager "{f"ndk;{NDK}" if what == "NDK" else f"cmake;{CMAKE}"}"')
         row(f'build-tools {BUILD_TOOLS}', (sdk / 'build-tools' / BUILD_TOOLS).is_dir(), str(sdk / 'build-tools' / BUILD_TOOLS), f'sdkmanager "build-tools;{BUILD_TOOLS}"')
         row(f'platform {PLATFORM}', (sdk / 'platforms' / PLATFORM / 'android.jar').is_file(), str(sdk / 'platforms' / PLATFORM), f'sdkmanager "platforms;{PLATFORM}"')
     a = tool_version(['adb', 'version'])
@@ -587,6 +690,19 @@ def check(sdk_arg):
     row('signing key', True, f'{KEYSTORE}' + ('' if KEYSTORE.is_file() else ' (made at the first build)'))
     hosts = library(); row('game hosts', True, f'{len(hosts)} in {data_dir() / "hosts"}' + (': ' + ', '.join(hosts) if hosts else ''))
     return rows
+
+
+def setup(sdk_arg, accept):   # --setup: what check() finds missing, installed (host_setup.py), then checked again; the Python modules stay pip's (or uv run's)
+    missing = {r['name'] for r in check(sdk_arg) if not r['ok']}
+    try: sdk = sdk_dir(sdk_arg)
+    except BuildError: sdk = Path(sdk_arg or os.path.join(os.environ.get('LOCALAPPDATA') or Path.home(), 'Android', 'Sdk')).expanduser()   # Android Studio's place
+    try: done = host_setup.setup(missing, sdk, data_dir() / 'tools', sdk_packages(sdk), accept, bi.PROG, say)
+    except host_setup.SetupError as e: raise BuildError(str(e)) from e
+    host_setup.add_tool_paths(data_dir() / 'tools', sdk)
+    still = [r for r in check(sdk_arg) if not r['ok']]
+    if done: say(f'installed: {", ".join(done)}')
+    if [r for r in still if not r['name'].startswith('Python')]: raise BuildError('still missing: ' + ', '.join(r['name'] for r in still))
+    for r in still: say(f'{r["name"]} is missing: {r["fix"]}')
 
 
 def games_table():   # {title ID: {engine, graphics, build, sdk}} from dm/games/README.md's Games table
@@ -680,6 +796,8 @@ def main(argv):
     ap.add_argument('--game-apk', action='store_true', help='the game in an app of its own, to install on any device (no phone needed; the nxnative app is left as it is)')
     ap.add_argument('--xapk', action='store_true', help='with --game-apk: one .xapk (the APK with the RomFS as its OBB file) for an XAPK installer')
     ap.add_argument('--out', help='with --game-apk: the folder for the app (default: the NSP folder)')
+    ap.add_argument('--setup', action='store_true', help='install what --check finds missing (Windows: the JDK, the .NET SDK and the Android SDK)')
+    ap.add_argument('--accept-android-licenses', action='store_true', help="with --setup: you accept the Android SDK License (https://developer.android.com/studio/terms)")
     a = ap.parse_args(argv)
     if a.xapk: a.game_apk = True
     if a.game_apk:
@@ -691,6 +809,7 @@ def main(argv):
         if a.info and not a.nsp_dir: raise BuildError('--info needs the NSP folder')
         with contextlib.redirect_stdout(sys.stderr): out = check(a.sdk) if a.check else info(Path(a.nsp_dir).expanduser().resolve(), Path(a.keys).expanduser().resolve() if a.keys else None)
         print(json.dumps(out, indent=1)); return
+    if a.setup: setup(a.sdk, a.accept_android_licenses); return
     if a.apk_only or a.migrate:
         logs = data_dir() / 'logs'; logs.mkdir(parents=True, exist_ok=True)
         serial = a.serial or os.environ.get('ANDROID_SERIAL') or pick_device()
@@ -723,9 +842,7 @@ def main(argv):
         if (pdir / f'{app:016X}' / 'game.tsv').exists(): say(f'no game profile for {app:016X}: reusing the provisional profile from the last run (delete it to survey again)')
         else:   # the first experimental build only packs; once its provisional profile exists, it is built and installed like a profiled game's (to try it on a phone)
             if not a.no_push: raise BuildError(f'no game profile for {app:016X}: a game without one is first packed with --no-push (a survey, a provisional profile and an APK that may not boot)')
-            ipa_nx, bi.build_nx_extract = bi.build_nx_extract, lambda repo, work, logs, env: build_nx_extract(work, logs, env)   # this script's, with Windows' .exe
-            try: facts = bi.survey(nsp_dir, app, fam, keys, REPO, sys.executable, env)
-            finally: bi.build_nx_extract = ipa_nx
+            facts = bi.survey(nsp_dir, app, fam, keys, REPO, sys.executable, env)
             facts['survey'] = str(nsp_dir / f'{app:016X}_survey' / 'survey.md')
             bi.write_profile(pdir / f'{app:016X}', app, facts)
         g = provisional_profile(gamemod, nsp_dir, app); env['DM_GAMES_DIR'] = os.environ['DM_GAMES_DIR']
