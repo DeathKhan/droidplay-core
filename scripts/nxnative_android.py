@@ -339,7 +339,8 @@ class LibraryPage(QWidget):
         self.reload()
 
     def folders(self): return [f for f in (self.win.st.value('folders', []) or []) if f]
-    def reload(self):
+    def reload(self):   # one read of the games at a time (each runs --info per folder): one asked for while it runs, as a build's stage ends do, runs once after it
+        if getattr(self, 'reading', False): self.again = True; return
         fs = list(self.folders()); seen = {str(Path(f).resolve()) for f in fs}   # resolved: a folder behind a link (Downloads moved to another drive) is the same folder
         names = {}   # a game packed on this computer keeps its name while its folder cannot be read (no keys yet), rather than the folder's (DroidPlay's are all "android")
         for gid, (_, meta) in ba.library().items():   # packed on this computer from a folder not in the list
@@ -358,6 +359,7 @@ class LibraryPage(QWidget):
                     out[f] = {'error': msg, 'needs_keys': not keys and 'prod.keys' in msg, 'name': names.get(str(Path(f).resolve())) or Path(f).name}
             return out
         def got(r):
+            self.reading = False
             if isinstance(r, Exception): self.win.toast(f'Reading the games failed: {r}'); r = {}
             self.games, ids = {}, set()
             for f, i in r.items():   # one card per game, from the first folder that holds it
@@ -365,7 +367,8 @@ class LibraryPage(QWidget):
                 if g.id and g.id in ids: continue
                 ids.add(g.id); self.games[f] = g
             self.render()
-        bg(read, got)
+            if getattr(self, 'again', False): self.again = False; self.reload()
+        self.reading = True; bg(read, got)
     def render(self):
         while self.rl.count() > 1:
             w = self.rl.takeAt(0).widget()
