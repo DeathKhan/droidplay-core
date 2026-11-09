@@ -800,7 +800,7 @@ def info(src, keys=None):
 
 # ---------------- main ----------------
 def main(argv):
-    ap = argparse.ArgumentParser(description='Pack a Switch game you own for Android (the nxnative app + the game files on the phone)')
+    ap = argparse.ArgumentParser(description='Pack a Switch game you own for Android (the DroidPlay app + the game files on the phone)')
     ap.add_argument('nsp_dir', nargs='?'); ap.add_argument('-k', '--keys', help='your prod.keys')
     ap.add_argument('-p', '--package', help='the version to pack (v0 = the base game; default: the newest in the folder)')
     ap.add_argument('-l', '--language', default='en-US', help='the game language (a code or a name; English by default)')
@@ -815,7 +815,7 @@ def main(argv):
     ap.add_argument('--info', action='store_true', help="print the NSP folder's game details as JSON and stop")
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'json', 'off'), default='auto', help='stage lines on the console; json = newline-delimited JSON events')
     ap.add_argument('--allow-damaged', action='store_true', help='pack files that fail the NCA hash check as read')
-    ap.add_argument('--game-apk', action='store_true', help='the game in an app of its own, to install on any device (no phone needed; the nxnative app is left as it is)')
+    ap.add_argument('--game-apk', action='store_true', help='the game in an app of its own, to install on any device (no phone needed; the DroidPlay app is left as it is)')
     ap.add_argument('--xapk', action='store_true', help='with --game-apk: one .xapk (the APK with the RomFS as its OBB file) for an XAPK installer')
     ap.add_argument('--out', help='with --game-apk: the folder for the app (default: the NSP folder)')
     ap.add_argument('--setup', action='store_true', help='install what --check finds missing (Windows: the JDK, the .NET SDK and the Android SDK)')
@@ -971,14 +971,14 @@ def main(argv):
         say(f'done: {apk}. On the phone: install it, then copy {patched} to {REMOTE}/games/{g.id}/code and {bi.rfs.source(game)} to {REMOTE}/games/{g.id}/'); return
     bi.PROG.stage('install and copy to the phone')
     serial = serial or pick_device()
-    bi.PROG.set(step='installing the app (an update: its data stays)'); install(serial, apk, logs)
+    bi.PROG.set(step='installing the app (an update keeps its data)'); install(serial, apk, logs)   # words that hold for a first install too, with no adb call to tell them apart
     adb(serial, 'shell', 'am', 'force-stop', PKG)
     rom = bi.rfs.source(game)
     push_game(serial, g.id, game, patched, spv, font, work / 'aoc', defaults, work, logs,
               {'title_id': g.id, 'name': label, 'version': pkg_ver, 'display': nacp.version(game / 'control.nacp'),
                'romfs_bytes': Path(rom).stat().st_size if bi.rfs.is_image(rom) else None})
     bi.PROG.end(f'{REMOTE}/games/{g.id}')
-    say(f'done: open nxnative on the phone and pick "{label}". Log: {REMOTE}/log.txt (adb logcat -s nxnative)')
+    say(f'done: open DroidPlay on the phone and pick "{label}". Log: {REMOTE}/log.txt (adb logcat -s nxnative)')
 
 
 if __name__ == '__main__':
