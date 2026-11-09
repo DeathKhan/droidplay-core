@@ -39,6 +39,7 @@ import build_android_from_nsp as ba   # noqa: E402  (data_dir, library: the host
 sys.path.insert(0, str(REPO / 'dm' / 'android' / 'desktop'))
 import first_run as fr   # noqa: E402  # pyright: ignore[reportMissingImports]  (dm/android/desktop, put on the path here: the Get started checklist's steps, Qt-free so its tests run without PySide6)
 import explain as ex   # noqa: E402  # pyright: ignore[reportMissingImports]  (plain words for what went wrong, and the report for #help)
+import phone_guide as pg   # noqa: E402  # pyright: ignore[reportMissingImports]  (how to connect a phone, by brand; its battery and free space)
 
 LANGUAGES = [('en-US', 'American English'), ('en-GB', 'British English'), ('ja', 'Japanese'), ('fr', 'French'), ('de', 'German'), ('es-419', 'Latin American Spanish'),
              ('es', 'Spanish'), ('it', 'Italian'), ('nl', 'Dutch'), ('fr-CA', 'Canadian French'), ('pt', 'Portuguese'), ('ru', 'Russian'), ('ko', 'Korean'),
@@ -830,7 +831,47 @@ class KeepColour(QStyledItemDelegate):   # a selected row keeps its coloured tex
 
 STATES = {'device': 'connected', 'unauthorized': 'allow USB debugging on the phone', 'authorizing': 'allow USB debugging on the phone', 'offline': 'offline'}   # adb's words
 NO_ADB = "adb isn't installed, so DroidPlay can't see your phones. It comes with the tools: Get started, step 2."
-NO_PHONE = 'No phone connected. Plug one in with USB debugging on (Developer options) and allow this computer when the phone asks, or pair one over Wi-Fi.'
+NO_PHONE = (f'No phone connected. Plug one in with USB debugging on and allow this computer when the phone asks, or pair one over Wi-Fi. '
+            f'<a style="color:{READY}" href="guide">How to connect a phone</a>')
+
+
+class PhoneGuide(QDialog):   # how to connect a phone, by brand (dm/android/desktop/phone_guide.py), with what DroidPlay sees now at its foot, live
+    def __init__(self, win):
+        super().__init__(win); self.win = win; self.setWindowTitle('Set up your phone'); self.setStyleSheet(STYLE + f'QDialog {{ background: {PANEL}; }}')
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); outer.addWidget(scroll, 1)
+        body = QWidget(); body.setStyleSheet('background: transparent'); scroll.setWidget(body)
+        lay = QVBoxLayout(body); lay.setContentsMargins(28, 24, 28, 8); lay.setSpacing(12)
+        lay.addWidget(label('Set up your phone', 'h2')); lay.addWidget(label(pg.INTRO, 'meta', wrap=True))
+        row = QHBoxLayout(); row.addWidget(label('Your phone is a', 'meta')); self.brand = QComboBox()
+        for k, name, *_ in pg.BRANDS: self.brand.addItem(name, k)
+        row.addWidget(self.brand, 1); lay.addLayout(row)
+        self.steps = label('', wrap=True); self.steps.setTextFormat(Qt.RichText); self.steps.setStyleSheet('font-size: 14px'); lay.addWidget(self.steps)
+        self.note = label('', 'muted', wrap=True); self.note.setTextFormat(Qt.RichText); self.note.setOpenExternalLinks(True); lay.addWidget(self.note)
+        self.more = QToolButton(); self.more.setObjectName('manage'); self.more.setText(" If it doesn't work"); self.more.setCheckable(True); self.more.setCursor(Qt.PointingHandCursor)
+        self.more.setIcon(icon('right', TEXT, 16)); self.more.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); lay.addWidget(self.more)
+        link = lambda h: h.replace('<a ', f'<a style="color:{READY}" ')   # noqa: E731  (the app's green, not the palette's blue on the dark panel)
+        self.trouble = label(link(''.join(f'<p><b>{t}{"" if t[-1] in "?!." else "."}</b> {x}</p>' for t, x in pg.TROUBLE)), 'meta', wrap=True); self.trouble.setTextFormat(Qt.RichText)
+        self.trouble.setOpenExternalLinks(True); self.trouble.hide(); lay.addWidget(self.trouble); lay.addStretch()
+        self.more.toggled.connect(lambda on: (self.trouble.setVisible(on), self.more.setIcon(icon('down' if on else 'right', TEXT, 16))))
+        foot = QWidget(); fl = QHBoxLayout(foot); fl.setContentsMargins(28, 12, 28, 22); fl.setSpacing(16)
+        self.seen = label('', 'meta', wrap=True); self.seen.setTextFormat(Qt.RichText); fl.addWidget(self.seen, 1)
+        done = QPushButton('Done'); done.setMinimumWidth(110); done.clicked.connect(self.accept); fl.addWidget(done); outer.addWidget(foot)
+        sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet(f'background: {LINE}'); outer.insertWidget(1, sep)
+        self.brand.setCurrentIndex(max(0, self.brand.findData(win.phone_brand()))); self.brand.currentIndexChanged.connect(self.show_brand); self.show_brand()
+        self.t = QTimer(self); self.t.timeout.connect(self.watch); self.t.start(1000); self.watch()
+        self.ensurePolished(); need = lay.totalHeightForWidth(640) + foot.sizeHint().height() + 40   # as tall as its steps, within the screen (the game-app dialog's rule)
+        self.resize(640, min(max(need, 680), int(win.screen().availableGeometry().height() * 0.85)))   # rich text's height for width comes out short: room for If it doesn't work
+    def show_brand(self):
+        k = self.brand.currentData(); _, _, steps, note = next(b for b in pg.BRANDS if b[0] == k)
+        self.steps.setText('<ol style="margin: 0">' + ''.join(f'<li style="margin-bottom: 10px">{x}</li>' for x in steps) + '</ol>')
+        self.note.setText(note.replace('<a ', f'<a style="color:{READY}" ')); self.note.setVisible(bool(note)); self.win.st.setValue('phone_brand', k)
+    def watch(self):   # the checklist's phone step, as DroidPlay sees it now (it looks every few seconds)
+        s = fr.phone_step(self.win.devs, self.win.adb, self.win.serial())
+        c = READY if s.done else BUILD if s.state in (fr.WAITING, fr.WORKING) else ERR if s.state == fr.PROBLEM else TEXT2
+        text = (f'✓ DroidPlay sees {s.text}' if s.done else s.text if s.state != fr.TODO else "DroidPlay doesn't see a phone yet: it looks every few seconds." if self.win.adb
+                else 'DroidPlay finds phones with adb, which comes with the tools: install them first (Get started, step 2).')
+        self.seen.setText(f'<span style="color:{c}">{text}</span>')
 
 
 class PhonesPage(QWidget):
@@ -840,13 +881,18 @@ class PhonesPage(QWidget):
         lay.addWidget(label('Phones', 'h1'))
         lay.addWidget(label('Over Wi-Fi: on the phone, Developer options → Wireless debugging. "Pair device with pairing code" gives an address and a code for Pair; '
                             'the address on the Wireless debugging screen itself is the one to Connect to (its port changes when wireless debugging restarts).', 'muted', wrap=True))
-        self.table = QTableWidget(0, 5); self.table.setHorizontalHeaderLabels(['Device', 'Model', 'Android', 'Connection', 'State'])
-        hh = self.table.horizontalHeader(); hh.setSectionResizeMode(QHeaderView.Stretch); hh.setSectionResizeMode(2, QHeaderView.ResizeToContents); hh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.table = QTableWidget(0, 7); self.table.setHorizontalHeaderLabels(['Device', 'Model', 'Android', 'Battery', 'Free', 'Connection', 'State'])
+        hh = self.table.horizontalHeader(); hh.setSectionResizeMode(QHeaderView.Stretch); hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        for i in (3, 4): hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        hh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.verticalHeader().hide(); self.table.setShowGrid(False); self.table.setItemDelegate(KeepColour(self.table))
         self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.itemSelectionChanged.connect(self.selected)
         self.table.setMaximumHeight(200); lay.addWidget(self.table)
         self.note = label('', 'meta', wrap=True); self.note.hide(); lay.addWidget(self.note)   # why the list is empty: no adb, or no phone
+        self.note.setTextFormat(Qt.RichText); self.note.linkActivated.connect(lambda _: win.phone_guide())
+        self.warn = label('', wrap=True); self.warn.setStyleSheet(f'color: {BUILD}; font-size: 13px'); self.warn.hide(); lay.addWidget(self.warn)   # the picked phone's low battery
         row = QHBoxLayout(); self.adb_buttons = []
+        b = QPushButton('How to connect a phone…'); b.clicked.connect(win.phone_guide); row.addWidget(b)
         for text, fn in (('Pair over Wi-Fi…', self.pair), ('Connect…', self.connect), ('Discover', self.discover), ('Disconnect', self.disconnect)):
             b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b); self.adb_buttons.append(b)
         row.addStretch(); lay.addLayout(row)
@@ -861,11 +907,16 @@ class PhonesPage(QWidget):
         self.table.setRowCount(len(devs))
         for i, d in enumerate(devs):
             how = 'Wi-Fi' if ':' in d['serial'] or '._adb-tls' in d['serial'] else 'USB'
-            for j, v in enumerate((d.get('name') or d['serial'], d.get('model', ''), d.get('android', ''), f'{how} · {d["serial"]}', STATES.get(d['state'], d['state']))):
+            bat = f'{d["battery"]}%' + (' charging' if d.get('charging') and d['battery'] < 100 else '') if d.get('battery') is not None else ''
+            free = pg.size_text(d['free']) if d.get('free') is not None else ''
+            for j, v in enumerate((d.get('name') or d['serial'], d.get('model', ''), d.get('android', ''), bat, free, f'{how} · {d["serial"]}', STATES.get(d['state'], d['state']))):
                 it = QTableWidgetItem(v); it.setData(Qt.UserRole, d['serial'])
-                if j == 4: it.setForeground(QColor(READY if d['state'] == 'device' else ERR))
+                if j == 6: it.setForeground(QColor(READY if d['state'] == 'device' else ERR))
+                if j == 3 and pg.battery_warning(d): it.setForeground(QColor(BUILD))
                 self.table.setItem(i, j, it)
         self.note.setText('' if devs else NO_PHONE if adb else NO_ADB); self.note.setVisible(not devs)
+        low = next((pg.battery_warning(d) for d in devs if d['serial'] == self.win.serial()), '')
+        self.warn.setText(f'⚠ {low}'); self.warn.setVisible(bool(low))
         for b in self.adb_buttons: b.setEnabled(adb)
     def selected(self):
         r = self.table.currentRow()
@@ -1213,7 +1264,7 @@ class SetupPage(QWidget):   # Get started: keys, tools, phone, first game. Not i
             if s.button == 'Look again': w.settings.run()
             elif s.button == 'Open Settings': w.go('settings')
             else: w.settings.install(show_builds=False)
-        elif key == 'phone': w.go('phones')
+        elif key == 'phone': w.phone_guide()
         elif key == 'game':
             g = w.library.games.get(s.ref)
             if not g: w.add_game(); return
@@ -1342,12 +1393,17 @@ class Window(QMainWindow):
         self.navgroup.setExclusive(True)
         if hasattr(self, 'pill'): self.show_pill()
     def act(self, action, folder=''):   # the button of what went wrong (explain.py's Help)
-        if action == 'phone': self.go('setup')
+        if action == 'phone': self.phone_guide()
         elif action == 'retry': self.builds.retry()
         elif action == 'keys': self.settings.pick_keys()
         elif action == 'tools': self.settings.install(show_builds=False); self.go('setup')
         elif action == 'folder' and folder: reveal(folder)
         elif action == 'backup': self.phones.backup()
+    def phone_guide(self): PhoneGuide(self).exec()
+    def phone_brand(self):   # the guide's brand: of the phone adb sees (its maker once it has allowed this PC, its model code before), else the one picked last time
+        d = next((d for d in self.devs or [] if d['state'] == 'device'), None) or next(iter(self.devs or []), None)
+        b = pg.brand_for(d.get('manufacturer', ''), d.get('model', '')) if d else 'other'
+        return b if b != 'other' else self.st.value('phone_brand', 'other') or 'other'
     def no_phone(self):   # why there is no phone to install to, from what adb lists: one waiting for Allow or not answering says so
         d = next((d for d in self.devs or [] if d['state'] != 'device'), None)
         h = ex.explain(f'0 adb devices ready (x ({d["state"]}))' if d else '0 adb devices ready (none)', phone=d.get('model', '') if d else '')
@@ -1427,11 +1483,14 @@ class Window(QMainWindow):
                 d = {'serial': c[0], 'state': c[1], 'model': next((x[6:] for x in c if x.startswith('model:')), '').replace('_', ' ')}
                 if d['state'] == 'device':   # in one call: Android's version, the model's market name where the maker sets one (devices -l has its code: OPD2415 for a OnePlus Pad 3), the phone's own name
                     # and the model as the phone spells it: devices -l turns what isn't a letter or a digit into _, so a Galaxy's SM-S937U1 came out as SM S937U1
+                    # its maker (the phone guide's brand), and its battery and free space (a PC's USB port charges slowly; an install needs room)
                     got_p, p = adb_run(d['serial'], 'shell', 'getprop ro.build.version.release; getprop ro.product.marketname; getprop ro.vendor.oplus.market.name; '
-                                       'getprop ro.product.model; settings get global device_name', timeout=8)
-                    v = [x.strip() for x in p.splitlines()] + [''] * 5 if got_p else [''] * 5
+                                       'getprop ro.product.model; settings get global device_name; getprop ro.product.manufacturer; '
+                                       'dumpsys battery | grep -E "powered:|level:|status:"; df -k /sdcard | tail -n 1', timeout=8)
+                    v = [x.strip() for x in p.splitlines()] + [''] * 6 if got_p else [''] * 6
                     d['android'], d['model'] = v[0], v[1] or v[2] or v[3] or d['model']
                     d['name'] = v[4] if v[4] not in ('', 'null') else d['model']
+                    d['manufacturer'] = v[5]; d.update(pg.parse_status(p) if got_p else {})
                 devs.append(d)
             return devs if ok else out
         def got(r):
@@ -1442,7 +1501,11 @@ class Window(QMainWindow):
                 r = []
             r = r or []
             if r == self.devs and adb == self.adb: return
-            self.devs, self.adb = r, adb; keep = self.serial() or self.st.value('serial', '')
+            ident = lambda ds: [(d['serial'], d['state'], d.get('model'), d.get('name'), d.get('android')) for d in ds]   # noqa: E731
+            same = self.devs is not None and adb == self.adb and ident(r) == ident(self.devs)
+            self.devs, self.adb = r, adb
+            if same: self.phones.fill(r, adb); self.setup_changed(); return   # only a battery level or the free space moved: the picker and the phone's games stay
+            keep = self.serial() or self.st.value('serial', '')
             self.models = {d['serial']: d.get('name') or d.get('model') or d['serial'] for d in r}
             self.phone.blockSignals(True); self.phone.clear()
             for d in r:
