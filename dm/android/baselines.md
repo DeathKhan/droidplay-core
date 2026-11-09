@@ -63,10 +63,13 @@ Numbered in the order they were found, so links to a number stay right:
 4. **Smash and Super Mario Odyssey crash now and then at boot.** Smash at `main+0x385201c` (`addr=0x50`), even with the font, on all three devices (about one
    launch in six). Odyssey only on the Odin 2, three times in about 20 launches, all in its first seconds of loading: twice in its loader thread as the mode-select
    layout loads (`main+0x95d414` with `addr=0`, once `svcBreak`), once at `main+0x954fb8`; never in 18 launches on the other two.
-5. **The pipeline cache is saved only when the app pauses** (`vkb_pipeline_cache_save` on `APP_CMD_PAUSE`). An app stopped by force (the benchmark, or a player
-   swiping it away) loses it, so every run builds its pipelines from scratch. The Pad 3's driver builds them about six times slower than the Odin 2's: a Smash
-   battle made 682 to 943 pipelines in 11 to 12 s on it (1,147 in 3.1 s on the Odin 2, 368 in 12.5 s on the Retroid Pocket 5), which is where its battle
-   frames of 100 to 370 ms come from.
+5. **Fixed: the pipeline cache was saved only when the app paused** (`vkb_pipeline_cache_save` on `APP_CMD_PAUSE`). The list of pipelines to make again at start
+   (`pipeline.cache.keys4`) is written as each one is made, but the driver's compiled binaries are in the cache, so after a stop by force (the benchmark, or a player
+   swiping the app away) the next start made the whole list again without them, in the background while the game played. The Pad 3's driver builds them about six
+   times slower than the Odin 2's: a Smash battle made 682 to 943 pipelines in 11 to 12 s on it (1,147 in 3.1 s on the Odin 2, 368 in 12.5 s on the Retroid Pocket
+   5), which is where its battle frames of 100 to 370 ms came from. The cache is now also written during play, after every 64 new pipelines and at most every
+   15 s, on a thread of its own: [The pipeline cache written during play](../../docs/reference/rendering.md#the-pipeline-cache-written-during-play). Two Smash
+   battles on the Pad 3 afterwards: 32.3 and 34.0 fps, frame p95 37.7 and 38.6 ms (16.8 to 29.7 fps and 73 to 81 ms before; the stage differs from run to run).
 6. **The Retroid Pocket 5 cannot hold 60 fps in Odyssey's opening cutscene** (38 fps, GPU 12.9 ms a frame).
 7. **The Pad 3's H.264 decoder takes no input** in `dm/android/tests/t_media` (`[RED] movie: the AVC decoder took no input for 2 s`), before and
    after the fix in problem 1. Not yet tried in a game: an H.264 movie there may show black.
@@ -104,8 +107,8 @@ Numbered in the order they were found, so links to a number stay right:
 
 ## Reading the numbers
 
-- **Cold pipelines.** Because of problem 5, every run here built its pipelines from scratch. A run whose cache survives should stutter less, most of all on the
-  Pad 3.
+- **Cold pipelines.** Because of problem 5 (since fixed), every run here began without the driver binaries of the pipelines earlier runs made, most of all on
+  the Pad 3.
 - **GPU time is at the clock the driver chose.** The Pad 3 shows longer GPU times than the Odin 2 in light scenes although its GPU is faster: it keeps its
   clocks low when the work is light. Compare the GPU column within one device, not across devices.
 - **The Retroid Pocket 5 can't run a route whose game saves early.** The benchmark keeps each run's save in the app's external files, and on the Retroid

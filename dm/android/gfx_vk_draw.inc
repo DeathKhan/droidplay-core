@@ -56,7 +56,7 @@ static int js_int(const jv *o, const char *k, int def) { const jv *v = js_get(o,
 
 // ---------------- The pipeline cache ----------------
 // The driver's compiled pipelines kept across runs: loaded from DM_PIPELINE_CACHE (front_android.c: the app's internal files) when the first pipeline is made,
-// written back by vkb_pipeline_cache_save (the app paused or stopped) when it grew
+// written back by vkb_pipeline_cache_save when it grew: the app paused or stopped, the start-up list done, and during play (pcache_made)
 static VkPipelineCache g_pc; static int g_pc_tried; static size_t g_pc_saved;
 static VkPipelineCache pcache(void) {
     if (g_pc_tried) return g_pc;
@@ -84,6 +84,23 @@ void vkb_pipeline_cache_save(void) {
     }
     free(data);
     pthread_mutex_unlock(&g_pc_mu);
+}
+// It is also written during play, after every PC_EVERY pipelines the game makes and at most every PC_GAP_NS, on a thread of its own (copying it out takes a while). Written only
+// when the app paused, a session stopped by force (swiped away, updated, the benchmark's stop) lost what it compiled, and the next start made its whole list again without the
+// driver's binaries: a Super Smash Bros. Ultimate battle's 700 to 1,100 pipelines, about 13 ms each on a OnePlus Pad 3, competing with play
+enum { PC_EVERY = 64 };
+#define PC_GAP_NS (15ull * 1000000000ull)
+static atomic_int g_pc_new, g_pc_busy; static uint64_t g_pc_last;
+static void *pcache_save_thread(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk-pcache"); setpriority(PRIO_PROCESS, (id_t)gettid(), 10);
+    vkb_pipeline_cache_save(); atomic_store(&g_pc_busy, 0); return NULL;
+}
+static void pcache_made(void) {   // pipe_get made a pipeline (under g_bk)
+    if (atomic_fetch_add(&g_pc_new, 1) + 1 < PC_EVERY) return;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC); if (g_pc_last && now - g_pc_last < PC_GAP_NS) return;
+    int idle = 0; if (!atomic_compare_exchange_strong(&g_pc_busy, &idle, 1)) return;
+    g_pc_last = now; atomic_store(&g_pc_new, 0);
+    pthread_t th; if (pthread_create(&th, NULL, pcache_save_thread, NULL)) atomic_store(&g_pc_busy, 0); else pthread_detach(th);
 }
 
 // ---------------- Shaders ----------------
@@ -1390,7 +1407,7 @@ static pipe_t *pipe_get(const pipe_key *k) {
     pipe_t *pp = nvn_hm_get(&g_pipes, k); if (pp) return pp->p ? pp : NULL;
     pp = calloc(1, sizeof *pp); nvn_hm_put(&g_pipes, k, pp);
     uint32_t ns, nva; VkPrimitiveTopology tp; VkResult pr = pipe_make(k, pp, &ns, &nva, &tp);
-    if (pr == VK_SUCCESS) pk_record(k);
+    if (pr == VK_SUCCESS) { pk_record(k); pcache_made(); }
     {   // which fields set a new pipeline apart from the last one with the same shaders and pass (the first 40): key churn
         static struct { vshader *a, *b; VkRenderPass rp; pipe_key k; } last[64]; static int nlog;
         unsigned h = (unsigned)(((uintptr_t)k->sh[0] >> 4) ^ ((uintptr_t)k->sh[1] >> 6) ^ ((uintptr_t)k->rp >> 3)) % 64;

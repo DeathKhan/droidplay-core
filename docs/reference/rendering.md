@@ -1661,6 +1661,19 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Check:** Skyward Sword HD in Skyloft: 30 fps before, 59.7 on a OnePlus Pad 3 and 59.3 on an Ayn Odin 2 after, the picture unchanged. Each switch alone on the Pad 3:
   `DM_VK_WB_ABSORB` 59.7 fps, `DM_VK_LINWB_SNAP` 56.3, `DM_VK_UP_RANGE` 30.
 - **Found on:** [The Legend of Zelda: Skyward Sword HD](../../dm/games/01002DA013484000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 11).
+### The pipeline cache written during play
+
+- **Symptom:** Android only: a game that stutters while it builds pipelines does it again at every start after the app was stopped by force (swiped away, updated, the
+  benchmark's stop), though `pipelines made again from the list` at start shows the list was kept.
+- **Cause:** the list of pipelines to make again at start (`<DM_PIPELINE_CACHE>.keys4`) is appended as each one is made, but the driver's compiled binaries live in the
+  `VkPipelineCache`, which was written only when the app paused and after the start-up list finished. A stop by force lost what the session compiled, and the next start
+  made the list again without the binaries: about 13 ms a pipeline on a OnePlus Pad 3, while the game played.
+- **Fix:** `pcache_made` (`gfx_vk_draw.inc`) counts the pipelines `pipe_get` makes and, after every 64 and at most every 15 s, writes the cache on a low-priority thread
+  of its own (copying out tens of megabytes held the game's draws up when done on its thread). The write goes to a `.new` file renamed over the cache, so a stop during
+  it leaves the last one whole.
+- **Check:** Super Smash Bros. Ultimate's battle on a OnePlus Pad 3: the cache written twice in the first run's battle (10.6 and 11.6 MB), the second run starting from
+  the 11.6 MB one; the battles at 32.3 and 34.0 fps with frame p95 37.7 and 38.6 ms, against 16.8 to 29.7 fps and 73 to 81 ms in the baselines.
+- **Found on:** [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 5).
 
 ### Pipeline keys built from the state objects' fields
 
