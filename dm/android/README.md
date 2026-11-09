@@ -193,3 +193,7 @@ python3 scripts/bench_android.py <NSP folder> [<NSP folder> ...] [-s <serial> ..
 The front end logs the Vulkan device's capabilities at start. The Adreno 619's driver (Vulkan 1.1.128) has no BC texture compression (every packaged
 Switch texture is BC: they need decoding), no descriptor indexing (NVN's texture and sampler pools are bindless), no transform feedback, no custom
 border colors and no extended dynamic state; it has geometry and tessellation shaders, buffer device addresses and push descriptors.
+
+The replay has shaders of its own too, for what Vulkan has no command for: `dm/android/shaders/` (a depth-stencil copy that scales or changes format, drawn by
+`gfx_vk_dscopy.inc`), compiled at build time by the NDK's `glslc` (`shader-tools/`). The copy writes the stencil from its shader where the device has
+`VK_EXT_shader_stencil_export` (the Adreno 740 and 830), and a bit at a time where it has not (the Adreno 650).

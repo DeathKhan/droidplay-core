@@ -41,6 +41,22 @@ foreach(s ${DM}/host/entry.S ${DM}/gfx/nvn/nvn_entry.S ${DM}/gfx/nvn/nvn_thunks.
   list(APPEND ASM_ELF ${GEN}/asm/${n})
 endforeach()
 
+# The Vulkan replay's own shaders (shaders/*.vert, *.frag: gfx_vk_dscopy.inc's depth-stencil copies), compiled by the NDK's glslc into the SPIR-V words gfx_vk.c
+# includes (-mfmt=c writes a C initializer)
+file(GLOB GLSLC ${ANDROID_NDK}/shader-tools/*/glslc ${ANDROID_NDK}/shader-tools/*/glslc.exe)
+if(NOT GLSLC)
+  message(FATAL_ERROR "no glslc in ${ANDROID_NDK}/shader-tools: the NDK's shader tools build the Vulkan replay's shaders")
+endif()
+list(GET GLSLC 0 GLSLC)
+file(MAKE_DIRECTORY ${GEN}/shaders)
+set(SHADER_INC)
+foreach(s ds_copy.vert ds_copy_export.frag ds_copy_bits.frag)
+  add_custom_command(OUTPUT ${GEN}/shaders/${s}.inc
+    COMMAND ${GLSLC} --target-env=vulkan1.1 -O -mfmt=c ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${s} -o ${GEN}/shaders/${s}.inc
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${s})
+  list(APPEND SHADER_INC ${GEN}/shaders/${s}.inc)
+endforeach()
+
 # Host sources: every dm/host/*.c, as the Mac Makefile's wildcard, less the ones Android replaces
 file(GLOB HOST_C ${DM}/host/*.c)
 list(REMOVE_ITEM HOST_C ${DM}/host/hle_movie_avc.c)   # VideoToolbox: media_android.c (MediaCodec)
@@ -68,13 +84,13 @@ target_include_directories(vpx PRIVATE ${DM}/third_party/libvpx ${DM}/third_part
 target_compile_options(vpx PRIVATE -O2 -w -fvisibility=hidden)
 
 # The replay records every draw on the game's render thread (descriptor writes, pipeline and view lookups, vertex and uniform copies): -O2 there, after the target's -O1
-set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/gfx_vk.c PROPERTIES COMPILE_OPTIONS "-O2")
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/gfx_vk.c PROPERTIES COMPILE_OPTIONS "-O2" OBJECT_DEPENDS "${SHADER_INC}")
 set_source_files_properties(${DM}/gfx/nvn/hle_nvn.c PROPERTIES COMPILE_OPTIONS "-fno-omit-frame-pointer")   # frame records: DM_NVN_SIZE_TRACE walks the game's call chain from them
-add_library(dmcore OBJECT ${HOST_C} ${GFX_C} ${ANDROID_C} ${ASM_ELF})
+add_library(dmcore OBJECT ${HOST_C} ${GFX_C} ${ANDROID_C} ${ASM_ELF} ${SHADER_INC})
 add_dependencies(dmcore game_profile)
 target_include_directories(dmcore PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/compat ${DM}/host ${DM}/gfx/nvn/include ${DM}/gfx/nvn ${DM}/gfx/tex ${DM}/third_party/vulkan-headers/include
-  ${GEN}/${GAME} ${DM}/third_party/libvpx ${DM}/third_party/stb_vorbis)
+  ${GEN}/${GAME} ${GEN} ${DM}/third_party/libvpx ${DM}/third_party/stb_vorbis)
 # x18 holds the guest thread's slot block (dm.h dm_slot_get): the compiler must never use it (Android reserves it by default; stated anyway)
 target_compile_options(dmcore PRIVATE
   $<$<COMPILE_LANGUAGE:C>:-include dm_android.h -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable

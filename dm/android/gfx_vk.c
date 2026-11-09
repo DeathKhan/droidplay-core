@@ -40,6 +40,7 @@ static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one 
 
 // ---------------- The device ----------------
 static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
+static int g_stencil_export;   // VK_EXT_shader_stencil_export enabled: a fragment shader writes the stencil test's value (gfx_vk_dscopy.inc)
 static vkb_ctx g_vk; static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT; static int g_vk_ok;
 // Query resets (the chunks' query pools, "Query resets" below). DM_VK_QRESET_USED=0 (env.txt): every pool is reset whole in the command buffer at every chunk begin, as before
 // (no host resets either); DM_VK_HOST_QRESET=0: VK_EXT_host_query_reset is not enabled, and the used queries are reset in the command buffer at the chunk's next begin
@@ -68,10 +69,13 @@ static void vk_create(void) {
     if (g_vk.qf == nq) { LOG("[RED] [vk] no graphics queue"); return; }
     uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, NULL);
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
-    const char *dext[3]; uint32_t nde = 0;
+    const char *dext[4]; uint32_t nde = 0;
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
     int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
+    // depth-stencil copies drawn in one pass (gfx_vk_dscopy.inc), else a draw per stencil bit; DM_VK_STENCIL_EXPORT=0 (env.txt, a diagnostic): the per-bit draws anyway
+    { const char *e = getenv("DM_VK_STENCIL_EXPORT"); g_stencil_export = has_ext(de, nd, "VK_EXT_shader_stencil_export") && !(e && *e == '0'); }
+    if (g_stencil_export) dext[nde++] = "VK_EXT_shader_stencil_export";
     int hqr = qr_host_env() && has_ext(de, nd, "VK_EXT_host_query_reset");   // the completion thread resets the queries a chunk used (Query resets below); core only from Vulkan 1.2
     free(de);
     VkPhysicalDeviceFeatures want = {.textureCompressionBC = f.textureCompressionBC, .textureCompressionASTC_LDR = f.textureCompressionASTC_LDR,
@@ -164,6 +168,7 @@ typedef struct chunk {
     stg_t *sb; int nsb, csb;   // the staging pool blocks it took while recorded, the last one being cut (stg_take); back to the free list in chunk_done
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
     VkDescriptorPool *dp; int ndp, cdp, dp_cur; VkBufferView *bv; int nbv, cbv;
+    VkDescriptorSet *dsc; int ndsc, cdsc, dsc_used;   // the depth-stencil copies' sets (gfx_vk_dscopy.inc dsc_set): made from its pools, handed out again once it completes
     ds_list **dl; int ndl, cdl; ds_list **dt; int ndt, cdt; int nds;   // recycled descriptor sets (gfx_vk_draw.inc ds_get): the lists holding sets, those handed out from in this recording, the sets held
 } chunk;
 enum { NCHUNK = 4 };
@@ -1291,6 +1296,7 @@ static int fmt_int(VkFormat f) {   // an integer colour format (vk_of_mtl's): a 
         default: return 0;
     }
 }
+static int ds_copy_draw(vtex *s, vtex *d, unsigned sl, unsigned sz, unsigned dl, unsigned dz, const p_copy_t2t *c);   // gfx_vk_dscopy.inc: one a blit cannot make, drawn
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = vt_get(c->src), *d = vt_get(c->dst); if (!s || !d) return;
     unsigned sl, sz, dl, dz;
@@ -1320,6 +1326,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     // a format change, a scaled or mirrored region: a blit, where both formats allow it
     VkFormatProperties fs, fd; vkGetPhysicalDeviceFormatProperties(g_vk.pd, s->fmt, &fs); vkGetPhysicalDeviceFormatProperties(g_vk.pd, d->fmt, &fd);
     if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) || as != ad) {
+        if (as != VK_IMAGE_ASPECT_COLOR_BIT && ad != VK_IMAGE_ASPECT_COLOR_BIT && ds_copy_draw(s, d, sl, sz, dl, dz, c)) return;   // depth-stencil: drawn (no Adreno blits D32_SFLOAT_S8_UINT)
         RED_ONCE(44, "texture copy with a format change or scaling between formats %d and %d: not blittable on this GPU", s->fmt, d->fmt); return; }
     int x0 = c->dr.xoffset, x1 = c->dr.xoffset + c->dr.width, y0 = c->dr.yoffset, y1 = c->dr.yoffset + c->dr.height;
     if (c->flags & NVN_COPY_FLAGS_MIRROR_X_BIT) { int k = x0; x0 = x1; x1 = k; }
@@ -1433,6 +1440,7 @@ static void clear_tex(const p_clear_tex *ct) {
 
 static int png_texels(const char *path, VkFormat f, int bpp, const uint8_t *p, uint32_t w, uint32_t x, uint32_t y, uint32_t cw, uint32_t ch, int flip);   // below (the pass dump's PNGs)
 #include "gfx_vk_draw.inc"
+#include "gfx_vk_dscopy.inc"
 
 // ---------------- Submission ----------------
 static void post(post_op o) {   // done when the current chunk completes, after its write-backs
