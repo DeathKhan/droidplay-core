@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 from pathlib import Path
 
 import lz4.block
@@ -37,13 +38,9 @@ def package(entries, version=13):
 class LspkPackage(unittest.TestCase):
     def setUp(self):
         self.seen = []
-        self.orig = ss.glslc_shaders
-        ss.glslc_shaders = lambda d, label, need=True, skip=(): self.seen.append((label, d)) or []
-        self.dir = tempfile.TemporaryDirectory()
-
-    def tearDown(self):
-        ss.glslc_shaders = self.orig
-        self.dir.cleanup()
+        patch = mock.patch.object(ss, 'glslc_shaders', lambda d, label, need=True, skip=(): self.seen.append((label, d)) or [])
+        patch.start(); self.addCleanup(patch.stop)
+        self.dir = tempfile.TemporaryDirectory(); self.addCleanup(self.dir.cleanup)
 
     def write(self, b):
         p = os.path.join(self.dir.name, 'Test.pak')
