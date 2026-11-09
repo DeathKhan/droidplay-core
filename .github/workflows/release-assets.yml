@@ -36,8 +36,11 @@ jobs:
       - name: Pack the source and upload it with the installer
         run: |
           name="droidplay-core-${TAG#v}"
-          git archive --format=tar --prefix="$name/" HEAD ':!docs' ':!.github' | xz -9 -T0 > "$name.tar.xz"
-          git archive --format=zip -9 --prefix="$name/" HEAD ':!docs' ':!.github' > "$name.zip"
+          # VERSION: the release's version, which the launcher app is given (build_android_from_nsp.py core_version); a checkout has git describe instead.
+          # --add-file, not --add-virtual-file: git puts a virtual file outside --prefix
+          printf '%s\n' "${TAG#v}" > "$RUNNER_TEMP/VERSION"
+          git archive --format=tar --prefix="$name/" --add-file="$RUNNER_TEMP/VERSION" HEAD ':!docs' ':!.github' | xz -9 -T0 > "$name.tar.xz"
+          git archive --format=zip -9 --prefix="$name/" --add-file="$RUNNER_TEMP/VERSION" HEAD ':!docs' ':!.github' > "$name.zip"
           # GitHub turns the space of an asset's name into a dot; the label keeps it
           cp dm/android/windows/install_droidplay.cmd Install.DroidPlay.cmd
           # the same archives under the name they had before the project was renamed from droidnative: the installers of 0.2.2 and earlier look only for

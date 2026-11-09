@@ -209,6 +209,17 @@ class Library(Base):
     def test_no_host_no_apk(self):
         with self.assertRaises(ba.BuildError): ba.make_apk(Path('sdk'), self.tmp, {})
 
+    def test_app_version_from_the_release_or_the_checkout(self):   # the launcher app's versionName: a release archive's VERSION file, else git describe, else the manifest's
+        rel = self.tmp / 'release'; rel.mkdir(); (rel / 'VERSION').write_text('0.3.1\n', encoding='utf-8')
+        with mock.patch.object(ba, 'REPO', rel): self.assertEqual(ba.core_version(), '0.3.1')
+        with mock.patch.object(ba, 'REPO', self.tmp / 'neither'): self.assertIsNone(ba.core_version())   # not a release, not a checkout
+        so = self.tmp / f'libdmhost_{GID}.so'; so.write_bytes(b'host'); loader = self.tmp / 'libnxloader.so'; loader.write_bytes(b'loader')
+        st = self.tmp / 'st'; st.mkdir(); (st / 'main.patched.bin').write_bytes(b'x'); ba.library_add(GID, so, loader, st, {'name': GID})
+        ran = []
+        with mock.patch.object(ba.bi, 'run', lambda cmd, log, env=None: ran.append([str(c) for c in cmd])), mock.patch.object(ba, 'core_version', lambda: '0.3.1'):
+            ba.make_apk(Path('sdk'), self.tmp, {})
+        self.assertEqual(ran[0][ran[0].index('--version-name') + 1], '0.3.1')
+
 
 class Journal(Base):
     def test_events_in_the_journal_whatever_the_console_mode(self):
