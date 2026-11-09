@@ -1,12 +1,17 @@
 # The desktop app of the Android port: pack your games for the nxnative app, install them on your phones and watch them run.
-#   python scripts/nxnative_android.py        (needs PySide6: pip install PySide6)
+#   uv run scripts/nxnative_android.py        (uv brings Python and the modules the block below names; or a Python that has them: pip install PySide6 lz4 capstone fonttools)
 # It drives scripts/build_android_from_nsp.py (its --progress json events, --info, --check, --push-only, --apk-only, --migrate) and adb:
 #   Library      your games (the NSP folders you added): the picked one large, Play (on the phone picked at the top), its options and Manage; the collection below
 #   Builds       the running build: its stages, progress and messages (the bar at the bottom of every page follows it); a build started from a console
 #                shows here too, from the journal the script writes (<data>/builds/*.jsonl)
 #   Phones       adb devices over USB and Wi-Fi (pair, connect, discover), the app and the games on each, saves backed up to the computer
 #   Performance  the game's log (adb logcat) with the frame time, GPU and CPU figures it prints, a frame's GPU passes
-#   Settings     your keys, and what the build needs on this computer with how to get what is missing
+#   Settings     your keys, and what the build needs on this computer with how to get what is missing; on Windows, Install what's missing (--setup)
+# /// script
+# # Below 3.15: lz4 has no wheels for it yet, and a player's computer has no compiler to build one. The packing script runs in this same Python.
+# requires-python = ">=3.12,<3.15"
+# dependencies = ["PySide6", "lz4", "capstone>=5,<6", "fonttools", "backports.zstd; python_version < '3.14'"]
+# ///
 import json, os, re, shutil, subprocess, sys, time, uuid
 from pathlib import Path
 
@@ -159,6 +164,7 @@ def alive(pid):
 def journal_title(argv):   # what a build from the console does, from its command line
     if '--apk-only' in argv: return 'Update the app'
     if '--migrate' in argv: return 'Move the old install'
+    if '--setup' in argv: return 'Set up this computer'
     folder = next((x for x in argv if not x.startswith('-') and Path(x).is_dir()), None)
     name = None
     if folder:
@@ -819,6 +825,7 @@ class SettingsPage(QWidget):
         b = QPushButton('Choose…'); b.clicked.connect(self.pick_keys); keys.addWidget(b); lay.addLayout(keys)
         lay.addSpacing(8)
         head = QHBoxLayout(); head.addWidget(label('Requirements', 'h2')); head.addStretch(); b = QPushButton('Check again'); b.setObjectName('ghost'); b.clicked.connect(lambda *_: self.run()); head.addWidget(b)
+        self.setup = QPushButton("Install what's missing"); self.setup.clicked.connect(self.install); self.setup.hide(); head.addWidget(self.setup); self.rows = []
         lay.addLayout(head)
         lay.addWidget(label(f'The build runs with {sys.executable}: install missing Python modules into it.', 'muted', wrap=True))
         self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(['', 'What', 'Detail / how to get it']); self.table.verticalHeader().hide(); self.table.setShowGrid(False)
@@ -835,8 +842,29 @@ class SettingsPage(QWidget):
                 mark = QTableWidgetItem('●'); mark.setForeground(QColor(READY if r['ok'] else ERR)); mark.setTextAlignment(Qt.AlignCenter); self.table.setItem(i, 0, mark)
                 self.table.setItem(i, 1, QTableWidgetItem(r['name'])); self.table.setItem(i, 2, QTableWidgetItem(r['detail'] + (f'\n→ {r["fix"]}' if r['fix'] else '')))
             self.table.resizeRowsToContents()
+            self.rows = rows; self.setup.setVisible(bool(self.installable()))
             if then: then(rows)
         bg(lambda: self.win.script_json('--check'), got)
+    def installable(self):   # the failing rows --setup installs: Windows only so far, and not the Python modules (uv run brings those, or pip)
+        return [r['name'] for r in self.rows if not r['ok'] and r['name'] != 'check' and not r['name'].startswith('Python')] if os.name == 'nt' else []
+    def install(self):   # build_android_from_nsp.py --setup, once the player has seen what it downloads and, for the Android SDK's parts, accepted Google's licence
+        missing = self.installable()
+        if not missing: return
+        sdk_rows = set(ba.sdk_packages(Path('.'))) | {'Android SDK'}
+        parts = (['JDK 21, Microsoft\'s build (about 190 MB)'] if any(n.startswith('JDK') for n in missing) else []) + \
+                (['.NET SDK 10 (about 290 MB)'] if '.NET SDK 10' in missing else []) + \
+                ([f'the Android SDK\'s {", ".join(n for n in missing if n in sdk_rows and n != "Android SDK") or "command-line tools and packages"} '
+                  '(about 1.1 GB to download, 4 GB installed)'] if any(n in sdk_rows for n in missing) else [])
+        sdk = any(n in sdk_rows for n in missing)
+        b = QMessageBox(QMessageBox.Question, "Install what's missing", 'Setup downloads and installs:\n\n• ' + '\n• '.join(parts) +
+                        f'\n\nThe JDK and the .NET SDK go into {ba.data_dir() / "tools"}, for this app alone; the Android SDK goes where Android Studio keeps it.', QMessageBox.Cancel, self)
+        if sdk: b.setInformativeText('The Android SDK comes from Google: installing its parts means accepting the Android SDK License, '
+                                     'https://developer.android.com/studio/terms. Its usage metrics stay off.')
+        go = b.addButton('Accept and install' if sdk else 'Install', QMessageBox.AcceptRole); b.setDefaultButton(QMessageBox.Cancel); b.exec()
+        if b.clickedButton() is not go: return
+        self.win.builds.start('Set up this computer', ['--setup'] + (['--accept-android-licenses'] if sdk else []),
+                              after=lambda: (ba.tool_paths(), self.run(), self.win.refresh_devices()))   # this app's PATH takes the new tools too (adb)
+        self.win.go('builds')
 
 
 # ---------------- The window ----------------
