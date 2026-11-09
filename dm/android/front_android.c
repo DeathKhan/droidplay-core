@@ -72,7 +72,8 @@ static void log_start(void) {
 // ---------- Files ----------
 static int exists(const char *p) { struct stat st; return !stat(p, &st); }
 static void mkdirs(const char *p) { char b[600]; snprintf(b, sizeof b, "%s", p); for (char *s = b + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(b, 0755); *s = '/'; } mkdir(b, 0755); }
-// <external files>/env.txt: KEY=VALUE per line; # comments. Then the game's launcher.txt, the settings screen's choices (java Launcher.java), without overriding env.txt
+// <external files>/env.txt: KEY=VALUE per line; # comments. Then the game's launcher.txt, the settings screen's choices (java Launcher.java), and its defaults.txt, the
+// language and the switches its profile asks for (build_android_from_nsp.py defaults_text), each without overriding what came before
 static void env_file(const char *dir, const char *name, int over) {
     char path[700]; snprintf(path, sizeof path, "%s/%s", dir, name);
     FILE *f = fopen(path, "r"); if (!f) return;
@@ -612,7 +613,7 @@ void android_main(struct android_app *app) {
     mkdirs(g_ext); mkdirs(g_int);
     log_start();
     LOG("nxnative for Android: %s (%s), files %s, internal %s", DM_GAME_NAME, DM_GAME_ID, g_game, g_int);
-    env_file(g_ext, "env.txt", 1); env_file(g_game, "launcher.txt", 0);
+    env_file(g_ext, "env.txt", 1); env_file(g_game, "launcher.txt", 0); env_file(g_game, "defaults.txt", 0);
     (*app->activity->vm)->AttachCurrentThread(app->activity->vm, &g_env, NULL);
     app->onAppCmd = on_cmd; app->onInputEvent = on_input;
     // The screen stays on while the game's window is up, as the launcher's does: Android counts only its own input events as activity, so a cutscene, a game

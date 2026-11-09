@@ -227,7 +227,17 @@ def clone(src, dst):   # an APFS clone where the volume can make one, else a har
 GAME_APP_LIMIT = (2 << 30) - (64 << 20)   # the APK's size with the RomFS inside it, kept clear of 2 GiB for the ZIP's own records
 
 
-def make_game_app(sdk, g, game, patched, spv, font, aoc, lang, so, meta, work, logs, env, out_dir, xapk):
+# The game's defaults.txt: the language, then the profile's Android switches (dm/games/<id>/android_defaults.txt: KEY=VALUE per line, # comments), for a game that needs
+# a switch only some games want. The host takes them as it takes env.txt's, without overriding a key env.txt or the settings screen sets (front_android.c); a game app
+# sets them the same way (GameStart.java)
+def defaults_text(g, lang):
+    lines = [f'DM_LANG={lang}']
+    own = g.dir / 'android_defaults.txt'
+    if own.is_file(): lines += [ln.strip() for ln in own.read_text(encoding='utf-8').splitlines() if '=' in ln and not ln.lstrip().startswith('#')]
+    return ''.join(ln + '\n' for ln in lines)
+
+
+def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, work, logs, env, out_dir, xapk):
     sys.path.insert(0, str(REPO / 'dm/android/tools')); import build_apk   # pyright: ignore[reportMissingImports]  # dm/android/tools, put on the path here
     pkg = build_apk.game_package(g.id)
     rom = bi.rfs.source(game)
@@ -237,7 +247,7 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, lang, so, meta, work, l
         if src and Path(src).is_dir(): (stage / name).symlink_to(Path(src).resolve(), target_is_directory=True)
     for f in ('icon.jpg', 'control.nacp'):
         if (game / f).is_file(): (stage / f).symlink_to((game / f).resolve())
-    (stage / 'defaults.txt').write_text(f'DM_LANG={lang}\n', encoding='utf-8')
+    (stage / 'defaults.txt').write_text(defaults, encoding='utf-8')
     (stage / 'game.json').write_text(json.dumps({**meta, 'package': pkg}, indent=1), encoding='utf-8')
     files = sorted(Path(r, f).relative_to(stage).as_posix() for r, _, fs in os.walk(stage, followlinks=True) for f in fs)
     (stage / 'files.txt').write_text(''.join(f + '\n' for f in files + ['files.txt']), encoding='utf-8', newline='\n')
@@ -494,7 +504,7 @@ def migrate_legacy(serial, gid, nacp_local=None):
     return True
 
 
-def push_game(serial, gid, game, patched, spv, font, aoc, lang, work, logs, meta):
+def push_game(serial, gid, game, patched, spv, font, aoc, defaults, work, logs, meta):
     """The game's files → files/games/<gid>/ (the RomFS with --sync: a repeat copies only what changed)"""
     dst = f'{REMOTE}/games/{gid}'
     parts = ['the one-game install', 'font', 'code'] + ['shaders'] * bool(spv) + ['RomFS'] + ['DLC'] * aoc.is_dir() + ['launcher files', 'permissions']
@@ -520,11 +530,11 @@ def push_game(serial, gid, game, patched, spv, font, aoc, lang, work, logs, meta
         push_dir(serial, rom, dst, 'RomFS', logs / 'adb_push_romfs.log', sync=True)
     if aoc.is_dir(): part('DLC'); push_dir(serial, aoc, dst, 'aoc', logs / 'adb_push_aoc.log', sync=True)
     part('launcher files')
-    # the launcher (dm/android/java Launcher.java): the game's icon and control data (name, version, languages), its defaults (the language picked with --language) and
+    # the launcher (dm/android/java Launcher.java): the game's icon and control data (name, version, languages), its defaults (defaults_text) and
     # game.json; env.txt is the player's and stays as it is (a key it sets wins over the settings screen)
     for f in ('icon.jpg', 'control.nacp'):
         if (game / f).is_file(): adb(serial, 'push', game / f, f'{dst}/{f}')
-    dflt = work / 'android_defaults.txt'; dflt.write_text(f'DM_LANG={lang}\n')
+    dflt = work / 'android_defaults.txt'; dflt.write_text(defaults, encoding='utf-8')
     adb(serial, 'push', dflt, f'{dst}/defaults.txt')
     gj = work / 'android_game.json'; gj.write_text(json.dumps(meta, indent=1), encoding='utf-8')
     adb(serial, 'push', gj, f'{dst}/game.json')
@@ -791,13 +801,14 @@ def main(argv):
         font = button_font(work, logs, env)
     have_l = nacp.languages(game / 'control.nacp')
     lang = bi.game_language(bi.language_code(a.language) or 'en-US', a.language != 'en-US', have_l)
+    defaults = defaults_text(g, lang)
     label = nacp.name(game / 'control.nacp') or g.get('name', '') or g.id
     if a.game_apk:
         rom = bi.rfs.source(game)
         meta = {'title_id': g.id, 'name': label, 'version': pkg_ver, 'display': nacp.version(game / 'control.nacp'),
                 'romfs_bytes': Path(rom).stat().st_size if bi.rfs.is_image(rom) else None}
         bi.PROG.stage('game app')
-        made, inside = make_game_app(sdk, g, game, patched, spv, font, work / 'aoc', lang, so, meta, work, logs, env,
+        made, inside = make_game_app(sdk, g, game, patched, spv, font, work / 'aoc', defaults, so, meta, work, logs, env,
                                      Path(a.out).expanduser().resolve() if a.out else nsp_dir, a.xapk)
         bi.PROG.end(str(made[0]))
         if a.xapk: say(f'done: {made[0]}. Install it with an XAPK installer on the device; it puts the game data in Android/obb. Or unzip it, install the APK and copy Android/obb/ to the device')
@@ -812,7 +823,7 @@ def main(argv):
     bi.PROG.set(step='installing the app (an update: its data stays)'); install(serial, apk, logs)
     adb(serial, 'shell', 'am', 'force-stop', PKG)
     rom = bi.rfs.source(game)
-    push_game(serial, g.id, game, patched, spv, font, work / 'aoc', lang, work, logs,
+    push_game(serial, g.id, game, patched, spv, font, work / 'aoc', defaults, work, logs,
               {'title_id': g.id, 'name': label, 'version': pkg_ver, 'display': nacp.version(game / 'control.nacp'),
                'romfs_bytes': Path(rom).stat().st_size if bi.rfs.is_image(rom) else None})
     bi.PROG.end(f'{REMOTE}/games/{g.id}')

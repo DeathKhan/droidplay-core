@@ -93,11 +93,13 @@ Numbered in the order they were found, so links to a number stay right:
     grey in the first pass that draws it, while Link and the bird statue, drawn next with the same ASTC 6×6 textures, have their colours. The terrain's draws
     also sample 64×64 textures the game renders earlier in the frame, which come out black from the game's own constants; whether that is right also needs
     a Mac dump to compare. The opening movie is right.
-11. **Skyward Sword HD plays at 30 fps** on the Odin 2 and the Pad 3 (the Mac runs Skyloft at 60): the game drops its present interval to 2 when frames come
-    late. Its long frames show the replay writing a 1920×1080 RGBA8 render target back to guest memory after its pass (`[vk] linear render target s19
-    1920x1080 (format 0x25) written back to guest memory`) and uploading it again (`texture uploads 0 first + 2 re-uploads, 15.8 MB`), with submit and
-    present taking up to 36 ms while the GPU takes 5 ms on the Odin 2. Link's Awakening's overworld likewise falls to 31 fps on the Pad 3: the game switched
-    interval 175 times in one run there, against 4 on the Odin 2.
+11. **Fixed for Skyward Sword HD: it played at 30 fps** on the Odin 2 and the Pad 3 (the Mac runs Skyloft at 60): the game drops its present interval
+    to 2 when frames come late. Its long frames showed the replay writing a 1920×1080 RGBA8 render target back to guest memory after its pass (`[vk]
+    linear render target s19 1920x1080 (format 0x25) written back to guest memory`) and uploading it again (`texture uploads 0 first + 2 re-uploads,
+    15.8 MB`), with submit and present taking up to 36 ms while the GPU takes 5 ms on the Odin 2. Its profile now turns on `DM_VK_WB_ABSORB` (59.7 fps
+    on the Pad 3, 59.3 on the Odin 2): [A linear render target uploaded again after its own write-back, every
+    frame](../../docs/reference/rendering.md#a-linear-render-target-uploaded-again-after-its-own-write-back-every-frame). Link's Awakening's overworld
+    likewise falls to 31 fps on the Pad 3: the game switched interval 175 times in one run there, against 4 on the Odin 2.
 
 ## Reading the numbers
 
