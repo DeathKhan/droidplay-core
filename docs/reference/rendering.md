@@ -1625,8 +1625,16 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 
 - **Symptom:** the whole picture darker and more saturated than the Switch's.
 - **Cause:** the render pass attached each colour target in its image's format, ignoring the format of the view the game binds it with. Wonder's last pass writes its RGBA8 window texture through an RGBA8_SRGB view, so the linear values were stored unencoded (the same as [the Metal finding](../../dm/games/010015100B514000/README.md)).
-- **Fix:** `rp_prepare` makes the attachment view in `view_format` (the images of uncompressed colour formats are mutable).
+- **Fix:** `rp_prepare` makes the attachment view in `view_format` (an uncompressed colour image is made for its own format and its sRGB twin: [Colour images keep Adreno's framebuffer compression](#colour-images-keep-adrenos-framebuffer-compression)).
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md).
+
+### Colour images keep Adreno's framebuffer compression
+
+- **Symptom:** Android only: GPU time up to a third higher than it needs to be, and a colour target's memory exactly its texels (`[vk] colour target 1600x900 format 37 (MUTABLE_FORMAT): 5.49 MB of memory for 5.49 MB of texels`).
+- **Cause:** every uncompressed colour image was made with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`, so that a view could take any format of its texel size (an NVN texture view's own format). Given that, Adreno's driver leaves the image without UBWC, its lossless framebuffer compression, and every pass stores and loads its targets uncompressed.
+- **Fix:** `vt_create` gives an uncompressed colour image that is not a storage image a format list (`VK_KHR_image_format_list`) of its format and its sRGB twin (`srgb_twin`: RGBA8, BGRA8, ABGR8, R8 and RG8), and `MUTABLE_FORMAT` only when there is a twin. A view in any other format reads the image's own (`[RED] [vk] texture view in format … which lists only its own and its sRGB twin`). Storage images keep `MUTABLE_FORMAT` with no list: a shader declares their format. Found by nx2android ([github.com/shirai91/nx2android](https://github.com/shirai91/nx2android), a1b4f54). `DM_VK_UBWC=0` (env.txt) makes them as before.
+- **Check:** the same targets now take room for the compression's metadata (`5.60 MB of memory for 5.49 MB of texels`). GPU time a frame (p50) on an Ayn Odin 2, kept against `DM_VK_UBWC=0`: Super Mario Odyssey's opening 4.30 against 5.57 ms, Brilliant Diamond's Eterna City 6.22 against 8.41, Animal Crossing's island 8.59 against 9.80, Skyward Sword HD's Skyloft 3.64 against 5.59, Link's Awakening's Ancient Ruins 5.91 against 5.83. On a OnePlus Pad 3: Odyssey 8.05 against 9.33 ms, Animal Crossing 15.09 against 15.59. The runs' last screenshots match apart from animation. No red line in any of the six test games.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md), with the other test games in the [Android baselines](../../dm/android/baselines.md).
 
 ### Compressed render targets through an uncompressed shadow on Vulkan
 
