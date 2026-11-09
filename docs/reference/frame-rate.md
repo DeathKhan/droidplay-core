@@ -399,6 +399,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** MacNativeGames commit `0531f28`, ported in [PR #195](https://github.com/seedds/nxnative/pull/195), reports autorelease work falling from 2.63% to 1.73% of replay time; the PR does not identify the game for that measurement. It has not been repeated here.
 - **Check:** `t_ub`, `t_vbuf` and `t_geometry` exercise arena-backed uniform shadows, vertex conversion and geometry scratch on the Mac with Metal validation.
 
+### Queued commands grown by doubling
+
+- **Symptom:** on Android, a game's render thread busy in `nvnQueueSubmitCommands` with the frame rate well under the GPU's: a simpleperf profile shows `nvn_queue_submit` → `nq_flatten` → `nq_bytes` → `realloc`, its time in `memcpy`, `munmap` and page faults. `NVN submit+present` counts it, beside the replay's own time.
+- **Cause:** `nq_flatten` copies each submission's commands into its continuation's buffer (`nq_bytes`), which grew to the next page whenever it filled. A submission of a thousand draws was copied again for every page it grew by, quadratic in its size; on Android, scudo's `realloc` of a large block maps a new one, copies into it (faulting in fresh pages) and unmaps the old. The copy runs under `g_sub_mu`, so the replay thread waits for it too.
+- **Fix:** `nq_bytes` doubles the buffer (from 4 KB) until the commands fit.
+- **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md)'s `eterna` route (`scripts/bench_android.py`) on a Retroid Pocket 5 (Snapdragon 865, Adreno 650, Android 13) with Mesa's Turnip T30: 25.1-25.5 fps before (frame p50 38.4 ms; `nq_flatten` 46% of the UnityGfx thread, which used 74% of a CPU), 38.3 and 38.7 fps after (frame p50 25.7 ms; UnityGfx 23%). On an Ayn Odin 2, which held 60 fps already: UnityGfx 36.5 → 24.5% of a CPU on Qualcomm's driver (`NVN submit+present` p50 14.0 → 12.7 ms) and 38 → 22.5% on Turnip (13.4 → 7.8 ms, frame p99 21 → 18.5 ms).
+- **Open:** the Retroid Pocket 5 then waits for its four chunks to come back from the GPU (the replay 64% in `cur()`, the GPU busy 12.7 of 25.7 ms). Eight chunks gave 48.8 fps with 69 MB more resident (sixteen 49.6 fps, 243 MB more), and then a draw about once a frame waits for a storage-buffer write-back still in flight (`draw_view`, `syncs by site` draw 1 a frame), about 8 ms.
+
 ### Dedicated c1 constants as slices of a bank
 
 - **Symptom:** a game runs at about 10 fps with little GPU work: the submit thread waits for a command allocator (`mtl_sub_begin` → `mtl_wait_at`), the GPU sits idle between encoders for hundreds of ms (`DM_NVN_GPUPROF`), the Metal 4 `SubmissionQueue` thread spends nearly all its time in `iokit_user_client_trap` (almost all system time), and the `memory up to frame` line shows a residency set of 10,000 objects or more.

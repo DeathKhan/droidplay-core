@@ -61,6 +61,7 @@ Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform
 - [AudioOut stop releases pending buffers](../../../docs/reference/audio.md#stopping-an-audioout-releases-its-pending-buffers), reported on 1.0.0 in PR #190.
 - [Unity's integer target frame rate](../../../docs/reference/frame-rate.md#unitys-integer-target-frame-rate).
 - [A guest thread attached to the Java VM (Android)](../../../docs/reference/memory.md#a-guest-thread-attached-to-the-java-vm-android): the software keyboard's name entry.
+- [Queued commands grown by doubling](../../../docs/reference/frame-rate.md#queued-commands-grown-by-doubling): Eterna City on a Retroid Pocket 5 with Turnip at 25 fps, 38.7 after.
 
 ## Open
 
