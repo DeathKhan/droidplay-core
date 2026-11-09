@@ -472,7 +472,8 @@ public final class Gamepad extends View {
             if (guide != null) in.setHint(guide);
             if (maxChars > 0) in.setFilters(new InputFilter[]{new InputFilter.LengthFilter(maxChars)});
             box.addView(in);
-            AlertDialog d = new AlertDialog.Builder(a).setTitle(title == null || title.isEmpty() ? null : title).setView(box)
+            // the device's own dialog look, as the launcher's: the activity's theme (the game's fullscreen NoTitleBar) drew it in the old Holo style
+            AlertDialog d = new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle(title == null || title.isEmpty() ? null : title).setView(box)
                 .setPositiveButton(android.R.string.ok, new android.content.DialogInterface.OnClickListener() { public void onClick(android.content.DialogInterface di, int w) { out[0] = in.getText().toString(); done.countDown(); } })
                 .setNegativeButton(android.R.string.cancel, new android.content.DialogInterface.OnClickListener() { public void onClick(android.content.DialogInterface di, int w) { done.countDown(); } })
                 .setOnCancelListener(new android.content.DialogInterface.OnCancelListener() { public void onCancel(android.content.DialogInterface di) { done.countDown(); } }).create();

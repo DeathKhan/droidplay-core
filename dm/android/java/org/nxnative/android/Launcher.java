@@ -107,7 +107,7 @@ public class Launcher extends Activity {
     @Override protected void onNewIntent(Intent i) { super.onNewIntent(i); setIntent(i); opened(i); }
     void opened(Intent i) {
         String id = i != null ? i.getStringExtra("game") : null; if (id == null) return;
-        for (Game g : scan()) if (g.id.equalsIgnoreCase(id) && g.hosted) { showSettings(g); if (i.getBooleanExtra("play", false)) play(); return; }
+        for (Game g : scan()) if (g.id.equalsIgnoreCase(id) && g.hosted) { showSettings(g); if (i.getBooleanExtra("play", false)) play(true); return; }
         toast("The game " + id + " is not on this phone, or this app has no host for it");
     }
 
@@ -337,18 +337,39 @@ public class Launcher extends Activity {
     void set(Setting s, String v) { chosen.put(s.key, v); prefs.edit().putString(s.key, v).apply(); }
 
     // ---------------- Starting a game ----------------
-    void play() {
+    void play() { play(false); }
+    // desktop: the desktop app's Play started it (it said the first start takes a while before it did), so a first start gets a toast here, not a dialog to tap
+    void play(final boolean desktop) {
         final Game g = game;
         StringBuilder sb = new StringBuilder("# written by the settings screen (Launcher.java); env.txt wins over these\n");
         for (Setting s : settings) if (!envFile.containsKey(s.key)) sb.append(s.key).append('=').append(chosen.get(s.key)).append('\n');
         try (FileOutputStream o = new FileOutputStream(new File(g.dir, "launcher.txt"))) { o.write(sb.toString().getBytes(StandardCharsets.UTF_8)); } catch (IOException e) { Log.w(TAG, "launcher.txt: " + e); }
-        String running = runningGame();
-        if (running == null) { start(g.id, false); return; }
-        if (running.equals(g.id)) { resume(); return; }
-        new AlertDialog.Builder(this).setTitle("Switch games?")
-            .setMessage("Another game is running. Starting " + g.name + " closes it: progress it has not saved is lost.")
-            .setPositiveButton("Close it and start", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) { endGame(); later(g.id, false); } })
+        final String running = runningGame();
+        if (running != null && running.equals(g.id)) { resume(); return; }
+        Runnable go = new Runnable() { public void run() {
+            if (running == null) { start(g.id, false); return; }
+            new AlertDialog.Builder(Launcher.this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Switch games?")
+                .setMessage("Another game is running. Starting " + g.name + " closes it: progress it has not saved is lost.")
+                .setPositiveButton("Close it and start", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) { endGame(); later(g.id, false); } })
+                .setNegativeButton("Cancel", null).show();
+        } };
+        if (!firstStart(g.id)) { go.run(); return; }
+        // A first start stays on the loading screen while the driver builds the game's pipelines: 80 seconds for Brilliant Diamond on a Galaxy S25 Edge (2,978
+        // pipelines and 8,844 shader libraries), 39 on a OnePlus Pad 3, a few seconds the next time. A player who isn't told takes it for a crash
+        Log.i(TAG, "launcher: first start of " + g.id + " (no pipeline cache)");
+        if (desktop) { toast(g.name + " prepares its shaders for its first start: it stays on the loading screen for a minute or two"); go.run(); return; }
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("The first start takes a minute or two")
+            .setMessage(g.name + " prepares its shaders first, and stays on the loading screen meanwhile. The phone may get warm. Later starts take a few seconds.")
+            .setPositiveButton("Start", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) { go.run(); } })
             .setNegativeButton("Cancel", null).show();
+    }
+    // No driver pipeline cache of the game's in internal storage: cache/<id>/pipeline.cache, where front_android.c points DM_PIPELINE_CACHE, or with a custom Vulkan
+    // driver's name after it (gfx_vk_draw.inc). pipeline.cache.keys4 beside it is the list of pipelines to make again, which a start without the driver's cache
+    // still makes slowly
+    boolean firstStart(String id) {
+        File[] fs = new File(internal, "cache/" + id.toUpperCase(Locale.ROOT)).listFiles();
+        if (fs != null) for (File f : fs) { String n = f.getName(); if (n.startsWith("pipeline.cache") && !n.contains(".keys") && f.length() > 0) return false; }
+        return true;
     }
     void selftest() {
         List<String> hosts = hosts(); if (hosts.isEmpty()) { toast("This app carries no game host"); return; }
