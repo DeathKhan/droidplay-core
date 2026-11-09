@@ -889,6 +889,7 @@ typedef struct {
     const void *pool; const uint8_t *store; nvn_texdesc desc;   // what it was made from: a serial met again with other storage or another description is made anew
     uint32_t w, h, d, layers, levels; VkImageType type; VkSampleCountFlagBits samples;
     int pkg; uint64_t stamp, seen; const void *span; uint8_t *edge[2]; uint32_t edge_n[2];
+    uint64_t rt_last; uint32_t rt_runs;   // the last present (+1) that drew into it as a pass's target, and in how many presents in a row up to it (gfx_vk_draw.inc rt_note)
     int refs, shared, mutable_, fixed_fmt; uint64_t used;   // mutable_: views in another format of the same texel size (a texture view's format); fixed_fmt: only its format and its sRGB twin (vt_create)   // texture objects (serials) resolving to it; in the sharing table; g_fence at its last lookup
 } vtex;
 static nvn_hmap g_tex = {.klen = 8}, g_cpuw = {.klen = 8};   // serial → vtex; serials the CPU wrote (WriteTexels). Keyed by the 8-byte serial
