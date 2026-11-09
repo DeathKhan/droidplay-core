@@ -1675,6 +1675,7 @@ static VkFormat view_format(const vtex *v, const view_t *vv) {
     if (!nvn_fmt_to_mtl(vv->format, &m, sw) || !m) return VK_FORMAT_UNDEFINED;
     VkFormat f = vk_of_mtl(m);
     if (!f || f == v->fmt) return VK_FORMAT_UNDEFINED;
+    if (v->fixed_fmt && f != srgb_twin(v->fmt)) { RED_ONCE(121, "texture view in format %d over an image of format %d, which lists only its own and its sRGB twin (DM_VK_UBWC=0 views it in any): read in the image's", f, v->fmt); return VK_FORMAT_UNDEFINED; }
     if (!v->mutable_ || !fmt_bytes(f) || fmt_bytes(f) != fmt_bytes(v->fmt)) { RED_ONCE(118, "texture view in format %d over an image of format %d: read in the image's", f, v->fmt); return VK_FORMAT_UNDEFINED; }
     return f;
 }

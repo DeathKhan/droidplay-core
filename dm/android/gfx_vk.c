@@ -40,6 +40,7 @@ static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one 
 
 // ---------------- The device ----------------
 static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
+static int g_fmt_list;   // VK_KHR_image_format_list enabled (vt_create)
 static int g_stencil_export;   // VK_EXT_shader_stencil_export enabled: a fragment shader writes the stencil test's value (gfx_vk_dscopy.inc)
 static vkb_ctx g_vk; static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT; static int g_vk_ok;
 // Query resets (the chunks' query pools, "Query resets" below). DM_VK_QRESET_USED=0 (env.txt): every pool is reset whole in the command buffer at every chunk begin, as before
@@ -71,13 +72,15 @@ static void vk_create(void) {
     if (g_vk.qf == nq) { LOG("[RED] [vk] no graphics queue"); return; }
     uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, NULL);
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
-    const char *dext[4]; uint32_t nde = 0;
+    const char *dext[5]; uint32_t nde = 0;
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
     int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
     // depth-stencil copies drawn in one pass (gfx_vk_dscopy.inc), else a draw per stencil bit; DM_VK_STENCIL_EXPORT=0 (env.txt, a diagnostic): the per-bit draws anyway
     { const char *e = getenv("DM_VK_STENCIL_EXPORT"); g_stencil_export = has_ext(de, nd, "VK_EXT_shader_stencil_export") && !(e && *e == '0'); }
     if (g_stencil_export) dext[nde++] = "VK_EXT_shader_stencil_export";
+    // colour images name the formats they are viewed in (vt_create: Adreno's framebuffer compression); core only from Vulkan 1.2, and the instance asks for 1.1
+    if ((g_fmt_list = has_ext(de, nd, "VK_KHR_image_format_list"))) dext[nde++] = "VK_KHR_image_format_list";
     int hqr = qr_host_env() && has_ext(de, nd, "VK_EXT_host_query_reset");   // the completion thread resets the queries a chunk used (Query resets below); core only from Vulkan 1.2
     free(de);
     VkPhysicalDeviceFeatures want = {.textureCompressionBC = f.textureCompressionBC, .textureCompressionASTC_LDR = f.textureCompressionASTC_LDR,
@@ -874,7 +877,7 @@ typedef struct {
     const void *pool; const uint8_t *store; nvn_texdesc desc;   // what it was made from: a serial met again with other storage or another description is made anew
     uint32_t w, h, d, layers, levels; VkImageType type; VkSampleCountFlagBits samples;
     int pkg; uint64_t stamp, seen; const void *span; uint8_t *edge[2]; uint32_t edge_n[2];
-    int refs, shared, mutable_; uint64_t used;   // mutable_: views in another format of the same texel size (a texture view's format)   // texture objects (serials) resolving to it; in the sharing table; g_fence at its last lookup
+    int refs, shared, mutable_, fixed_fmt; uint64_t used;   // mutable_: views in another format of the same texel size (a texture view's format); fixed_fmt: only its format and its sRGB twin (vt_create)   // texture objects (serials) resolving to it; in the sharing table; g_fence at its last lookup
 } vtex;
 static nvn_hmap g_tex = {.klen = 8}, g_cpuw = {.klen = 8};   // serial → vtex; serials the CPU wrote (WriteTexels). Keyed by the 8-byte serial
 static uint64_t g_pkg_uploads, g_pkg_reuploads, g_pkg_edge_skips, g_up_bytes, g_draws_skipped;
@@ -920,6 +923,20 @@ static void vt_clear_new(vtex *v) {   // fresh Switch memory reads as 0
     cb_barrier();
 }
 static nvn_hmap g_img_refused = {.klen = 8};   // serials whose image was over DM_VK_IMAGE_MAX_MB (vt_create; g_bk held)
+static int fmt_bytes(VkFormat f);   // gfx_vk_draw.inc
+// The sRGB form of an 8-bit UNORM colour format and back (0: none), the one other format a colour image is viewed in under DM_VK_UBWC (vt_create)
+static VkFormat srgb_twin(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB; case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB; case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32; case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+        case VK_FORMAT_R8_UNORM: return VK_FORMAT_R8_SRGB; case VK_FORMAT_R8_SRGB: return VK_FORMAT_R8_UNORM;
+        case VK_FORMAT_R8G8_UNORM: return VK_FORMAT_R8G8_SRGB; case VK_FORMAT_R8G8_SRGB: return VK_FORMAT_R8G8_UNORM;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+// DM_VK_UBWC=0 (env.txt): colour images MUTABLE_FORMAT with no format list, as before (vt_create)
+static int ubwc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = !(e && *e == '0') && g_fmt_list; LOG("[vk] colour images %s", v ? "list their format and its sRGB twin, so Adreno keeps their framebuffer compression (DM_VK_UBWC=0: MUTABLE_FORMAT, any format of the texel size)" : g_fmt_list ? "MUTABLE_FORMAT with no format list (DM_VK_UBWC=0)" : "MUTABLE_FORMAT with no format list (no VK_KHR_image_format_list)"); } return v; }
 static vtex *vt_create(const tex_t *t) {
     uint32_t m = 0; uint8_t swz[4];
     if (nvn_hm_get(&g_img_refused, &t->serial)) return NULL;
@@ -951,6 +968,13 @@ static vtex *vt_create(const tex_t *t) {
     if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     // an uncompressed colour image may be viewed in another format of its texel size (NVN texture views: sRGB over UNORM and the like): mutable
     int mut = v->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !conv && !(f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
+    // MUTABLE_FORMAT alone lets a view take any format of the texel size, and Adreno then leaves the image without UBWC, its framebuffer compression: every target
+    // stored and loaded uncompressed. nx2android (github.com/shirai91/nx2android, a1b4f54) found that a format list keeps it: Super Mario Bros. Wonder's GPU time
+    // 11.8 -> 8.8 ms a frame on an Adreno 830. A colour image that is not a storage image now lists its format and its sRGB twin (MUTABLE_FORMAT only with a twin);
+    // a view in any other format reads the image's own (view_format, a red line). Storage images keep MUTABLE_FORMAT: a shader declares their format (storage_view)
+    VkFormat fl[2] = {f, srgb_twin(f)};
+    VkImageFormatListCreateInfoKHR fli = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR, .viewFormatCount = fl[1] ? 2 : 1, .pViewFormats = fl};
+    if (mut && !(u & VK_IMAGE_USAGE_STORAGE_BIT) && ubwc_on()) { v->fixed_fmt = 1; mut = fl[1] != VK_FORMAT_UNDEFINED; }
     v->mutable_ = mut || (u & VK_IMAGE_USAGE_STORAGE_BIT);
     VkImageCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = v->type, .format = f, .extent = {v->w, v->h, v->d}, .mipLevels = v->levels,
         .arrayLayers = v->layers, .samples = v->samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -958,8 +982,14 @@ static vtex *vt_create(const tex_t *t) {
                                                            (u & VK_IMAGE_USAGE_STORAGE_BIT || mut ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0) |   // storage: viewed in the format a shader declares (gfx_vk_draw.inc storage_view); colour: a texture view's format
                                                            (v->type == VK_IMAGE_TYPE_3D && (u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0)};   // a 3D target is drawn a slice at a time through 2D views (gfx_vk_draw.inc rp_start)
     if (v->samples > 1) ic.mipLevels = 1;
+    if (v->fixed_fmt && mut) ic.pNext = &fli;
     if (vkCreateImage(g_vk.dev, &ic, NULL, &v->img) != VK_SUCCESS) { RED_ONCE(15, "vkCreateImage %ux%ux%u ×%u levels %u format %d failed", v->w, v->h, v->d, v->layers, v->levels, f); free(v); return NULL; }
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_vk.dev, v->img, &mr);
+    if ((u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && v->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !conv && v->w >= 256 && v->h >= 256 && v->levels == 1 && v->layers == 1 && v->d == 1 && v->samples == 1) {
+        // a compressed target needs room for its metadata beside the texels: the size says whether the driver kept UBWC (above)
+        static int n; uint64_t raw = (uint64_t)v->w * v->h * (uint64_t)fmt_bytes(f);
+        if (raw && n++ < 6) LOG("[vk] colour target %ux%u format %d%s: %.2f MB of memory for %.2f MB of texels", v->w, v->h, f, v->fixed_fmt ? " (format list)" : mut ? " (MUTABLE_FORMAT)" : "", mr.size / 1048576.0, raw / 1048576.0);
+    }
     // A phone shares its RAM with the GPU, and the replay makes every texture whole: Mario Kart World's terrain arrays (8192x8192x68, 5.8 GB in BC6H, 1.45 GB in ASTC 8x8), sparse in a
     // virtual pool on the Switch 2 with a fraction of their pages mapped, took the Ayn Odin 2's 11.5 GB until the low-memory killer ended the game, as each failed lookup made the image again.
     // An image over DM_VK_IMAGE_MAX_MB (1024 by default; 0: no limit), or one in a virtual pool over DM_VK_SPARSE_MAX_MB (256 by default: the console maps only part of such a texture, and
