@@ -1343,6 +1343,30 @@ static void *prewarm_thread(void *arg) {
 }
 static void prewarm_start(void) { static int started; if (started++) return; pthread_t th; if (!pthread_create(&th, NULL, prewarm_thread, NULL)) pthread_detach(th); }
 static VkDescriptorSetLayout g_empty_dsl;
+// Pipelines being built, for a crash dump (crash.c crash_set_gfx_hook): Brilliant Diamond on the Retroid Pocket 5 crashes in the Adreno 650 driver's shader compiler
+// (libllvm-qgl.so) while it builds its first pipelines (baselines problem 2), and nothing said which shaders. Each build takes a slot for its compile (graphics in pipe_make, which
+// the replay, the start-up list and the background builds call; compute in cpipe_get) and gives it back after; the dump prints every slot in use, the crashing thread's marked.
+// Shader keys are the translator's bundle keys (vshader key), the same as the pass dumps and the res.json files name
+enum { PB_MAX = 8 };
+static struct { _Atomic int tid; const char *sh[4]; char kind; uint8_t topo, ncolor, z; uint32_t miss; } g_pb[PB_MAX];
+static int pb_begin(char kind, const char *const sh[4], uint8_t topo, uint8_t ncolor, uint8_t z, uint32_t miss) {
+    int me = gettid();
+    for (int i = 0; i < PB_MAX; i++) { int none = 0;
+        if (atomic_compare_exchange_strong(&g_pb[i].tid, &none, -1)) {
+            for (int j = 0; j < 4; j++) g_pb[i].sh[j] = sh[j];
+            g_pb[i].kind = kind; g_pb[i].topo = topo; g_pb[i].ncolor = ncolor; g_pb[i].z = z; g_pb[i].miss = miss; atomic_store(&g_pb[i].tid, me); return i; } }
+    return -1;
+}
+static void pb_end(int i) { if (i >= 0) atomic_store(&g_pb[i].tid, 0); }
+static void pb_dump(void) {   // crash.c, on the crashing thread, after its backtrace
+    int me = gettid();
+    for (int i = 0; i < PB_MAX; i++) { int t = atomic_load(&g_pb[i].tid); if (t <= 0) continue;
+        char tn[32] = ""; char path[64]; snprintf(path, sizeof path, "/proc/self/task/%d/comm", t);
+        int fd = open(path, O_RDONLY); if (fd >= 0) { ssize_t n = read(fd, tn, sizeof tn - 1); close(fd); if (n > 0) tn[n - (tn[n - 1] == '\n')] = 0; }
+        fprintf(stderr, "[dm] pipeline being built%s: thread %d \"%s\", %s, shaders %s %s %s %s%s, topology %u, %u colour targets%s\n", t == me ? " by the crashing thread" : "", t, tn,
+                g_pb[i].kind == 'c' ? "compute" : "graphics", g_pb[i].sh[0] ? g_pb[i].sh[0] : "-", g_pb[i].sh[1] ? g_pb[i].sh[1] : "-", g_pb[i].sh[2] ? g_pb[i].sh[2] : "-",
+                g_pb[i].sh[3] ? g_pb[i].sh[3] : "-", g_pb[i].z ? " (vertex .z variant)" : "", g_pb[i].topo, g_pb[i].ncolor, g_pb[i].miss ? " (fragment variant without some inputs)" : ""); }
+}
 // The pipeline of key k into pp (its layout and pipeline). Under the replay's lock from pipe_get; the start-up list (prewarm_thread) calls it without the lock after pipe_prep,
 // so a compile there no longer holds the game's draws up (the driver's pipeline cache is internally synchronized)
 static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t *onva, VkPrimitiveTopology *otp) {
@@ -1412,7 +1436,11 @@ static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t
     VkGraphicsPipelineCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = ns, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
         .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb_, .pDynamicState = &dy, .layout = pp->pl, .renderPass = k->rp};
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    const char *pbk[4]; uint32_t miss = 0; for (int i = 0; i < 4; i++) { pbk[i] = k->sh[i] ? k->sh[i]->key : NULL;
+        if (k->sh[i] && k->sh[i]->stage == SH_PS) { const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; miss = pv ? k->sh[i]->io_in & ~pv->io_out : 0; } }
+    int pb = pb_begin('g', pbk, (uint8_t)tp, (uint8_t)k->ncolor, (uint8_t)(k->z != 0), miss);
     VkResult pr = vkCreateGraphicsPipelines(g_vk.dev, pcache(), 1, &pc, NULL, &pp->p);
+    pb_end(pb);
     atomic_fetch_add(&g_pso_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_pso_made, 1);
     *ons = ns; *onva = nva; *otp = tp;
     return pr;
@@ -2486,7 +2514,9 @@ static cpipe_t *cpipe_get(vshader *s) {
     if (vkCreatePipelineLayout(g_vk.dev, &lc, NULL, &cp->pl) != VK_SUCCESS) return NULL;
     VkComputePipelineCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = cp->pl,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = s->mod, .pName = "main"}};
+    const char *pbk[4] = {s->key, NULL, NULL, NULL}; int pb = pb_begin('c', pbk, 0, 0, 0, 0);
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); VkResult pr = vkCreateComputePipelines(g_vk.dev, pcache(), 1, &pc, NULL, &cp->p);
+    pb_end(pb);
     atomic_fetch_add(&g_cpso_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_cpso_made, 1);
     if (pr != VK_SUCCESS) { static int n; if (n++ < 16) LOG("[RED] [vk] compute pipeline of shader %s failed", s->key); cp->p = VK_NULL_HANDLE; return NULL; }
     if (vk_debug()) LOG("[vk] compute pipeline for shader %s", s->key);

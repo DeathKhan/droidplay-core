@@ -1731,6 +1731,14 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   the 11.6 MB one; the battles at 32.3 and 34.0 fps with frame p95 37.7 and 38.6 ms, against 16.8 to 29.7 fps and 73 to 81 ms in the baselines.
 - **Found on:** [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 5).
 
+### A crash in the driver's shader compiler names the pipelines being built
+
+- **Symptom:** Android only: a crash in the Vulkan driver's shader compiler (`libllvm-qgl.so` in the stack) while a game builds pipelines, and nothing in the log says which shaders, or on which thread.
+- **Cause:** the replay noted nothing while it built a pipeline, and the crash line did not name the crashing thread. Builds run on the replay thread and on the start-up list's (`vk-prewarm`), so the stack alone did not say which build it was.
+- **Fix:** every build takes one of eight slots for its compile (`pb_begin` / `pb_end` around `vkCreateGraphicsPipelines` in `pipe_make` and `vkCreateComputePipelines` in `cpipe_get`), with its shader keys, topology, colour target count and whether it takes the vertex `.z` or a fragment variant. The crash dump prints every slot in use after the backtrace (`[dm] pipeline being built by the crashing thread: …`), and the `CRASH` line ends with the thread's id and name (`crash.c`, through `crash_set_gfx_hook`). The keys are the translator's bundle keys, which name the shader's `spv/<key>.spv` and `res.json` in the build folder. From nx2android ([github.com/shirai91/nx2android](https://github.com/shirai91/nx2android), 3433389).
+- **Check:** a test build that crashed the 40th pipeline build on purpose, Super Mario Odyssey on an Ayn Odin 2: `[dm] CRASH sig=11 … thread 12790 "vk-prewarm"`, then `[dm] pipeline being built by the crashing thread: thread 12790 "vk-prewarm", graphics, shaders 384597a04ae3928e 12bd959fa3ef29ce - - (vertex .z variant), topology 3, 6 colour targets`.
+- **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) on a Retroid Pocket 5 ([Android baselines](../../dm/android/baselines.md), problem 2).
+
 ### Pipeline keys built from the state objects' fields
 
 - **Symptom:** new graphics pipelines made all through play, also in a level seen before (a few per frame, about 1 to 2 ms each on the Adreno); the start-up list of pipelines grew past 186,000 keys over a few sessions, and making it again took the fast cores for most of an hour.

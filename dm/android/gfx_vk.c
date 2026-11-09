@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include "dm.h"
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
@@ -41,6 +42,7 @@ static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one 
 // ---------------- The device ----------------
 static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
 static int g_fmt_list;   // VK_KHR_image_format_list enabled (vt_create)
+static void pb_dump(void);   // gfx_vk_draw.inc: the pipelines being built, for a crash dump
 static int g_stencil_export;   // VK_EXT_shader_stencil_export enabled: a fragment shader writes the stencil test's value (gfx_vk_dscopy.inc)
 static vkb_ctx g_vk; static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT; static int g_vk_ok;
 // Query resets (the chunks' query pools, "Query resets" below). DM_VK_QRESET_USED=0 (env.txt): every pool is reset whole in the command buffer at every chunk begin, as before
@@ -115,6 +117,7 @@ static void vk_create(void) {
     LOG("[vk] query resets: %s", g_qreset ? "on the host, the queries each chunk used, once read (VK_EXT_host_query_reset)" : qr_used() ? "in the command buffer, the queries the chunk used last time"
                                                                                                                                      : "in the command buffer, every pool at every chunk begin (DM_VK_QRESET_USED=0)");
     LOG("[vk] descriptor sets bound at once: %u, subgroup size / ops / stages: see vulkan probe", g_vk.props.limits.maxBoundDescriptorSets);
+    { void crash_set_gfx_hook(void (*)(void)); crash_set_gfx_hook(pb_dump); }   // a crash dump lists the pipelines being built (gfx_vk_draw.inc)
     LOG("[vk] %s (Vulkan %u.%u.%u): BC %s, ASTC %s", g_vk.props.deviceName, VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion),
         VK_API_VERSION_PATCH(g_vk.props.apiVersion), g_vk.has_bc ? "native" : "decoded on the CPU", g_vk.has_astc ? "native" : "missing");
     g_vk_ok = 1;
