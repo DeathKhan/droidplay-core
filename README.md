@@ -116,7 +116,19 @@ game keeps the first one in the app. Game files (code, shaders, RomFS, icon) liv
 
 ## The desktop app
 
-`python scripts/nxnative_android.py` opens a window that drives the packing script and adb for you:
+`uv run scripts/nxnative_android.py` opens a window that drives the packing script and adb for you ([uv](https://docs.astral.sh/uv/) brings Python and the
+modules the script names at its top; `python scripts/nxnative_android.py` works too, with them installed).
+
+**On Windows**, from nothing:
+
+1. Install uv, in PowerShell: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+2. Get droidnative: `git clone https://github.com/enjoyerofslop/droidnative` (or download it as a ZIP from GitHub and unpack it).
+3. In its folder: `uv run scripts\nxnative_android.py`
+4. In **Settings**, pick your `prod.keys`, then **Install what's missing**: it downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder
+   (`%LOCALAPPDATA%\nxnative\android\tools`), and Google's Android SDK with the NDK, CMake, build-tools, platform and platform-tools into Android Studio's place,
+   `%LOCALAPPDATA%\Android\Sdk` (about 1.5 GB to download, 5 GB installed). Installing the Android SDK means accepting its
+   [license](https://developer.android.com/studio/terms), which the app asks first; its usage metrics stay off. What the computer already has is kept.
+   From a console: `build_android_from_nsp.py --setup --accept-android-licenses`.
 
 - **Library:** the games you added (**+ Build game** picks a folder with a game's NSP files), each with its box art, version and status on the phone picked at the top.
   The big button does what comes next: **Build and install**, **Install on phone** (a game built before, without building again) or **Play**. **Manage** has the rest:
@@ -125,7 +137,7 @@ game keeps the first one in the app. Game files (code, shaders, RomFS, icon) liv
 - **Builds:** the running build's stages, progress and messages (the bar at the bottom of every page follows it); a build started from a console shows here too.
 - **Phones:** adb devices over USB and Wi-Fi (pair, connect, discover), the app version and the games on each phone, saves backed up to the computer.
 - **Performance:** the game's log from `adb logcat`, with the frame time, GPU and CPU figures the host prints, and a frame's GPU time per pass.
-- **Settings:** your `prod.keys`, and the requirements above with how to install what is missing.
+- **Settings:** your `prod.keys`, and the requirements above with how to install what is missing (on Windows, **Install what's missing** does it).
 
 A rebuild only does what changed: the extraction, the rewritten code and the translated shaders are reused when their inputs are the same, and the RomFS image is not
 copied to the phone again when the phone already holds the same one.
