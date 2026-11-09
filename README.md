@@ -115,7 +115,7 @@ game keeps the first one in the app. Game files (code, shaders, RomFS, icon) liv
 - **On the phone:** USB debugging (or wireless debugging) turned on, so that `adb devices` lists the phone, and room for the game: its RomFS is copied as one image
   (Danganronpa V3's is 6.7 GB).
 
-## <a id="the-desktop-app"></a>DroidPlay for Windows and Linux: the desktop app
+## The desktop app
 
 `python scripts/nxnative_android.py` opens a window that drives the packing script and adb for you:
 
