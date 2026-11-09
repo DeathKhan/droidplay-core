@@ -39,6 +39,13 @@ LANGUAGES = [('en-US', 'American English'), ('en-GB', 'British English'), ('ja',
              ('es', 'Spanish'), ('it', 'Italian'), ('nl', 'Dutch'), ('fr-CA', 'Canadian French'), ('pt', 'Portuguese'), ('ru', 'Russian'), ('ko', 'Korean'),
              ('zh-Hant', 'Traditional Chinese'), ('zh-Hans', 'Simplified Chinese'), ('pt-BR', 'Brazilian Portuguese')]
 NOWINDOW = 0x08000000 if os.name == 'nt' else 0   # CREATE_NO_WINDOW: no console flashing up for each adb call
+# The Python that builds and the script's --check and --info run on. On Windows the Start menu shortcut opens this app on pythonw.exe, which has no console, so
+# each console tool a build runs on it (java, dotnet, cmake, ninja, adb…) would open a window of its own, dozens in a build. The python.exe beside it, started from
+# this windowless app (QProcess, NOWINDOW), gets one hidden console that every tool shares, and their output still reaches the Builds page.
+def console_python():
+    exe = Path(sys.executable); con = exe.with_name('python.exe')
+    return str(con) if os.name == 'nt' and exe.name.lower() == 'pythonw.exe' and con.is_file() else sys.executable
+PYTHON = console_python()
 
 # ---- the palette: a dark room lit by the game's own colours; colour only where it means something ----
 INK = '#0b0b0c'          # the room
@@ -595,7 +602,7 @@ class BuildsPage(QWidget):
     def start(self, title, args, after=None):
         if self.busy() or self.ext: QMessageBox.warning(self, 'Busy', 'A build is running: wait for it or stop it'); return
         self.live = None; self.title = title; self.head.setText(title); self.sub.setText('starting…'); self.tree.clear(); self.items = {}; self.log.clear(); self.after = after; self.buf = ''
-        self.proc = QProcess(self); self.proc.setProgram(sys.executable); self.proc.setArguments([str(SCRIPT), *args, '--progress', 'json'])
+        self.proc = QProcess(self); self.proc.setProgram(PYTHON); self.proc.setArguments([str(SCRIPT), *args, '--progress', 'json'])
         bid = uuid.uuid4().hex; self.ids.add(bid)
         env = QProcessEnvironment.systemEnvironment(); env.insert('PYTHONUTF8', '1'); env.insert('PYTHONUNBUFFERED', '1'); env.insert('NXNATIVE_BUILD_ID', bid); self.proc.setProcessEnvironment(env)
         self.proc.setProcessChannelMode(QProcess.MergedChannels); self.proc.readyRead.connect(self.read); self.proc.finished.connect(self.finished)
@@ -893,7 +900,7 @@ class SettingsPage(QWidget):
         head = QHBoxLayout(); head.addWidget(label('Requirements', 'h2')); head.addStretch(); b = QPushButton('Check again'); b.setObjectName('ghost'); b.clicked.connect(lambda *_: self.run()); head.addWidget(b)
         self.setup = QPushButton("Install what's missing"); self.setup.clicked.connect(self.install); self.setup.hide(); head.addWidget(self.setup); self.rows = []
         lay.addLayout(head)
-        lay.addWidget(label(f'The build runs with {sys.executable}: install missing Python modules into it.', 'muted', wrap=True))
+        lay.addWidget(label(f'The build runs with {PYTHON}: install missing Python modules into it.', 'muted', wrap=True))
         self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(['', 'What', 'Detail / how to get it']); self.table.verticalHeader().hide(); self.table.setShowGrid(False)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch); self.table.setColumnWidth(0, 36); self.table.setColumnWidth(1, 220); self.table.setWordWrap(True)
         lay.addWidget(self.table, 1)
@@ -999,7 +1006,7 @@ class Window(QMainWindow):
     def stop_build(self): self.builds.stop()
     def keys(self): k = self.st.value('keys', '') or ''; return k if k and Path(k).is_file() else None
     def script_json(self, *args):
-        r = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=NOWINDOW, env=dict(os.environ, PYTHONUTF8='1'))
+        r = subprocess.run([PYTHON, str(SCRIPT), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=NOWINDOW, env=dict(os.environ, PYTHONUTF8='1'))
         if r.returncode: raise RuntimeError((r.stderr or r.stdout).strip()[-500:])
         return json.loads(r.stdout)
     def serial(self): return self.phone.currentData() or None
