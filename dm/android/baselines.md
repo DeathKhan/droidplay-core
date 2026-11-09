@@ -16,6 +16,10 @@ not a verdict: every known problem below that is not marked fixed is open.
 
 All three use 4 KB pages. The Odin 2 and the Retroid Pocket 5 have built-in controls; the Pad 3 shows the on-screen controls over the game.
 
+The RAM column is the device's installed capacity, not a measurement of how much memory a game uses. These baselines report frame rates and frame
+times, not per-game peak memory use or a matched memory-use comparison with an emulator. A result on the 8 GB Retroid Pocket 5 does not establish
+how the same game runs on a different 8 GB device.
+
 ## Results
 
 Frames per second over a 30 s window, then frame time p50 / p95 in ms, from two measured runs after a warm-up run (ranges where they differ). GPU is the
