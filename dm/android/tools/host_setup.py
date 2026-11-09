@@ -23,13 +23,15 @@ def arch(): return 'arm64' if platform.machine().lower() in ('arm64', 'aarch64')
 
 def add_tool_paths(tools, sdk=None):
     """The JDK and .NET SDK this module installed into tools first on PATH, for this process and what it runs: they are there because the computer had none
-    (or no .NET 10), so they win over an older one. The SDK's platform-tools go last, for adb, so a computer's own adb keeps its server."""
+    (or no .NET 10), so they win over an older one. JAVA_HOME follows the JDK put first, so sdkmanager and apksigner run the java that javac comes from, even where a
+    JAVA_HOME the computer has names a JDK that is gone or too old. The SDK's platform-tools are added last, for adb, only where PATH has no such entry yet: an order
+    the caller chose (nxplay puts ANDROID_HOME's first) stays, and so does a computer's own adb and its server."""
     path = [p for p in os.environ.get('PATH', '').split(os.pathsep) if p]
     first = []
-    if (tools / 'jdk' / 'bin').is_dir(): first.append(str(tools / 'jdk' / 'bin')); os.environ.setdefault('JAVA_HOME', str(tools / 'jdk'))
+    if (tools / 'jdk' / 'bin').is_dir(): first.append(str(tools / 'jdk' / 'bin')); os.environ['JAVA_HOME'] = str(tools / 'jdk')
     if (tools / 'dotnet').is_dir(): first.append(str(tools / 'dotnet')); os.environ['DOTNET_ROOT'] = str(tools / 'dotnet')
-    last = [str(sdk / 'platform-tools')] if sdk and (sdk / 'platform-tools').is_dir() else []
-    os.environ['PATH'] = os.pathsep.join(first + [p for p in path if p not in first and p not in last] + last)
+    last = [str(sdk / 'platform-tools')] if sdk and (sdk / 'platform-tools').is_dir() and str(sdk / 'platform-tools') not in path else []
+    os.environ['PATH'] = os.pathsep.join(first + [p for p in path if p not in first] + last)
     os.environ.setdefault('DOTNET_CLI_TELEMETRY_OPTOUT', '1'); os.environ.setdefault('DOTNET_NOLOGO', '1')   # dotnet build sends usage data unless told not to
 
 
@@ -111,6 +113,6 @@ def setup(missing, sdk, tools, packages, accept, prog, say):
         elif s == '.NET SDK 10': prog.end(str(install_dotnet(tools, work, prog)))
         elif s == 'Android command-line tools': install_cmdline_tools(sdk, work, prog); prog.end(str(sdk / 'cmdline-tools' / 'latest'))
         else: install_packages(sdk, pkgs, prog); prog.end(', '.join(p for p, _ in pkgs))
-        done.append(s)
+        done.append(s); add_tool_paths(tools, sdk)   # the next step runs what this one installed: sdkmanager needs the JDK that was just unpacked
     shutil.rmtree(work, ignore_errors=True)
     return done

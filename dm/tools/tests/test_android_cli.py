@@ -91,10 +91,26 @@ class Setup(unittest.TestCase):   # --setup (dm/android/tools/host_setup.py): wh
 
     def test_installed_tools_go_first_on_path_and_the_sdks_adb_last(self):   # they are there because the computer had none; its own adb keeps its server
         for d in ('tools/jdk/bin', 'tools/dotnet', 'sdk/platform-tools'): (self.tmp / d).mkdir(parents=True)
-        with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['/usr/bin', str(self.sdk / 'platform-tools')])}):
-            os.environ.pop('JAVA_HOME', None); self.hs.add_tool_paths(self.tools, self.sdk)
+        with mock.patch.dict(os.environ, {'PATH': '/usr/bin', 'JAVA_HOME': str(self.tmp / 'jdk-8-uninstalled')}):   # a JAVA_HOME left behind by an old JDK
+            self.hs.add_tool_paths(self.tools, self.sdk)
             self.assertEqual(os.environ['PATH'].split(os.pathsep), [str(self.tools / 'jdk/bin'), str(self.tools / 'dotnet'), '/usr/bin', str(self.sdk / 'platform-tools')])
             self.assertEqual(os.environ['JAVA_HOME'], str(self.tools / 'jdk')); self.assertEqual(os.environ['DOTNET_ROOT'], str(self.tools / 'dotnet'))
+
+    def test_platform_tools_already_on_path_keep_their_place(self):   # nxplay puts ANDROID_HOME's first, ahead of any other adb: that order stays
+        (self.sdk / 'platform-tools').mkdir(parents=True)
+        with mock.patch.dict(os.environ, {'PATH': os.pathsep.join([str(self.sdk / 'platform-tools'), '/opt/homebrew/bin', '/usr/bin'])}):
+            self.hs.add_tool_paths(self.tools, self.sdk)
+            self.assertEqual(os.environ['PATH'].split(os.pathsep), [str(self.sdk / 'platform-tools'), '/opt/homebrew/bin', '/usr/bin'])
+
+    def test_each_step_runs_with_what_the_steps_before_it_installed(self):   # sdkmanager needs the JDK unpacked a moment earlier, in the same run
+        seen = {}
+        def jdk(tools, work, prog): (tools / 'jdk/bin').mkdir(parents=True); return tools / 'jdk'
+        def packages(sdk, pkgs, prog): seen.update(path=os.environ['PATH'].split(os.pathsep), java=os.environ.get('JAVA_HOME'))
+        (self.sdk / 'cmdline-tools/latest/bin').mkdir(parents=True)
+        with mock.patch.dict(os.environ, {'PATH': '/usr/bin'}), mock.patch.object(self.hs, 'install_jdk', jdk), mock.patch.object(self.hs, 'install_packages', packages):
+            os.environ.pop('JAVA_HOME', None)
+            self.hs.setup({'JDK javac', 'NDK'}, self.sdk, self.tools, ba.sdk_packages(self.sdk), True, mock.Mock(), lambda m: None)
+        self.assertEqual(seen['path'][0], str(self.tools / 'jdk/bin')); self.assertEqual(seen['java'], str(self.tools / 'jdk'))
 
     def test_only_what_is_missing_is_installed(self):
         calls = []
