@@ -516,6 +516,9 @@ def migrate_legacy(serial, gid, nacp_local=None):
 def push_game(serial, gid, game, patched, spv, font, aoc, defaults, work, logs, meta):
     """The game's files → files/games/<gid>/ (the RomFS with --sync: a repeat copies only what changed)"""
     dst = f'{REMOTE}/games/{gid}'
+    # each device's copy logs, and the tar archives and RomFS pieces named after them, in a folder of its own: two installs at once (one per device) shared
+    # adb_push_spv.tar, and one's cleanup removed the archive the other was sending
+    logs = logs / f'push_{serial}'; logs.mkdir(parents=True, exist_ok=True)
     parts = ['the one-game install', 'font', 'code'] + ['shaders'] * bool(spv) + ['RomFS'] + ['DLC'] * aoc.is_dir() + ['launcher files', 'permissions']
     def part(name, step=None):   # the part in the step's name; the count is the part's files or bytes (counting), or the parts when it has none
         bi.PROG.set(step=f'{step or name} · part {parts.index(name) + 1} of {len(parts)}'); bi.PROG.set(done=parts.index(name), total=len(parts), unit='parts')
