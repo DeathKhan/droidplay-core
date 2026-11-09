@@ -28,7 +28,7 @@
 #      A one-game install of the same game (files/game, the layout before the launcher) is moved there instead of copied again, and its save is copied by the app
 # The picture comes from the Vulkan replay of NVN (dm/android/gfx_vk.c).
 # Needs: Python with lz4, capstone, fonttools and backports.zstd (not on Python 3.14), the .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (ANDROID_HOME or --sdk), adb, keytool (a JDK).
-import argparse, contextlib, datetime, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile
+import argparse, contextlib, datetime, functools, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -371,7 +371,11 @@ def adb(serial, *a, log=None, check=True):
     cmd = ['adb'] + (['-s', serial] if serial else []) + [str(x) for x in a]
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', env=dict(os.environ, MSYS_NO_PATHCONV='1'))
     if log: log.write_text(r.stdout + r.stderr)
-    if r.returncode and check: raise BuildError(f'{" ".join(cmd)} failed: {(r.stdout + r.stderr).strip()[-400:]}')
+    # the exit status too: a step that printed nothing left only "failed:" (droidplay-core issue #37), with no way to tell a missing program (127), adb losing the phone (255)
+    # and a command that failed (1)
+    if r.returncode and check:
+        out = (r.stdout + r.stderr).strip()
+        raise BuildError(f'{" ".join(cmd)} failed (exit status {r.returncode}): {out[-400:] if out else "no output"}')
     return r.stdout
 
 
@@ -388,6 +392,39 @@ def remote_files(serial, d):
 def remote_size(serial, f):
     n = adb(serial, 'shell', f'stat -c %s {sh_quote(f)} 2>/dev/null', check=False).strip()
     return int(n) if n.isdigit() else None
+
+
+# A phone that fills up in the middle of an install fails at whatever step comes next, often with nothing printed (droidplay-core issue #37: the folder script, after an install
+# that ran out of room). The large copies check the room first, and a failed install on a nearly full phone says how full it is
+ROOM_SPARE = 256 << 20   # left free besides a copy's own bytes: Android, the app's saves and its log need room too
+LOW_ROOM = 1 << 30       # a failed install on a phone with less than this free names the free space as the likely cause
+
+
+def size_text(n): return f'{n / 1e9:.1f} GB' if n >= 1e9 else f'{max(n, 0) / 1e6:.0f} MB'
+
+
+def remote_free(serial, d):   # bytes free on the phone's storage where folder d is, or None
+    row = adb(serial, 'shell', f'df -k {sh_quote(d)} 2>/dev/null | tail -n 1', check=False).split()
+    return int(row[3]) * 1024 if len(row) >= 4 and row[3].isdigit() else None
+
+
+def need_room(serial, d, need, what):
+    free = remote_free(serial, d)
+    if free is None or free >= need + ROOM_SPARE: return
+    raise BuildError(f'the phone has {size_text(free)} free: {what} needs {size_text(need)}, plus {size_text(ROOM_SPARE)} left free for Android and the app. '
+                     f'Free up {size_text(need + ROOM_SPARE - free)} on the phone, then install again')
+
+
+def says_when_phone_full(f):   # a failed step's error, plus the phone's free space when that is low (a full phone fails steps that print nothing)
+    @functools.wraps(f)
+    def run(serial, *a, **k):
+        try: return f(serial, *a, **k)
+        except BuildError as e:
+            free = remote_free(serial, REMOTE)
+            if free is None or free >= LOW_ROOM or 'free up' in str(e).lower(): raise
+            raise BuildError(f'{e}\nThe phone has only {size_text(free)} free, which is likely why: free up space on the phone '
+                             f'(a game\'s RomFS.img.partial is a copy cut short, kept so the next install goes on from it), then install again') from e
+    return run
 
 
 @contextlib.contextmanager
@@ -427,6 +464,7 @@ def push_tar(serial, local, parent, name, files, log, sync):
                 bi.PROG.set(done=i)
         remote = f'{parent}/.{name}.tar'
         try:
+            need_room(serial, dst, 2 * tar.stat().st_size, f'{name} ({len(send):,} files in one archive, unpacked beside itself)')
             with counting('sending', tar.stat().st_size, 'B', lambda: remote_size(serial, remote)):
                 adb(serial, 'push', tar, remote, log=log)
             have = len(rows) - len(send)   # the files kept from an earlier copy are counted by the phone too
@@ -469,6 +507,9 @@ def push_resumable(serial, local, remote, log):
         if theirs != [ours]: say(f'{remote}: the part on the phone ({have:,} bytes) differs from this file: sent again from the start'); have = 0
         else: say(f'{remote}: {have:,} of {size:,} bytes on the phone already: going on from there')
     if not have: adb(serial, 'shell', f': > {sh_quote(part)}')
+    if have < size:   # the part grows to the whole file, and each piece is on the phone twice for a moment (as itself, then appended)
+        folder, file = remote.rsplit('/', 1)
+        need_room(serial, folder, size - have + min(CHUNK, size - have), f'{file} ({size_text(size - have)} left to send)')
     piece, tmp = log.with_suffix('.piece'), remote + '.piece'
     with counting('sending', size, 'B', lambda: (lambda a, b: None if a is None else a + (b or 0))(remote_size(serial, part), remote_size(serial, tmp))):
         with open(local, 'rb') as f:
@@ -483,16 +524,25 @@ def push_resumable(serial, local, remote, log):
     adb(serial, 'shell', f'mv -f {sh_quote(part)} {sh_quote(remote)}')
 
 
+MKDIRS_DONE = 'nxnative_mkdirs_done'   # the last line push_dir's folder script prints
+
+
 def push_dir(serial, local, parent, name, log, sync=False):
     files = [f for f in local.rglob('*') if f.is_file()]
     if len(files) > TAR_FILES: return push_tar(serial, local, parent, name, files, log, sync)
     # <local folder> → <parent>/<name>: adb push copies a folder by its own name into the remote parent ("<folder>/." makes "/./" paths that adb cannot create
     # subfolders under on Windows); a folder named otherwise is pushed under its own name and renamed. adbd may not create folders under Android/data (its FUSE
     # mount refuses them: "secure_mkdirs() failed"), while the shell may: the whole tree is made first by a mkdir script run in the shell
+    need_room(serial, parent, sum(f.stat().st_size for f in files), name)
     dirs = [f'{parent}/{local.name}'] + [f'{parent}/{local.name}/{d.relative_to(local).as_posix()}' for d in sorted(local.rglob('*')) if d.is_dir()]
+    # set -e: the script's status was its last mkdir's, so one that failed in the middle went unnoticed until adb push stopped on the missing folder. The closing
+    # line is checked too: an adb without the shell protocol reports 0 whatever the command did, and an empty script succeeds
     script = log.with_suffix('.mkdirs.sh')
-    script.write_text(''.join(f'mkdir -p {sh_quote(d)}\n' for d in dirs), newline='\n')
-    adb(serial, 'push', script, '/data/local/tmp/nxnative_mkdirs.sh'); adb(serial, 'shell', 'sh', '/data/local/tmp/nxnative_mkdirs.sh')
+    script.write_text('set -e\n' + ''.join(f'mkdir -p {sh_quote(d)}\n' for d in dirs) + f'echo {MKDIRS_DONE}\n', newline='\n')
+    adb(serial, 'push', script, '/data/local/tmp/nxnative_mkdirs.sh')
+    out = adb(serial, 'shell', 'sh', '/data/local/tmp/nxnative_mkdirs.sh')
+    if MKDIRS_DONE not in out:
+        raise BuildError(f'the folders for {name} were not made on the phone: the folder script stopped early, ' + (f'printing {out.strip()[-300:]}' if out.strip() else 'printing nothing'))
     with counting('sending', len(files), 'files', lambda: remote_files(serial, dirs[0])):
         adb(serial, 'push', *(['--sync'] if sync else []), local, f'{parent}/', log=log)
     if local.name != name:
@@ -560,6 +610,7 @@ def migrate_legacy(serial, gid, nacp_local=None):
     return True
 
 
+@says_when_phone_full
 def push_game(serial, gid, game, patched, spv, font, aoc, defaults, work, logs, meta):
     """The game's files → files/games/<gid>/ (the RomFS with --sync: a repeat copies only what changed)"""
     dst = f'{REMOTE}/games/{gid}'
@@ -571,6 +622,9 @@ def push_game(serial, gid, game, patched, spv, font, aoc, defaults, work, logs, 
         bi.PROG.set(step=f'{step or name} · part {parts.index(name) + 1} of {len(parts)}'); bi.PROG.set(done=parts.index(name), total=len(parts), unit='parts')
     part('the one-game install', 'looking for the one-game install'); migrate_legacy(serial, gid, game / 'control.nacp')
     adb(serial, 'shell', 'rm', '-rf', f'{dst}/code', f'{dst}/font', f'{dst}/{patched.name}'); adb(serial, 'shell', 'mkdir', '-p', dst)
+    # an install cut short (the phone full, the cable out) can leave a folder's archive (push_tar) or a RomFS piece (push_resumable) behind: gigabytes that kept the
+    # phone full, and that no install reuses. RomFS.img.partial stays, as the next copy goes on from it
+    adb(serial, 'shell', f'rm -f {sh_quote(dst)}/.*.tar {sh_quote(dst + "/RomFS.img.piece")}', check=False)
     part('font'); push_dir(serial, font, dst, 'font', logs / 'adb_push_font.log')
     part('code'); push_dir(serial, patched, dst, 'code', logs / 'adb_push_code.log')
     if spv: part('shaders', 'shaders (only the changed files)'); push_dir(serial, spv, dst, 'spv', logs / 'adb_push_spv.log', sync=True)

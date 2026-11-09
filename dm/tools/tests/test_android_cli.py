@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Any
 import unittest
 from unittest import mock
 
@@ -218,12 +219,28 @@ class Journal(Base):
         self.assertEqual([e['done'] for e in evs if e['ev'] == 'progress' and e['name'] == 'one'][-1], 7)
 
 
+class AdbErrors(unittest.TestCase):
+    def test_a_failure_names_its_exit_status_even_with_no_output(self):
+        r = subprocess.CompletedProcess([], 1, stdout='', stderr='')
+        with mock.patch.object(ba.subprocess, 'run', return_value=r):
+            with self.assertRaisesRegex(ba.BuildError, r'adb -s S shell true failed \(exit status 1\): no output'): ba.adb('S', 'shell', 'true')
+        r = subprocess.CompletedProcess([], 255, stdout='', stderr="adb: device 'S' not found\n")
+        with mock.patch.object(ba.subprocess, 'run', return_value=r):
+            with self.assertRaisesRegex(ba.BuildError, r"failed \(exit status 255\): adb: device 'S' not found$"): ba.adb('S', 'shell', 'true')
+
+
 class Phone(Base):
     def setUp(self):
         super().setUp()
-        self.cmds = []; self.remote = {}   # remote path → exists
+        self.cmds = []; self.remote: dict[str, Any] = {}   # remote path → exists ('free': the phone's free KiB for df, 'mkdirs': what the folder script prints)
         def adb(serial, *a, log=None, check=True):
             c = [str(x) for x in a]; self.cmds.append(c)
+            if c[:2] == ['shell', 'sh'] and c[2].endswith('nxnative_mkdirs.sh'):
+                out = self.remote.get('mkdirs', ba.MKDIRS_DONE + '\n')
+                if isinstance(out, Exception): raise out
+                return out
+            if c[:1] == ['shell'] and len(c) == 2 and c[1].startswith('df -k '):
+                return f"/dev/fuse 233000000 120000000 {self.remote['free']} 51% /storage/emulated\n" if 'free' in self.remote else ''
             if c[:1] == ['shell'] and len(c) == 2 and c[1].startswith('[ -e '):
                 path = c[1].split("'")[1]; return 'yes\n' if self.remote.get(path) else ''
             if c[:1] == ['shell'] and len(c) == 2 and c[1].startswith('sha256sum '): return self.remote.get('sha', '') + '  x\n'
@@ -292,6 +309,7 @@ class Phone(Base):
                 b = files[q(m[1])][int(m[2]) * 4096:][:int(m[3]) * 4096][:int(m[4])]; return hashlib.sha256(b).hexdigest() + '  -\n'
             if m := re.fullmatch(r"cat (.+) >> (.+) && rm (.+)", cmd): files[q(m[2])] += files.pop(q(m[1])); return ''
             if m := re.fullmatch(r"mv -f (.+) (.+)", cmd): files[q(m[2])] = files.pop(q(m[1])); return ''
+            if cmd.startswith('df -k '): return ''   # free space not known: no check
             raise AssertionError(c)
         big = self.tmp / 'RomFS.img'; big.write_bytes(bytes(range(256)) * 9000)   # 2.2 MB, in 1 MB pieces
         with mock.patch.object(ba, 'adb', adb), mock.patch.object(ba, 'CHUNK', 1 << 20):
@@ -301,6 +319,43 @@ class Phone(Base):
         self.assertEqual(files['/r/RomFS.img'], big.read_bytes())
         self.assertEqual(len(sent), 3)   # the first piece once, then the two left
         self.assertTrue(any('going on from there' in s for s in self.said), self.said)
+
+    def test_folder_script_stops_at_the_first_failure_and_must_finish(self):   # droidplay-core issue #37: "nxnative_mkdirs.sh failed:" and nothing after it
+        self.push()
+        script = (self.tmp / 'logs' / 'push_S/adb_push_font.mkdirs.sh').read_text(encoding='utf-8').splitlines()
+        self.assertEqual(script[0], 'set -e'); self.assertEqual(script[-1], f'echo {ba.MKDIRS_DONE}')
+        self.cmds.clear(); self.remote['mkdirs'] = ''   # the script printed nothing and adb reported success
+        with self.assertRaisesRegex(ba.BuildError, 'folders for font were not made on the phone.*printing nothing'): self.push()
+        self.assertFalse(any(c[0] == 'push' and c[-1].endswith(f'{GID}/') for c in self.cmds), self.cmds)   # the folder is not sent into nothing
+
+    def test_a_failed_step_on_a_full_phone_says_so(self):
+        self.remote = {'mkdirs': ba.BuildError('adb -s S shell sh /data/local/tmp/nxnative_mkdirs.sh failed (exit status 1): no output'), 'free': 100 * 1024}
+        with mock.patch.object(ba, 'ROOM_SPARE', 0):   # the font fits: the step after it fails
+            with self.assertRaisesRegex(ba.BuildError, r'(?s)exit status 1.*only 105 MB free.*RomFS\.img\.partial'): self.push()
+            self.remote['free'] = 20 << 20   # 20 GB free: the error stays as it was
+            with self.assertRaises(ba.BuildError) as e: self.push()
+        self.assertNotIn('free', str(e.exception))
+        self.remote['free'] = 100 * 1024   # with the usual spare, 105 MB stops the install before anything is copied
+        with self.assertRaisesRegex(ba.BuildError, r'the phone has 105 MB free: font needs 0 MB, plus 268 MB left free for Android and the app\. Free up 164 MB'): self.push()
+
+    def test_a_copy_that_does_not_fit_stops_before_it_starts(self):
+        big = self.tmp / 'RomFS.img'; big.write_bytes(b'r' * 3_000_000)
+        self.remote = {'free': 1}
+        with mock.patch.object(ba, 'ROOM_SPARE', 1 << 20):
+            with self.assertRaisesRegex(ba.BuildError, r'the phone has 0 MB free: RomFS\.img \(3 MB left to send\) needs 6 MB, plus 1 MB left free for Android and the app\. Free up 7 MB'):
+                ba.push_resumable('S', big, f'{ba.REMOTE}/games/{GID}/RomFS.img', self.tmp / 'logs' / 'p.log')
+        self.assertFalse(any(c[0] == 'push' for c in self.cmds), self.cmds)
+        spv = self.tmp / 'spv'; spv.mkdir()
+        for i in range(ba.TAR_FILES + 1): (spv / f'{i:04}.spv').write_bytes(b'x' * 100)
+        with self.assertRaisesRegex(ba.BuildError, r'spv \(201 files in one archive, unpacked beside itself\) needs'):
+            ba.push_dir('S', spv, f'{ba.REMOTE}/games/{GID}', 'spv', self.tmp / 'logs' / 'p.log', sync=True)
+        self.assertFalse(any(c[0] == 'push' for c in self.cmds), self.cmds)
+        self.assertFalse((self.tmp / 'logs' / 'p.tar').exists())   # the archive made on this computer is removed too
+
+    def test_leftovers_of_a_copy_cut_short_are_removed(self):
+        flat = self.push(); dst = f'{ba.REMOTE}/games/{GID}'
+        self.assertIn(f"shell rm -f '{dst}'/.*.tar '{dst}/RomFS.img.piece'", flat)
+        self.assertFalse(any('rm' in c and 'RomFS.img.partial' in c for c in flat), flat)   # the next copy goes on from it
 
     def test_install_is_an_update(self):
         apk = self.tmp / 'a.apk'; apk.write_bytes(b'apk')
