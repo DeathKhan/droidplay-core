@@ -1,6 +1,8 @@
 # The desktop app of the Android port: pack your games for the nxnative app, install them on your phones and watch them run.
 #   uv run scripts/nxnative_android.py        (uv brings Python and the modules the block below names; or a Python that has them: pip install PySide6 lz4 capstone fonttools)
 # It drives scripts/build_android_from_nsp.py (its --progress json events, --info, --check, --push-only, --apk-only, --migrate) and adb:
+#   Get started  a new player's four steps (keys, tools, phone, first game), each with its state: where a first launch and the empty Library land; the top bar's
+#                "Setup 2 of 4" opens it while a step is left (dm/android/desktop/first_run.py works the steps out)
 #   Library      your games (the NSP folders you added): the picked one large, Play (on the phone picked at the top), its options and Manage; the collection below
 #   Builds       the running build: its stages, progress and messages (the bar at the bottom of every page follows it); a build started from a console
 #                shows here too, from the journal the script writes (<data>/builds/*.jsonl)
@@ -34,6 +36,8 @@ PKG = 'org.nxnative.android'
 REMOTE = f'/sdcard/Android/data/{PKG}/files'
 sys.path.insert(0, str(REPO / 'scripts'))
 import build_android_from_nsp as ba   # noqa: E402  (data_dir, library: the host library)
+sys.path.insert(0, str(REPO / 'dm' / 'android' / 'desktop'))
+import first_run as fr   # noqa: E402  # pyright: ignore[reportMissingImports]  (dm/android/desktop, put on the path here: the Get started checklist's steps, Qt-free so its tests run without PySide6)
 
 LANGUAGES = [('en-US', 'American English'), ('en-GB', 'British English'), ('ja', 'Japanese'), ('fr', 'French'), ('de', 'German'), ('es-419', 'Latin American Spanish'),
              ('es', 'Spanish'), ('it', 'Italian'), ('nl', 'Dutch'), ('fr-CA', 'Canadian French'), ('pt', 'Portuguese'), ('ru', 'Russian'), ('ko', 'Korean'),
@@ -125,6 +129,10 @@ QPushButton#round:hover {{ background: rgba(40,40,44,0.75); }}
 QToolButton#manage {{ background: transparent; border: none; font-size: 14px; font-weight: 600; padding: 8px 6px; }}
 QToolButton#manage:hover {{ color: white; }}
 QToolButton#manage::menu-indicator {{ image: none; }}
+QPushButton#next {{ background: {CREAM}; color: #121212; border: none; }}
+QPushButton#next:hover {{ background: #fff8e8; }}
+QPushButton#pill {{ background: rgba(245,184,46,0.12); border: 1px solid rgba(245,184,46,0.45); border-radius: 12px; color: {BUILD}; padding: 4px 14px; font-size: 13px; font-weight: 700; }}
+QPushButton#pill:hover {{ background: rgba(245,184,46,0.22); }}
 QPushButton#stop {{ background: transparent; border: 1px solid {BUILD}; color: {BUILD}; }}
 QPushButton#stop:hover {{ background: rgba(245,184,46,0.12); }}
 QPushButton#arrow {{ background: rgba(20,20,22,0.85); border: 1px solid rgba(255,255,255,0.16); border-radius: 22px; min-width: 44px; max-width: 44px; min-height: 44px; max-height: 44px; padding: 0; }}
@@ -196,7 +204,7 @@ def alive(pid):
 def journal_title(argv):   # what a build from the console does, from its command line
     if '--apk-only' in argv: return 'Update the app'
     if '--migrate' in argv: return 'Move the old install'
-    if '--setup' in argv: return 'Set up this computer'
+    if '--setup' in argv: return fr.SETUP_TITLE
     folder = next((x for x in argv if not x.startswith('-') and Path(x).is_dir()), None)
     name = None
     if folder:
@@ -256,9 +264,9 @@ class Game:
     def new_shaders(self, on_phone):   # run-time shaders the phone saved beyond the ones on this computer (a provisional profile's only: build_android_from_nsp.py pull_captures)
         return max(0, (on_phone.get(self.id) or {}).get('captures', 0) - self.captures) if self.provisional else 0
     def status(self, on_phone, phone):   # (text, colour, state): state picks what Play does
-        if self.info.get('needs_keys'): return 'Needs your prod.keys to read it: pick them in Settings', ERR, 'keys'
+        if self.info.get('needs_keys'): return 'Needs your prod.keys to read it: Get started, step 1', ERR, 'keys'
         # not the game's fault: the tools that read it aren't installed yet. It showed as unreadable, with a disabled "Not supported", to every new player
-        if self.info.get('needs_tools'): return "Install DroidPlay's tools to read it: Settings › Install what's missing", BUILD, 'tools'
+        if self.info.get('needs_tools'): return "Install DroidPlay's tools to read it: Get started, step 2", BUILD, 'tools'
         if self.error: return f'Could not read the folder: {self.error}', ERR, 'none'
         if not self.profile: return 'No profile: experimental build only', ERR, 'survey'
         x = 'Experimental (provisional profile, may not boot) · ' if self.provisional else ''   # an experimental build's profile, guessed from the survey
@@ -419,8 +427,10 @@ class LibraryPage(QWidget):
                 ids.add(g.id); self.games[f] = g
             self.render()
             if getattr(self, 'again', False): self.again = False; self.reload()
-        self.reading = True; bg(read, got)
+        self.reading = True; bg(read, got); self.win.setup_changed()   # the checklist's last step says it reads the game
+    def no_games(self): return not self.games and not getattr(self, 'reading', False)
     def render(self):
+        self.read_once = True
         while self.rl.count() > 1:
             w = self.rl.takeAt(0).widget()
             if w: w.deleteLater()
@@ -433,6 +443,8 @@ class LibraryPage(QWidget):
         keep = self.picked if self.picked in self.games else self.win.st.value('picked', None)
         g = self.games.get(keep) or (gs[0] if gs else None)
         self.pick(g); QTimer.singleShot(0, self.arrows)
+        if self.win.navs['library'].isChecked() and self.win.pages.currentWidget() is not (self.win.setup if self.no_games() else self): self.win.go('library')
+        self.win.setup_changed()
     def refresh_status(self):
         on, phone = self.win.phone_games, self.win.phone_name()
         for c in self.cards: t, col, _ = c.g.status(on, phone); c.set_status(t, col)
@@ -465,7 +477,7 @@ class LibraryPage(QWidget):
         if not g: return
         state = g.status(self.win.phone_games, self.win.phone_name())[2]
         s = self.win.serial()
-        if state in ('keys', 'tools'): self.win.go('settings'); return
+        if state in ('keys', 'tools'): self.win.go('setup'); return   # the checklist's step for it
         if state in ('play', 'install') and not s: self.win.toast('Connect a phone first (Phones)'); return
         if state == 'play':
             bg(lambda: adb_run(s, 'shell', 'am', 'start', '-n', f'{PKG}/.Launcher', '--es', 'game', g.id, '--ez', 'play', 'true'),
@@ -480,7 +492,7 @@ class LibraryPage(QWidget):
             if box.clickedButton() is go: self.run(g, ['--no-push'], 'Experimental build')
     def run(self, g, extra, what, after=None):
         keys = self.win.st.value('keys', '')
-        if not keys or not Path(keys).is_file(): self.win.toast('Pick your prod.keys in Settings first'); self.win.go('settings'); return
+        if not keys or not Path(keys).is_file(): self.win.toast('Pick your prod.keys first'); self.win.go('setup'); return
         args = [g.folder, '-k', keys, '-l', self.win.st.value(f'lang/{g.id}', 'en-US') or 'en-US']
         v = self.win.st.value(f'ver/{g.id}', '')
         if v: args += ['-p', v]
@@ -571,8 +583,10 @@ class LibraryPage(QWidget):
 # ---------------- Builds ----------------
 class BuildsPage(QWidget):
     progress = Signal(str, str, float, bool)   # title, detail, fraction (-1: unknown), running
+    event = Signal(str, object)   # title, a stage event as the script sent it: the checklist draws Install tools' one bar from --setup's
     def __init__(self, win):
         super().__init__(); self.win = win; self.setObjectName('page'); self.proc = None; self.after = None; self.items = {}; self.title = ''; self.buf = ''
+        self.last_red = self.last_line = ''   # what a failed build last said: the checklist shows it when Install tools stops
         self.ids = set(); self.ext = None   # this app's builds (their journals are skipped: their events come on stdout); the console build followed: {path, pid, pos}
         lay = QVBoxLayout(self); lay.setContentsMargins(48, 32, 48, 24); lay.setSpacing(16)
         self.head = label('Builds', 'h1'); lay.addWidget(self.head); self.sub = label('Nothing running. Builds start from the Library.', 'muted'); lay.addWidget(self.sub)
@@ -599,6 +613,7 @@ class BuildsPage(QWidget):
                 if first.get('id') in self.ids or '"ev": "exit"' in text or not alive(int(first.get('pid') or 0)): continue
                 self.ext = {'path': f, 'pid': int(first['pid']), 'pos': 0}; self.title = journal_title(first.get('argv') or [])
                 self.head.setText(self.title + '  ·  from the console'); self.sub.setText('following its journal'); self.tree.clear(); self.items = {}; self.log.clear(); self.buf = ''
+                self.last_red = self.last_line = ''
                 self.t0 = first.get('t') or time.time(); self.say('$ build_android_from_nsp.py ' + ' '.join(first.get('argv') or []), TEXT3)
                 self.progress.emit(self.title, 'running', -1, True); break
             if self.ext is None: return
@@ -622,6 +637,7 @@ class BuildsPage(QWidget):
     def start(self, title, args, after=None):
         if self.busy() or self.ext: QMessageBox.warning(self, 'Busy', 'A build is running: wait for it or stop it'); return
         self.live = None; self.title = title; self.head.setText(title); self.sub.setText('starting…'); self.tree.clear(); self.items = {}; self.log.clear(); self.after = after; self.buf = ''
+        self.last_red = self.last_line = ''
         self.proc = QProcess(self); self.proc.setProgram(PYTHON); self.proc.setArguments([str(SCRIPT), *args, '--progress', 'json'])
         bid = uuid.uuid4().hex; self.ids.add(bid)
         env = QProcessEnvironment.systemEnvironment(); env.insert('PYTHONUTF8', '1'); env.insert('PYTHONUNBUFFERED', '1'); env.insert('NXNATIVE_BUILD_ID', bid); self.proc.setProcessEnvironment(env)
@@ -629,7 +645,10 @@ class BuildsPage(QWidget):
         self.proc.start(); self.t0 = time.time(); self.say(f'$ python {SCRIPT.name} ' + ' '.join(args), TEXT3)
         self.progress.emit(title, 'starting…', -1, True)
     def say(self, text, color=None):
-        if color is None: color = ERR if '[RED]' in text else None
+        if color is None:
+            color = ERR if '[RED]' in text else None
+            if text.strip(): self.last_line = text.strip()
+            if '[RED]' in text: self.last_red = text.split('[RED]', 1)[1].strip()
         self.log.appendHtml(f'<span style="color:{color}">{esc(text)}</span>' if color else esc(text))
     def read(self):
         if not self.proc: return
@@ -645,6 +664,7 @@ class BuildsPage(QWidget):
         k = ev.get('ev')
         if k == 'say': self.say(ev.get('msg', '')); return
         if k not in ('stage', 'step', 'progress', 'stage_end'): return
+        self.event.emit(self.title, ev)
         key = ev.get('k'); it = self.items.get(key)
         if it is None:
             it = QTreeWidgetItem([f'{key}/{ev.get("n", "?")}   {ev.get("name", "")}', '', '', '']); self.tree.addTopLevelItem(it); self.items[key] = it
@@ -723,7 +743,7 @@ class KeepColour(QStyledItemDelegate):   # a selected row keeps its coloured tex
 
 
 STATES = {'device': 'connected', 'unauthorized': 'allow USB debugging on the phone', 'authorizing': 'allow USB debugging on the phone', 'offline': 'offline'}   # adb's words
-NO_ADB = "adb isn't installed, so DroidPlay can't see your phones. Settings › Install what's missing installs it with the Android SDK."
+NO_ADB = "adb isn't installed, so DroidPlay can't see your phones. It comes with the tools: Get started, step 2."
 NO_PHONE = 'No phone connected. Plug one in with USB debugging on (Developer options) and allow this computer when the phone asks, or pair one over Wi-Fi.'
 
 
@@ -947,9 +967,12 @@ class SettingsPage(QWidget):
         upd = QHBoxLayout(); upd.addWidget(label('Updates', 'meta')); self.update_line = label('', 'muted'); upd.addWidget(self.update_line, 1)
         self.update_btn = QPushButton('Check for updates'); self.update_btn.setObjectName('ghost'); self.update_btn.clicked.connect(self.update_clicked); upd.addWidget(self.update_btn)
         lay.addLayout(upd)
+        start = QHBoxLayout(); start.addWidget(label('Get started', 'meta')); self.start_line = label('', 'muted'); start.addWidget(self.start_line, 1)
+        b = QPushButton('Show the setup checklist'); b.setObjectName('ghost'); b.clicked.connect(lambda: win.go('setup')); start.addWidget(b); lay.addLayout(start)
         lay.addSpacing(8)
         head = QHBoxLayout(); head.addWidget(label('Requirements', 'h2')); head.addStretch(); b = QPushButton('Check again'); b.setObjectName('ghost'); b.clicked.connect(lambda *_: self.run()); head.addWidget(b)
         self.setup = QPushButton("Install what's missing"); self.setup.clicked.connect(self.install); self.setup.hide(); head.addWidget(self.setup); self.rows = []
+        self.checked = False   # --check has answered once: until then the checklist says it is looking, not that tools are missing
         lay.addLayout(head)
         self.summary = label('Checking what the build needs…', 'muted', wrap=True); lay.addWidget(self.summary)
         self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(['', 'What', 'Detail / how to get it']); self.table.verticalHeader().hide(); self.table.setShowGrid(False)
@@ -977,7 +1000,7 @@ class SettingsPage(QWidget):
         if f: self.keys.setText(f); self.set_keys(f)
     def set_keys(self, f):   # the library reads NSP and XCI games with the keys: read it again when they change
         if f == (self.win.st.value('keys', '') or ''): return
-        self.win.st.setValue('keys', f); self.win.library.reload()
+        self.win.st.setValue('keys', f); self.win.library.reload(); self.win.setup_changed()
     def run(self, then=None):
         def got(rows):
             failed = isinstance(rows, Exception)
@@ -997,12 +1020,13 @@ class SettingsPage(QWidget):
             n, it = len(missing), 'it' if len(missing) == 1 else 'them'
             self.summary.setText('Could not check what the build needs:' if failed else 'Everything the build needs is on this computer.' if not n else
                                  f"{n} missing: Install what's missing gets {it}." if len(fixes) == n else f'{n} missing: the rows below say how to get {it}.')
-            self.fit(); self.setup.setVisible(bool(fixes))
+            self.fit(); self.setup.setVisible(bool(fixes)); self.checked = True
             if then: then(rows)
+            self.win.setup_changed()
         bg(lambda: self.win.script_json('--check'), got)
     def installable(self):   # the failing rows --setup installs: Windows only so far, and not the Python modules (uv run brings those, or pip)
         return [r['name'] for r in self.rows if not r['ok'] and r['name'] != 'check' and not r['name'].startswith('Python')] if os.name == 'nt' else []
-    def install(self):   # build_android_from_nsp.py --setup, once the player has seen what it downloads and, for the Android SDK's parts, accepted Google's licence
+    def install(self, show_builds=True):   # build_android_from_nsp.py --setup, once the player has seen what it downloads and, for the Android SDK's parts, accepted Google's licence
         missing = self.installable()
         if not missing: return
         sdk_rows = set(ba.sdk_packages(Path('.'))) | {'Android SDK'}
@@ -1014,13 +1038,100 @@ class SettingsPage(QWidget):
         sdk = any(n in sdk_rows for n in missing)
         b = QMessageBox(QMessageBox.Question, "Install what's missing", 'Setup downloads and installs:\n\n• ' + '\n• '.join(parts) +
                         f'\n\nThe JDK and the .NET SDK go into {ba.data_dir() / "tools"}, for this app alone; the Android SDK goes where Android Studio keeps it.', QMessageBox.Cancel, self)
-        if sdk: b.setInformativeText('The Android SDK comes from Google: installing its parts means accepting the Android SDK License, '
-                                     'https://developer.android.com/studio/terms. Its usage metrics stay off.')
+        if sdk: b.setInformativeText(f'The Android SDK comes from Google: installing its parts means accepting the <a style="color:{READY}" '
+                                     'href="https://developer.android.com/studio/terms">Android SDK License</a>. Nothing is sent to Google about you: '
+                                     'the SDK\'s usage metrics stay off.')
         go = b.addButton('Accept and install' if sdk else 'Install', QMessageBox.AcceptRole); b.setDefaultButton(QMessageBox.Cancel); b.exec()
         if b.clickedButton() is not go: return
-        self.win.builds.start('Set up this computer', ['--setup'] + (['--accept-android-licenses'] if sdk else []),
+        self.win.builds.start(fr.SETUP_TITLE, ['--setup'] + (['--accept-android-licenses'] if sdk else []),
                               after=lambda: (ba.tool_paths(), self.run(), self.win.refresh_devices(), self.win.library.reload()))   # this app's PATH takes the new tools too (adb and dotnet), and the games are read again with them
-        self.win.go('builds')
+        if show_builds: self.win.go('builds')   # from the checklist, its card shows the one bar and the player stays on the next step
+
+
+# ---------------- Get started ----------------
+class StepCard(QFrame):   # one of the checklist's steps: its number (a ✓ once done), what it is and what to do, a bar while it works, its one button
+    COLOURS = {fr.TODO: TEXT3, fr.WORKING: BUILD, fr.WAITING: BUILD, fr.DONE: READY, fr.PROBLEM: ERR}
+
+    def __init__(self, n):
+        super().__init__(); self.n = n; self.setObjectName('card')
+        lay = QHBoxLayout(self); lay.setContentsMargins(22, 18, 22, 18); lay.setSpacing(18)
+        self.mark = QLabel(); self.mark.setFixedSize(32, 32); self.mark.setAlignment(Qt.AlignCenter); lay.addWidget(self.mark, 0, Qt.AlignTop)
+        col = QVBoxLayout(); col.setSpacing(6)
+        self.title = label(''); col.addWidget(self.title)
+        self.text = label('', 'meta', wrap=True); self.text.setTextFormat(Qt.RichText); col.addWidget(self.text)
+        self.bar = QProgressBar(); self.bar.setTextVisible(False); self.bar.hide(); col.addSpacing(2); col.addWidget(self.bar)
+        lay.addLayout(col, 1)
+        self.button = QPushButton(); self.button.setCursor(Qt.PointingHandCursor); self.button.setMinimumWidth(170); lay.addWidget(self.button, 0, Qt.AlignVCenter)
+
+    def show_step(self, s, first):   # first: the first step not done, whose button is the one to press now
+        c = self.COLOURS[s.state]; done = s.state == fr.DONE
+        self.mark.setText('✓' if done else '!' if s.state == fr.PROBLEM else str(self.n))
+        self.mark.setStyleSheet(f'border: 2px solid {c}; border-radius: 16px; font-size: 15px; font-weight: 800; ' + (f'background: {c}; color: {INK}' if done else f'color: {c}'))
+        self.title.setText(s.title); self.title.setStyleSheet(f'font-size: 17px; font-weight: 700; color: {TEXT2 if done else TEXT}')
+        self.text.setText(s.text)
+        self.bar.setVisible(s.fraction is not None); tint(self.bar, BUILD)
+        if s.fraction is not None:
+            if s.fraction < 0: self.bar.setRange(0, 0)
+            else: self.bar.setRange(0, 1000); self.bar.setValue(int(s.fraction * 1000))
+        self.button.setText(s.button); self.button.setVisible(bool(s.button))
+        name = 'next' if first and not done else 'ghost' if done else ''
+        if self.button.objectName() != name: self.button.setObjectName(name); self.button.style().unpolish(self.button); self.button.style().polish(self.button)
+        self.setStyleSheet(f'QFrame#card {{ border: 1px solid {"rgba(253,243,220,0.35)" if first and not done else LINE}; }}')
+
+
+class SetupPage(QWidget):   # Get started: keys, tools, phone, first game. Not in the nav row: a first launch with a step left, the empty Library and the top bar's pill open it
+    def __init__(self, win):
+        super().__init__(); self.win = win; self.setObjectName('page'); self.run = None; self.failed = None; self.steps = []
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); outer.addWidget(scroll)
+        inner = QWidget(); inner.setObjectName('page'); scroll.setWidget(inner)
+        lay = QVBoxLayout(inner); lay.setContentsMargins(48, 32, 48, 24); lay.setSpacing(14)
+        lay.addWidget(label('Get started', 'h1'))
+        intro = label(fr.INTRO, 'meta', wrap=True); intro.setTextFormat(Qt.RichText); intro.setMaximumWidth(860); lay.addWidget(intro); lay.addSpacing(8)
+        self.cards = {}
+        for i, key in enumerate(('keys', 'tools', 'phone', 'game'), 1):
+            c = StepCard(i); c.setMaximumWidth(1000); c.button.clicked.connect(lambda _=False, k=key: self.act(k)); lay.addWidget(c); self.cards[key] = c
+        self.foot = label('', 'muted', wrap=True); lay.addSpacing(4); lay.addWidget(self.foot); lay.addStretch(1)
+        win.builds.progress.connect(self.build_progress); win.builds.event.connect(self.build_event)
+
+    def build_progress(self, title, _detail, frac, running):   # --setup, started here, in Settings or from the console: the tools card follows it
+        if title != fr.SETUP_TITLE: return
+        if running and self.run is None: self.run = fr.SetupProgress(time.time()); self.failed = None
+        elif not running:
+            self.run = None; b = self.win.builds
+            self.failed = None if frac >= 0 else (b.last_red or b.last_line or 'see the Builds page for what happened')
+        self.refresh()
+    def build_event(self, title, ev):
+        if title == fr.SETUP_TITLE and self.run: self.run.feed(ev); self.refresh()
+
+    def compute(self):
+        w = self.win; lib = w.library
+        games = [{'folder': g.folder, 'name': g.name, 'state': g.status(w.phone_games, w.phone_name())[2], 'tested': g.tested, 'error': g.error} for g in lib.games.values()]
+        run = ('running', self.run.fraction(), self.run.text(time.time())) if self.run else ('failed', self.failed) if self.failed else None
+        return [fr.keys_step(w.st.value('keys', '') or ''), fr.tools_step(w.settings.rows if w.settings.checked else None, os.name == 'nt', run),
+                fr.phone_step(w.devs, w.adb, w.serial(), bool(w.st.value('serial', ''))), fr.game_step(lib.folders(), games, getattr(lib, 'reading', False))]
+    def refresh(self):   # → how many steps are done
+        if not hasattr(self.win, 'library'): return 0
+        self.steps = self.compute(); first = next((s.key for s in self.steps if not s.done), None)
+        for s in self.steps: self.cards[s.key].show_step(s, s.key == first)
+        n = fr.ready_count(self.steps)
+        self.foot.setText('All set: your game is in the Library.' if n == 4 else 'Settings › Show the setup checklist brings you back here.')
+        return n
+    def step(self, key): return next(s for s in self.steps if s.key == key)
+    def act(self, key):
+        s = next((s for s in self.steps if s.key == key), None)
+        if not s: return
+        w = self.win
+        if key == 'keys': w.settings.pick_keys()
+        elif key == 'tools':
+            if s.button == 'Look again': w.settings.run()
+            elif s.button == 'Open Settings': w.go('settings')
+            else: w.settings.install(show_builds=False)
+        elif key == 'phone': w.go('phones')
+        elif key == 'game':
+            g = w.library.games.get(s.ref)
+            if not g: w.add_game(); return
+            w.library.pick(g); w.go('library'); w.library.play()
 
 
 # ---------------- Updates ----------------
@@ -1075,11 +1186,13 @@ class Window(QMainWindow):
         # the top bar: the wordmark, the pages, the phone, search, + Build game
         top = QWidget(); top.setObjectName('topbar'); top.setAttribute(Qt.WA_StyledBackground, True); tl = QHBoxLayout(top); tl.setContentsMargins(28, 14, 28, 14); tl.setSpacing(6)
         tl.addWidget(label('DroidPlay', 'wordmark'))
-        self.navs = {}; group = QButtonGroup(self); group.setExclusive(True)
+        self.navs = {}; group = self.navgroup = QButtonGroup(self); group.setExclusive(True)
         for key, text, ic in (('library', 'Library', 'library'), ('builds', 'Builds', 'builds'), ('phones', 'Phones', 'phone'), ('perf', 'Performance', 'perf'), ('settings', 'Settings', 'settings')):
             b = QToolButton(); b.setObjectName('nav'); b.setText(f' {text}'); b.setIcon(icon(ic, TEXT2, 18)); b.setIconSize(QSize(18, 18)); b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
             b.setCheckable(True); b.setCursor(Qt.PointingHandCursor); b.clicked.connect(lambda _=False, k=key: self.go(k)); group.addButton(b); tl.addWidget(b); self.navs[key] = b
         tl.addStretch()
+        self.pill = QPushButton(); self.pill.setObjectName('pill'); self.pill.setCursor(Qt.PointingHandCursor); self.pill.setToolTip('The steps left before your first game')
+        self.pill.clicked.connect(lambda: self.go('setup')); self.pill.hide(); tl.addWidget(self.pill); tl.addSpacing(10)
         self.phone = QComboBox(); self.phone.setFixedWidth(250); self.phone.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon); self.phone.setMinimumContentsLength(18); self.phone.setToolTip('The phone builds install to'); self.phone.currentIndexChanged.connect(self.phone_changed)
         tl.addWidget(self.phone); tl.addSpacing(8)
         self.search = QLineEdit(); self.search.setPlaceholderText('Search your games'); self.search.setFixedWidth(220); self.search.hide()
@@ -1092,15 +1205,21 @@ class Window(QMainWindow):
         self.version = ba.core_version()   # the VERSION file a release carries (its installer's copy too), git describe in a checkout
         self.updatebar = UpdateBar(self); root.addWidget(self.updatebar)
         self.pages = QStackedWidget(); root.addWidget(self.pages, 1)
-        self.builds = BuildsPage(self); self.phones = PhonesPage(self); self.perf = PerformancePage(self); self.settings = SettingsPage(self); self.library = LibraryPage(self)
-        self.page_of = {'library': self.library, 'builds': self.builds, 'phones': self.phones, 'perf': self.perf, 'settings': self.settings}
+        self.builds = BuildsPage(self); self.phones = PhonesPage(self); self.perf = PerformancePage(self); self.settings = SettingsPage(self); self.setup = SetupPage(self)
+        self.library = LibraryPage(self)
+        self.page_of = {'library': self.library, 'builds': self.builds, 'phones': self.phones, 'perf': self.perf, 'settings': self.settings, 'setup': self.setup}
         for p in self.page_of.values(): self.pages.addWidget(p)
         self.buildbar = BuildBar(self); root.addWidget(self.buildbar); self.builds.progress.connect(self.buildbar.update_from)
         self.toastl = label('', wrap=True); self.toastl.setParent(central); self.toastl.setStyleSheet(f'background: {LIFT}; border: 1px solid {LINE}; border-radius: 10px; padding: 10px 16px; font-size: 13px')
         self.toastl.hide(); self.toast_t = QTimer(self); self.toast_t.setSingleShot(True); self.toast_t.timeout.connect(self.toastl.hide)
         self.go('library')
+        # a first launch, or one with a step left, lands on the checklist rather than the Library: at once for what is known now (keys, a game, a phone seen
+        # before), and for the tools once --check answers, unless the player has gone elsewhere meanwhile
+        self.setup_changed()
+        if self.pages.currentWidget() is not self.setup and (not self.setup.step('keys').done or self.library.no_games() or
+                                                             not self.setup.step('phone').done and not self.st.value('serial', '')): self.go('setup')
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_devices); self.timer.start(5000); self.refresh_devices()
-        self.settings.run(then=lambda rows: self.go('settings') if any(not r['ok'] for r in rows) else None)
+        self.settings.run(then=self.after_check)
         if os.name == 'nt': self.dark_title()
         self.settings.show_update(None)
         if uv_install() and not self.st.value('switch/later', ''): self.updatebar.show_switch()
@@ -1128,8 +1247,24 @@ class Window(QMainWindow):
         except Exception: pass
     def go(self, key):
         page = self.page_of.get(key, key) if isinstance(key, str) else key
+        nav = page   # the tab lit: the checklist has none of its own, but is the Library's while it has no game (adding one is its last step)
+        if page is self.library and self.library.no_games(): page = self.setup
         self.pages.setCurrentWidget(page)
-        for k, b in self.navs.items(): b.setChecked(self.page_of[k] is page); b.setIcon(icon({'library': 'library', 'builds': 'builds', 'phones': 'phone', 'perf': 'perf', 'settings': 'settings'}[k], TEXT if self.page_of[k] is page else TEXT2, 18))
+        self.navgroup.setExclusive(False)   # an exclusive group keeps one tab lit: the checklist, opened from the pill, lights none
+        for k, b in self.navs.items(): b.setChecked(self.page_of[k] is nav); b.setIcon(icon({'library': 'library', 'builds': 'builds', 'phones': 'phone', 'perf': 'perf', 'settings': 'settings'}[k], TEXT if self.page_of[k] is nav else TEXT2, 18))
+        self.navgroup.setExclusive(True)
+        if hasattr(self, 'pill'): self.show_pill()
+    def after_check(self, _rows):   # --check's first answer: a launch with the tools missing lands on the checklist too, unless the player has gone elsewhere meanwhile
+        self.setup_changed()
+        if self.pages.currentWidget() is self.library and not self.setup.step('tools').done: self.go('setup')
+    def setup_changed(self):   # keys, tools, phones or games changed: the checklist's steps, the pill and Settings' line again
+        if not hasattr(self, 'library') or not hasattr(self, 'pill'): return   # still making the pages
+        n = self.setup.refresh(); self.pill.setText(f'Setup {n} of 4')
+        self.settings.start_line.setText('All four steps are done.' if n == 4 else f'{n} of 4 steps done.'); self.show_pill()
+    def show_pill(self):   # while a step is left, but not over the checklist itself, and only once --check and the first read of the games have answered: until then
+        # their steps say they are looking, and a set-up player's every launch flashed "Setup 2 of 4"
+        n = fr.ready_count(self.setup.steps)
+        self.pill.setVisible(n < 4 and self.pages.currentWidget() is not self.setup and self.settings.checked and getattr(self.library, 'read_once', False))
     def toast(self, text):
         self.toastl.setText(text); self.toastl.setMaximumWidth(560); self.toastl.adjustSize()
         self.toastl.move(self.width() - self.toastl.width() - 28, 84); self.toastl.raise_(); self.toastl.show(); self.toast_t.start(5000)
@@ -1143,7 +1278,8 @@ class Window(QMainWindow):
         if not d: return
         fs = [f for f in (self.st.value('folders', []) or []) if f]
         if d not in fs: self.st.setValue('folders', fs + [d])
-        self.go('library'); self.library.reload(); self.toast('Reading the game… then Build and install puts it on your phone')
+        if self.pages.currentWidget() is not self.setup: self.go('library')   # the checklist says it reads the game, then what comes next
+        self.library.reload(); self.toast('Reading the game… then Build and install puts it on your phone')
     def stop_build(self): self.builds.stop()
     def keys(self): k = self.st.value('keys', '') or ''; return k if k and Path(k).is_file() else None
     def script_json(self, *args):
@@ -1213,10 +1349,10 @@ class Window(QMainWindow):
             self.phone.blockSignals(True); self.phone.clear()
             for d in r:
                 if d['state'] == 'device': self.phone.addItem(icon('phone', TEXT2, 16), f'{self.models[d["serial"]]}' + (f' · Android {d.get("android")}' if d.get('android') else ''), d['serial'])
-            if not self.phone.count(): self.phone.addItem(icon('phone', TEXT3, 16), 'No phone connected' if adb else 'adb not found: see Settings', None)
-            self.phone.setToolTip('The phone builds install to' if adb else "DroidPlay finds the phones with adb: Settings › Install what's missing installs it")
+            if not self.phone.count(): self.phone.addItem(icon('phone', TEXT3, 16), 'No phone connected' if adb else 'Install the tools to find phones', None)
+            self.phone.setToolTip('The phone builds install to' if adb else 'DroidPlay finds phones with adb, which comes with the tools: Get started, step 2')
             i = self.phone.findData(keep); self.phone.setCurrentIndex(i if i >= 0 else 0); self.phone.blockSignals(False)
-            self.phones.fill(r, adb); self.phone_changed(0)
+            self.phones.fill(r, adb); self.phone_changed(0); self.setup_changed()
         bg(look, got)
 
 

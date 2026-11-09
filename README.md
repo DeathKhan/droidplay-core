@@ -139,11 +139,17 @@ modules the script names at its top; `python scripts/nxnative_android.py` works 
      games, builds and settings. `Install DroidPlay.cmd uninstall` still removes such a copy by hand (`dm/android/windows/install_droidplay.cmd`).
    - Or from source: install [uv](https://docs.astral.sh/uv/) (`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`), get
      DroidPlay Core (`git clone https://github.com/enjoyerofslop/droidplay-core`) and, in its folder, `uv run scripts\nxnative_android.py`.
-2. In **Settings**, pick your `prod.keys`, then **Install what's missing**: it downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder
-   (`%LOCALAPPDATA%\nxnative\android\tools`), and Google's Android SDK with the NDK, CMake, build-tools, platform and platform-tools into Android Studio's place,
-   `%LOCALAPPDATA%\Android\Sdk` (about 1.5 GB to download, 5 GB installed). Installing the Android SDK means accepting its
-   [license](https://developer.android.com/studio/terms), which the app asks first; its usage metrics stay off. What the computer already has is kept.
-   From a console: `build_android_from_nsp.py --setup --accept-android-licenses`.
+2. DroidPlay opens on **Get started**: four steps, each saying what it needs and whether it's done. Setting up takes about half an hour the first time.
+   - **Your keys:** pick your `prod.keys`.
+   - **Tools for building:** **Install tools** downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder (`%LOCALAPPDATA%\nxnative\android\tools`),
+     and Google's Android SDK with the NDK, CMake, build-tools, platform and platform-tools into Android Studio's place, `%LOCALAPPDATA%\Android\Sdk` (about 1.5 GB
+     to download, 5 GB installed), with one bar and the time left. Installing the Android SDK means accepting its
+     [license](https://developer.android.com/studio/terms), which the app asks first; its usage metrics stay off. What the computer already has is kept.
+     From a console: `build_android_from_nsp.py --setup --accept-android-licenses`.
+   - **Your phone:** plug it in with USB debugging on; the step says when the phone is waiting for you to tap **Allow**.
+   - **Your first game:** add the folder with its NSP or XCI files, then **Build and install**.
+
+   Until all four are done, a launch opens on the checklist and the top bar's **Setup 2 of 4** opens it; **Settings › Show the setup checklist** does any time.
 
 - **Library:** the games you added (**+ Build game** picks a folder with a game's NSP files), each with its box art, version and status on the phone picked at the top.
   The big button does what comes next: **Build and install**, **Install on phone** (a game built before, without building again) or **Play**. **Manage** has the rest:
