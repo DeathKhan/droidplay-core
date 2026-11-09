@@ -1527,7 +1527,7 @@ static VkDescriptorSet ds_get(vshader *s, int tf) {
     g_ds_got++;
     if (!ds_recycle()) return ds_alloc(l);
     if (s->dsbig >> !!tf & 1) return VK_NULL_HANDLE;   // no pool holds one (RED 93)
-    if (!cur() || (!s->dsf && !(s->dsf = calloc(2 * NCHUNK, sizeof *s->dsf)))) return VK_NULL_HANDLE;
+    if (!cur() || (!s->dsf && !(s->dsf = calloc(2 * (size_t)g_nchunk, sizeof *s->dsf)))) return VK_NULL_HANDLE;
     ds_list *L = &s->dsf[2 * (C - g_ch) + !!tf];
     if (!L->used && !ds_room(&C->dt, C->ndt, &C->cdt)) return VK_NULL_HANDLE;   // the arrays grow before any set is made: a list holding sets is always in dl
     if (L->used < L->n) g_ds_reused++;

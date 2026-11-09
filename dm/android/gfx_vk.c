@@ -176,9 +176,17 @@ typedef struct chunk {
     VkDescriptorSet *dsc; int ndsc, cdsc, dsc_used;   // the depth-stencil copies' sets (gfx_vk_dscopy.inc dsc_set): made from its pools, handed out again once it completes
     ds_list **dl; int ndl, cdl; ds_list **dt; int ndt, cdt; int nds;   // recycled descriptor sets (gfx_vk_draw.inc ds_get): the lists holding sets, those handed out from in this recording, the sets held
 } chunk;
-enum { NCHUNK = 4 };
-static chunk g_ch[NCHUNK], *C;   // C: the chunk being recorded (NULL: none yet)
-static chunk *g_fifo[NCHUNK]; static int g_fifo_n;   // submitted, oldest first
+// Chunks in use (g_nchunk of NCHUNK_MAX): the one being recorded and those submitted, until the completion thread is done with them. With none free, cur() waits for the
+// oldest (the wait is in the GPU busy line: g_chunk_wait_ns). A submission is cut every 48-64 draws (EARLY_DRAWS, MID_DRAWS), so a game sends many a frame, and with four
+// the replay could not get far ahead of what had come back: Pokémon Brilliant Diamond on a Retroid Pocket 5 (Adreno 650, Turnip), about 18 chunks a frame, waited here 10-11 ms
+// of each 21 ms frame with the GPU busy 11 ms, at 47.6 fps. Six gave 52.5 fps, eight 53.3, sixteen 54.0; and Skyward Sword HD on an Odin 2 (Qualcomm's driver) held 60 fps
+// only with eight. Each chunk keeps the arena blocks and descriptor sets it has used: eight cost Brilliant Diamond 68 MB more, sixteen 202 MB.
+// DM_VK_CHUNKS=<2-16> (env.txt): another count (4: as before)
+enum { NCHUNK_MAX = 16, NCHUNK_DEF = 8 };
+static int g_nchunk = NCHUNK_DEF;   // set in chunks_init, before the first chunk is made
+static chunk g_ch[NCHUNK_MAX], *C;   // C: the chunk being recorded (NULL: none yet)
+static chunk *g_fifo[NCHUNK_MAX]; static int g_fifo_n;   // submitted, oldest first
+static _Atomic uint64_t g_chunk_wait_ns;   // the replay's time in cur() waiting for a free chunk
 static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop, g_inflight_fwd; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
 static void rp_end(void); static void views_drop(VkImage img); static void draw_chunk_reset(chunk *c); static void bf_reset(void); static int ds_recycle(void);   // gfx_vk_draw.inc
@@ -238,9 +246,11 @@ static int chunks_init(void) {
     static int ok = -1; if (ok >= 0) return ok;
     ok = 0; if (!vkb()) return 0;
     fgpu_on(); stg_pool_on(); lsnap_on(); wb_revert_on(); wb_absorb_on(); up_range_on(); ds_recycle();   // read before the completion thread starts (sp_done reads g_sp_on, draw_chunk_reset the recycling switch)
-    if (g_vk.props.limits.timestampComputeAndGraphics) { VkQueryPoolCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * NCHUNK};
-        if (vkCreateQueryPool(g_vk.dev, &qc, NULL, &g_tsq) != VK_SUCCESS) g_tsq = VK_NULL_HANDLE; else if (g_qreset) g_qreset(g_vk.dev, g_tsq, 0, 2 * NCHUNK); }
-    for (int i = 0; i < NCHUNK; i++) if (!chunk_make(&g_ch[i])) { LOG("[RED] [vk] command buffers could not be made"); return 0; }
+    { const char *e = getenv("DM_VK_CHUNKS"); int n = e ? atoi(e) : 0; if (n > 0) g_nchunk = n < 2 ? 2 : n > NCHUNK_MAX ? NCHUNK_MAX : n;
+      LOG("[vk] chunks in flight: up to %d%s", g_nchunk, g_nchunk != NCHUNK_DEF ? " (DM_VK_CHUNKS)" : ""); }
+    if (g_vk.props.limits.timestampComputeAndGraphics) { VkQueryPoolCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * (uint32_t)g_nchunk};
+        if (vkCreateQueryPool(g_vk.dev, &qc, NULL, &g_tsq) != VK_SUCCESS) g_tsq = VK_NULL_HANDLE; else if (g_qreset) g_qreset(g_vk.dev, g_tsq, 0, 2 * (uint32_t)g_nchunk); }
+    for (int i = 0; i < g_nchunk; i++) if (!chunk_make(&g_ch[i])) { LOG("[RED] [vk] command buffers could not be made"); return 0; }
     pthread_t th; if (pthread_create(&th, NULL, chunk_thread, NULL)) return 0;
     pthread_detach(th);
     return ok = 1;
@@ -249,7 +259,9 @@ static chunk *cur(void) {   // the chunk being recorded: a free one is taken (wa
     if (C) return C;
     if (!chunks_init()) return NULL;
     pthread_mutex_lock(&g_cmu);
-    for (;;) { for (int i = 0; i < NCHUNK && !C; i++) if (!g_ch[i].busy) C = &g_ch[i]; if (C) break; pthread_cond_wait(&g_ccv, &g_cmu); }
+    uint64_t t0 = 0;
+    for (;;) { for (int i = 0; i < g_nchunk && !C; i++) if (!g_ch[i].busy) C = &g_ch[i]; if (C) break; if (!t0) t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); pthread_cond_wait(&g_ccv, &g_cmu); }
+    if (t0) atomic_fetch_add(&g_chunk_wait_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0);
     C->busy = 1; C->seq = ++g_seq; C->nvn_fence = 0; C->ndraw = 0;
     pthread_mutex_unlock(&g_cmu);
     return C;
@@ -735,7 +747,7 @@ static void *chunk_thread(void *arg) {
         g_seq_done = c->seq;
         if (c->gtag) { fgpu_done(c->gf, busy); c->gtag = 0; }
         if (c->hold > c->seq) c->held = 1; else { c->busy = 0; c->hold = 0; }
-        for (int i = 0; i < NCHUNK; i++) if (g_ch[i].held && g_ch[i].hold <= g_seq_done) { g_ch[i].held = 0; g_ch[i].hold = 0; g_ch[i].busy = 0; }
+        for (int i = 0; i < g_nchunk; i++) if (g_ch[i].held && g_ch[i].hold <= g_seq_done) { g_ch[i].held = 0; g_ch[i].hold = 0; g_ch[i].busy = 0; }
         pthread_cond_broadcast(&g_ccv);
         pthread_mutex_unlock(&g_cmu);
         sp_trim();   // after the fence and g_seq_done: no sync waits for a trim's frees
@@ -1930,11 +1942,12 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     if (ext_check()) LOG("[vk] DM_VK_EXT_CHECK: %llu constant buffer bindings copied whole with NaN past their extents (cumulative)", (unsigned long long)g_ext_checked);
     LOG("[vk] support buffer: %llu stages wrote it, %llu left it unwritten (no module reads binding 0) (cumulative; gfx_vk_draw.inc stage_set)", (unsigned long long)g_sup_written, (unsigned long long)g_sup_skipped);
     if (g_ds_stats) { static unsigned long long f0; static uint64_t h0, r0, m0, k0; uint64_t h = g_ds_got, r = g_ds_reused, m = g_ds_made, k = g_ds_calls;   // DM_VK_SET_STATS=1
-        if (frame > f0) { double nf = (double)(frame - f0);
-            LOG("[vk] descriptor sets a frame over the last %llu frames: %.0f handed out, %.0f of them recycled; %.0f made in %.0f vkAllocateDescriptorSets calls; held by the chunks %d %d %d %d in %d %d %d %d pools, "
+        if (frame > f0) { double nf = (double)(frame - f0); char sets[16 * NCHUNK_MAX], pools[16 * NCHUNK_MAX]; size_t ns = 0, np = 0; sets[0] = pools[0] = 0;
+            for (int i = 0; i < g_nchunk; i++) { ns += (size_t)snprintf(sets + ns, sizeof sets - ns, i ? " %d" : "%d", g_ch[i].nds); np += (size_t)snprintf(pools + np, sizeof pools - np, i ? " %d" : "%d", g_ch[i].ndp); }
+            LOG("[vk] descriptor sets a frame over the last %llu frames: %.0f handed out, %.0f of them recycled; %.0f made in %.0f vkAllocateDescriptorSets calls; held by the chunks %s in %s pools, "
                 "%llu full pool resets, %llu of %llu stage_set calls did not write each descriptor of their layout, %llu draws, captures or dispatches taken again after a sync inside "
                 "stage_set closed their sets' chunk and %llu / %llu / %llu dropped when it closed again (cumulative; DM_VK_SET_RECYCLE=%d, gfx_vk_draw.inc ds_get, ds_moved)", frame - f0,
-                (double)(h - h0) / nf, (double)(r - r0) / nf, (double)(m - m0) / nf, (double)(k - k0) / nf, g_ch[0].nds, g_ch[1].nds, g_ch[2].nds, g_ch[3].nds, g_ch[0].ndp, g_ch[1].ndp, g_ch[2].ndp, g_ch[3].ndp,
+                (double)(h - h0) / nf, (double)(r - r0) / nf, (double)(m - m0) / nf, (double)(k - k0) / nf, sets, pools,
                 (unsigned long long)atomic_load(&g_ds_resets), (unsigned long long)g_ds_short, (unsigned long long)g_ds_checked, (unsigned long long)g_ds_again,
                 (unsigned long long)g_ds_lost[0], (unsigned long long)g_ds_lost[1], (unsigned long long)g_ds_lost[2], g_ds_on > 0); }
         f0 = frame; h0 = h; r0 = r; m0 = m; k0 = k; }
@@ -1952,9 +1965,10 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         (unsigned long long)g_tc_hit, (unsigned long long)g_tc_again, (unsigned long long)g_sc_hit, (unsigned long long)g_sc_made, (unsigned long long)g_vt_gen, tex_once());
     LOG("[vk] geometry kept on the GPU: %llu index / vertex bindings from kept copies, %llu copies kept (%llu MB now), %llu copied per draw (cumulative; gfx_vk_draw.inc gc_get)",
         (unsigned long long)g_gc_hit, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy);
-    { static unsigned long long f0; static uint64_t g0; uint64_t g = atomic_load(&g_gpu_ns);
-      if (frame > f0) LOG("[vk] GPU busy %.2f ms per frame over the last %llu frames (%llu command buffers in all)", (double)(g - g0) / 1e6 / (double)(frame - f0), frame - f0, (unsigned long long)atomic_load(&g_gpu_chunks));
-      f0 = frame; g0 = g; }
+    { static unsigned long long f0; static uint64_t g0, w0; uint64_t g = atomic_load(&g_gpu_ns), w = atomic_load(&g_chunk_wait_ns);
+      if (frame > f0) LOG("[vk] GPU busy %.2f ms per frame over the last %llu frames (%llu command buffers in all); the replay waited %.2f ms per frame for a free one of %d", (double)(g - g0) / 1e6 / (double)(frame - f0), frame - f0,
+                          (unsigned long long)atomic_load(&g_gpu_chunks), (double)(w - w0) / 1e6 / (double)(frame - f0), g_nchunk);
+      f0 = frame; g0 = g; w0 = w; }
     LOG("[vk] occlusion queries %llu, samples-passed reports %llu, timestamp reports %llu, queries reset on the host %llu / in command buffers %llu, graphics pipelines made %llu (%.0f ms), compute pipelines %llu (%.0f ms), shader modules %llu (%.0f ms) (cumulative)",
         (unsigned long long)g_q_queries, (unsigned long long)g_q_reports, (unsigned long long)g_ts_reports, (unsigned long long)atomic_load(&g_qr_host), (unsigned long long)g_qr_cmd,
         (unsigned long long)atomic_load(&g_pso_made), atomic_load(&g_pso_ns) / 1e6, (unsigned long long)atomic_load(&g_cpso_made), atomic_load(&g_cpso_ns) / 1e6, (unsigned long long)atomic_load(&g_mod_made), atomic_load(&g_mod_ns) / 1e6);
