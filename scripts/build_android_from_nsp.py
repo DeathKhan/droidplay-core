@@ -32,6 +32,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'scripts'))
+try: import fcntl  # noqa: F401
+except ImportError: sys.path.append(str(REPO / 'dm/android/tools/compat'))   # Windows: build_ipa_from_nsp.py loads tree_tar.py, which imports fcntl (compat/fcntl.py)
 import build_ipa_from_nsp as bi   # noqa: E402
 from build_ipa_from_nsp import BuildError, say   # noqa: E402
 
@@ -217,6 +219,13 @@ def clone(src, dst):   # an APFS clone where the volume can make one, else a har
     except OSError: shutil.copyfile(src, dst)
 
 
+def stage_link(dst, src):   # a symbolic link, else the files cloned (clone): Windows lets a process make symbolic links only with Developer Mode on, or as administrator
+    try: Path(dst).symlink_to(src, target_is_directory=Path(src).is_dir())
+    except OSError:
+        if Path(src).is_dir(): shutil.copytree(src, dst, copy_function=clone)
+        else: clone(src, dst)
+
+
 # A game app (--game-apk): the game in an app of its own, org.nxnative.game.t<title ID> with its name and icon, entered through dm/android/java GameStart with no launcher
 # (apk/AndroidManifest.game.xml). The APK carries the game's host and its files as push_game lays them out on the phone (assets/game/, unpacked by GameStart at the first
 # start), and the RomFS image as a stored entry when the APK stays under 2 GiB (build_apk.py: a ZIP without ZIP64). A bigger game's RomFS goes beside it, <name>.romfs,
@@ -244,9 +253,9 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, wor
     if not bi.rfs.is_image(rom): raise BuildError(f'a game app reads the RomFS as one image ({game}/RomFS.img), and this extraction has a RomFS folder: extract the game again')
     stage = work / 'game_app'; shutil.rmtree(stage, ignore_errors=True); stage.mkdir(parents=True)
     for name, src in (('code', patched), ('spv', spv), ('font', font), ('aoc', aoc)):
-        if src and Path(src).is_dir(): (stage / name).symlink_to(Path(src).resolve(), target_is_directory=True)
+        if src and Path(src).is_dir(): stage_link(stage / name, Path(src).resolve())
     for f in ('icon.jpg', 'control.nacp'):
-        if (game / f).is_file(): (stage / f).symlink_to((game / f).resolve())
+        if (game / f).is_file(): stage_link(stage / f, (game / f).resolve())
     (stage / 'defaults.txt').write_text(defaults, encoding='utf-8')
     (stage / 'game.json').write_text(json.dumps({**meta, 'package': pkg}, indent=1), encoding='utf-8')
     files = sorted(Path(r, f).relative_to(stage).as_posix() for r, _, fs in os.walk(stage, followlinks=True) for f in fs)

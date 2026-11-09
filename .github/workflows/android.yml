@@ -1,4 +1,5 @@
-# droidnative's own check: the Android host builds with the NDK, and the Android packing and RomFS image tests pass. nxnative's workflows that need its macOS
+# droidnative's own check: the Android host builds with the NDK, and the Android packing and RomFS image tests pass, on Linux and (but for the RomFS image
+# tests) on Windows, where the packing script and the desktop app run too. nxnative's workflows that need its macOS
 # runners with Xcode 27 (tests, lint-c) or its labels (issue-areas, pr-areas, triage-report) are switched off in this repository's Actions settings; their files
 # stay as nxnative has them, so merges from it do not conflict. Device tests stay manual: say what you ran on a device in the pull request (CONTRIBUTING.md).
 name: android
@@ -58,3 +59,42 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/cc" && ln -sf "$(command -v clang)" "$RUNNER_TEMP/cc/cc"
           PATH="$RUNNER_TEMP/cc:$PATH" python -m unittest -v test_android_cli test_romfs_image
+
+  # The same host build and packing tests on Windows. Python 3.15, whose UTF-8 mode is on by default: nxnative's scripts read and write text without naming UTF-8, which
+  # an older Python on Windows takes as the system's code page. test_romfs_image stays on Linux: it compiles C with cc and runs xattr and bash, which packing on
+  # Windows does not use. The runner is an administrator, so it makes symbolic links that a player's Windows refuses (test_android_cli's Windows tests cover those).
+  windows:
+    name: Android host build and packing tests (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.15'
+      - name: Python modules the packing script imports
+        run: python -m pip install lz4 capstone fonttools
+      - name: NDK and CMake
+        run: |
+          $sdk = "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat"
+          1..50 | ForEach-Object { 'y' } | & $sdk --licenses | Out-Null
+          & $sdk --install "ndk;$env:NDK_VERSION" "cmake;$env:CMAKE_VERSION" | Out-Null
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build the Android host (the game library, the command-line host and the loader)
+        run: |
+          $sdk = $env:ANDROID_HOME -replace '\\', '/'   # CMake takes forward slashes
+          $cm = "$sdk/cmake/$env:CMAKE_VERSION/bin"
+          $py = (Get-Command python).Source -replace '\\', '/'
+          & "$cm/cmake.exe" -G Ninja -S dm/android -B build "-DCMAKE_MAKE_PROGRAM=$cm/ninja.exe" `
+            "-DCMAKE_TOOLCHAIN_FILE=$sdk/ndk/$env:NDK_VERSION/build/cmake/android.toolchain.cmake" `
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 "-DGAME=$env:GAME" "-DPython3_EXECUTABLE=$py"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "$cm/ninja.exe" -C build dmhost_app dmhost_cli nxloader
+      - name: Packing tests
+        working-directory: dm/tools/tests
+        run: python -m unittest -v test_android_cli
