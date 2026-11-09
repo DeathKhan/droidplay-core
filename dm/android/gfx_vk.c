@@ -1282,6 +1282,15 @@ static void copy_t2b(const p_copy_b2t *c) {
     }
     cb_barrier();
 }
+static int fmt_int(VkFormat f) {   // an integer colour format (vk_of_mtl's): a blit cannot convert to or from one
+    switch (f) {
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: return 1;
+        default: return 0;
+    }
+}
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = vt_get(c->src), *d = vt_get(c->dst); if (!s || !d) return;
     unsigned sl, sz, dl, dz;
@@ -1294,8 +1303,13 @@ static void copy_t2t(const p_copy_t2t *c) {
                             .dstSubresource = {ad, dl, dz + c->dr.zoffset, 1}, .dstOffset = {c->dr.xoffset, c->dr.yoffset, 0}, .extent = {(uint32_t)c->dr.width, (uint32_t)c->dr.height, 1}};
         vkCmdResolveImage(cbuf, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r); cb_barrier(); return;
     }
+    // A colour copy between two float, normalized or sRGB formats converts, as NVN's copy and the Mac's draw do: it is a blit unless the formats are equal or both
+    // decode on the CPU from one compressed family (the same blocks, decoded alike). Unconverted formats all have conv 0 and px 0, so without the conv test Link's
+    // Awakening's R11G11B10F frame was copied into its RGBA8 window as raw bits, banding every colour. A blit cannot convert to or from an integer format, nor
+    // between depth formats, so those keep the raw copy
+    int blits = s->aspect == VK_IMAGE_ASPECT_COLOR_BIT && d->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !fmt_int(s->fmt) && !fmt_int(d->fmt);
     int same = c->sr.width == c->dr.width && c->sr.height == c->dr.height && ns == nd && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT))
-               && (s->fmt == d->fmt || (s->conv == d->conv && aspect_of(s->fmt) == aspect_of(d->fmt) && s->px == d->px));
+               && (s->fmt == d->fmt || (s->conv == d->conv && aspect_of(s->fmt) == aspect_of(d->fmt) && s->px == d->px && (s->conv != CONV_NONE || !blits)));
     int s3 = s->type == VK_IMAGE_TYPE_3D, d3 = d->type == VK_IMAGE_TYPE_3D;
     if (same && s->samples == d->samples) {
         VkImageCopy r = {.srcSubresource = {as, sl, s3 ? 0 : sz + c->sr.zoffset, s3 ? 1 : (uint32_t)ns}, .srcOffset = {c->sr.xoffset, c->sr.yoffset, s3 ? c->sr.zoffset : 0},

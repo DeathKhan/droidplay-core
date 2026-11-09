@@ -1571,6 +1571,18 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** `spv_android.py` `dyn_components` loads the whole vec4 and picks the component with `OpSelect` on the index (`ANDROID_CHAIN` 3). All 9,192 rewritten modules pass `spirv-val --target-env vulkan1.1`.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): vertex shader `16684efcf1fa7d8d` (every layout pane). Found with `DM_VK_DUMP` (every pass's targets written out) and the shader's disassembly.
 
+### Texture copies that change format convert on Vulkan
+
+- **Symptom:** a whole frame, a movie or HUD art in bands of saturated colour that cycle as brightness changes (contour rings), the shapes intact.
+- **Cause:** `copy_t2t` (`dm/android/gfx_vk.c`) made a raw `vkCmdCopyImage` of any same-size copy whose two textures had equal `conv` and `px`. Those fields describe
+  textures the replay decodes from BC on the CPU, and every other format has 0 in both, so a copy between any two uncompressed formats copied bits. Link's Awakening copies
+  its R11G11B10F frame into its RGBA8 window texture: the packed floats arrived as bytes. NVN's copy converts, as the Mac's `copy_t2t_draw` does.
+- **Fix:** a colour copy between two float, normalized or sRGB formats is a blit (which converts) unless the formats are equal or both decode from one compressed family.
+  Copies to or from an integer format, or between depth formats, stay raw: a blit cannot convert those.
+- **Check:** Link's Awakening on an Ayn Odin 2: the opening movie, the file select and the HUD in their colours; Super Mario Odyssey, Brilliant Diamond, Animal Crossing,
+  Smash and Skyward Sword HD unchanged (frame rates and pictures).
+- **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 8).
+
 ### Plain char is unsigned on Android
 
 - **Symptom:** sparkling noise on lit surfaces and bright broken lines inside soft shapes (clouds), wherever a signed normal map is sampled.
