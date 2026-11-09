@@ -840,7 +840,7 @@ static VkRenderPass rp_get(const rp_key *k) {
     nvn_hm_put(&g_rps, k, rp);
     return rp;
 }
-static struct { int active; VkRenderPass rp; rp_key key; uint32_t w, h; VkFramebuffer fb; vtex *cv[8]; uint32_t clv[8], cly[8];
+static struct { int active; VkRenderPass rp; rp_key key; uint32_t w, h; VkFramebuffer fb; vtex *cv[8], *dv; uint32_t clv[8], cly[8];
                 uint8_t *snap[8]; size_t snap_cap[8], snap_n[8]; uint8_t *snap_dst[8]; VkImage snap_img[8]; } P;   // snap: a linear target's guest bytes at rp_prepare (lsnap_take), until its write-back takes them
 static uint64_t g_passes;
 // DM_VK_DUMP=<frame>: every render pass of that frame (counted in presents from 1) has its colour targets copied out when it ends, written to
@@ -1055,12 +1055,14 @@ static void rp_end(void) {
     if (linwb_on()) for (int i = 0; i < 8; i++) if (P.cv[i]) lin_writeback(i);
     lsnap_drop_all();   // what no write-back took
 }
+// a pass's target: drawn into in this present, and in how many presents in a row (apipe_ok)
+static void rt_note(vtex *v) { uint64_t p = atomic_load(&g_presents) + 1; if (v->rt_last != p) { v->rt_runs = v->rt_last + 1 == p ? v->rt_runs + 1 : 1; v->rt_last = p; } }
 // the render pass of the bound render targets (R.rt): images, views and framebuffer, made before the draw's textures are resolved (that may record uploads, outside a pass)
 static int rp_prepare(void) {
     if (P.active) return 1;
     lsnap_drop_all();   // an earlier rp_prepare's that no pass used
     if (!R.has_rt) { RED_ONCE(83, "draw with no render target set"); return 0; }
-    memset(P.cv, 0, sizeof P.cv); memset(g_bcrt_pend, 0, sizeof g_bcrt_pend);
+    memset(P.cv, 0, sizeof P.cv); P.dv = NULL; memset(g_bcrt_pend, 0, sizeof g_bcrt_pend);
     rp_key k; memset(&k, 0, sizeof k); VkImageView views[9]; memset(views, 0, sizeof views); uint32_t nv = 0, w = UINT32_MAX, h = UINT32_MAX, layers = 1; k.samples = 1;
     k.ncolor = (uint32_t)(R.rt.n > 8 ? 8 : R.rt.n);
     for (uint32_t i = 0; i < k.ncolor; i++) {
@@ -1073,7 +1075,7 @@ static int rp_prepare(void) {
             VkCommandBuffer c = cb(); if (!c) continue;
             bcrt_copy(v, sh, lv, ly, 0);
             VkImageView iv = view_get(sh, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT, NULL); if (!iv) continue;
-            k.color[i] = sh->fmt; k.samples = sh->samples; views[nv++] = iv; P.cv[i] = sh; P.clv[i] = 0; P.cly[i] = 0;
+            k.color[i] = sh->fmt; k.samples = sh->samples; views[nv++] = iv; P.cv[i] = sh; P.clv[i] = 0; P.cly[i] = 0; rt_note(sh);
             g_bcrt_pend[i].base = v; g_bcrt_pend[i].sh = sh; g_bcrt_pend[i].lv = lv; g_bcrt_pend[i].ly = ly;
             if (sh->w < w) w = sh->w; if (sh->h < h) h = sh->h;
             continue;
@@ -1082,7 +1084,7 @@ static int rp_prepare(void) {
         // format the linear values were stored unencoded (the whole picture darker and more saturated; nvn_mtl.m found the same)
         g_view_fmt = cv ? view_format(v, cv) : VK_FORMAT_UNDEFINED; VkFormat af = g_view_fmt ? g_view_fmt : v->fmt;
         g_view_slice = 1; VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, 1, VK_IMAGE_ASPECT_COLOR_BIT, NULL); g_view_slice = 0; g_view_fmt = VK_FORMAT_UNDEFINED; if (!iv) continue;
-        k.color[i] = af; k.samples = v->samples; views[nv++] = iv; P.cv[i] = v; P.clv[i] = lv; P.cly[i] = ly;
+        k.color[i] = af; k.samples = v->samples; views[nv++] = iv; P.cv[i] = v; P.clv[i] = lv; P.cly[i] = ly; rt_note(v);
         lsnap_take((int)i, v, lv, ly);   // a linear target: its guest bytes now, which its write-back diffs against
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh;
     }
@@ -1092,7 +1094,7 @@ static int rp_prepare(void) {
             const view_t *dv = R.rt.has_dview ? &R.rt.dview : NULL;
             uint32_t lv = dv && dv->set_levels ? dv->base_level : 0, ly = dv && dv->set_layers ? dv->min_layer : 0;
             g_view_slice = 1; VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, 1, v->aspect, NULL); g_view_slice = 0;
-            if (iv) { k.depth = v->fmt; k.samples = v->samples; views[nv++] = iv; uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh; }
+            if (iv) { k.depth = v->fmt; k.samples = v->samples; views[nv++] = iv; P.dv = v; rt_note(v); uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh; }
         }
     }
     if (!nv || w == UINT32_MAX) { RED_ONCE(84, "render targets without an image"); lsnap_drop_all(); return 0; }
@@ -1453,9 +1455,61 @@ static void pipe_prep(const pipe_key *k) {   // under the lock: what pipe_make w
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &g_empty_dsl); }
     for (int i = 0; i < 4; i++) if (k->sh[i] && k->sh[i]->stage == SH_PS && !k->tf) pipe_ps_mod(k, k->sh[i]);
 }
+// ---------------- Pipelines met for the first time, built in the background ----------------
+// A pipeline met for the first time cost the driver's compile on the replay thread, which the game's frame waits for: 20 to 35 ms a graphics pipeline on an Adreno 830, and the
+// OnePlus Pad 3's driver builds them about six times slower than the Ayn Odin 2's (baselines problem 5: Smash battles of 100 to 370 ms frames while it met new ones).
+// nx2android (github.com/shirai91/nx2android, 0d0468d) builds such pipelines on two threads of their own and leaves the draw out until its pipeline exists, a few frames,
+// under the rule kept here: every target of the draw's pass was drawn into in this present and the two before (rt_runs >= 3), so the draw shows a few frames late on a target
+// the game draws every frame. A target drawn for the first time (an environment map made once at a scene's load) builds at once, as before: its one drawing would be lost
+// for good. So do a linear render target's (the CPU reads it back: Super Mario Odyssey's fog solver feeds what it reads into the next step) and transform feedback (later draws
+// read what it writes). The keys' shaders and pass are made under the replay's lock as pipe_get does (pipe_prep), the compile without it, as the start-up list does
+// (prewarm_thread). DM_VK_ASYNC_PIPE=0 (env.txt): every pipeline built at once, on the replay thread
+enum { APQ = 256 };
+#define APQ_PENDING ((uintptr_t)1)   // a queued pipeline's pl until its thread fills it in (or, the build failed, clears it): never a layout of its own
+typedef struct { pipe_key k; pipe_t *pp; } apq_t;
+static apq_t g_apq[APQ]; static unsigned g_apq_h, g_apq_t; static int g_apq_on;   // under g_apq_mu: the queue (head, tail), its threads started
+static pthread_mutex_t g_apq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_apq_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t g_apq_queued, g_apq_built, g_apq_failed, g_apq_left;   // under g_bk: pipelines queued, built, failed; draws left out waiting for one
+static void *apipe_thread(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk-apipe");
+    for (;;) {
+        pthread_mutex_lock(&g_apq_mu); while (g_apq_h == g_apq_t) pthread_cond_wait(&g_apq_cv, &g_apq_mu);
+        apq_t q = g_apq[g_apq_t % APQ]; g_apq_t++; pthread_mutex_unlock(&g_apq_mu);
+        pipe_t tmp; memset(&tmp, 0, sizeof tmp); uint32_t ns = 0, nva = 0; VkPrimitiveTopology tp = 0; uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        VkResult pr = pipe_make(&q.k, &tmp, &ns, &nva, &tp);
+        double ms = (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6;
+        pthread_mutex_lock(&g_bk);
+        if (pr == VK_SUCCESS) { *q.pp = tmp; pk_record(&q.k); pcache_made(); g_apq_built++; } else { q.pp->pl = VK_NULL_HANDLE; g_apq_failed++; }   // (failed: never made again, as at once)
+        uint64_t built = g_apq_built, queued = g_apq_queued, left = g_apq_left;
+        pthread_mutex_unlock(&g_bk);
+        if (pr != VK_SUCCESS) { static int n; if (n++ < 16) LOG("[RED] [vk] pipeline creation failed in the background: VkResult %d (shaders %s %s; %u stages, %u vertex attributes, %u colour targets, topology %d)",
+                                                                  pr, q.k.sh[0] ? q.k.sh[0]->key : "-", q.k.sh[1] ? q.k.sh[1]->key : "-", ns, nva, q.k.ncolor, (int)tp); }
+        else { static int n; if (n++ < 8 || built % 100 == 0) LOG("[vk] pipeline built in the background in %.1f ms (shaders %s %s): %llu built of %llu queued, %llu draws left out meanwhile (DM_VK_ASYNC_PIPE=0 builds at once)",
+                                                          ms, q.k.sh[0] ? q.k.sh[0]->key : "-", q.k.sh[1] ? q.k.sh[1]->key : "-", (unsigned long long)built, (unsigned long long)queued, (unsigned long long)left); }
+    }
+    return NULL;
+}
+static int apipe_ok(const pipe_key *k) {   // under g_bk, right after rp_prepare (P is the draw's pass): whether a new pipeline may be built in the background
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_ASYNC_PIPE"); on = !(e && *e == '0'); if (!on) LOG("[vk] DM_VK_ASYNC_PIPE=0: pipelines met for the first time are built at once, on the replay thread"); }
+    if (!on || k->tf) return 0;
+    int n = 0;
+    for (int i = 0; i < 8; i++) { const vtex *v = P.cv[i]; if (!v) continue; n++; if (v->rt_runs < 3 || (v->desc.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0; }
+    if (P.dv) { n++; if (P.dv->rt_runs < 3) return 0; }
+    return n > 0;
+}
+static int apipe_queue(const pipe_key *k, pipe_t *pp) {   // under g_bk: 1 = queued (pp stays without a pipeline until a thread has built it)
+    (void)pcache();   // made here, under the lock: pcache makes it on first use, which a build outside the lock must not race
+    pthread_mutex_lock(&g_apq_mu);
+    if (!g_apq_on) { g_apq_on = 1; for (int i = 0; i < 2; i++) { pthread_t th; if (!pthread_create(&th, NULL, apipe_thread, NULL)) pthread_detach(th); } }
+    int ok = g_apq_h - g_apq_t < APQ; if (ok) { g_apq[g_apq_h % APQ] = (apq_t){*k, pp}; g_apq_h++; pthread_cond_signal(&g_apq_cv); }
+    pthread_mutex_unlock(&g_apq_mu);
+    if (ok) g_apq_queued++;
+    return ok;
+}
 static pipe_t *pipe_get(const pipe_key *k) {
-    pipe_t *pp = nvn_hm_get(&g_pipes, k); if (pp) return pp->p ? pp : NULL;
+    pipe_t *pp = nvn_hm_get(&g_pipes, k); if (pp) { if (!pp->p && pp->pl == (VkPipelineLayout)APQ_PENDING) g_apq_left++; return pp->p ? pp : NULL; }
     pp = calloc(1, sizeof *pp); nvn_hm_put(&g_pipes, k, pp);
+    if (apipe_ok(k)) { pipe_prep(k); pp->pl = (VkPipelineLayout)APQ_PENDING; if (apipe_queue(k, pp)) { g_apq_left++; return NULL; } pp->pl = VK_NULL_HANDLE; }
     uint32_t ns, nva; VkPrimitiveTopology tp; VkResult pr = pipe_make(k, pp, &ns, &nva, &tp);
     if (pr == VK_SUCCESS) { pk_record(k); pcache_made(); }
     {   // which fields set a new pipeline apart from the last one with the same shaders and pass (the first 40): key churn
@@ -1555,7 +1609,7 @@ static VkDescriptorSet ds_get(vshader *s, int tf) {
     g_ds_got++;
     if (!ds_recycle()) return ds_alloc(l);
     if (s->dsbig >> !!tf & 1) return VK_NULL_HANDLE;   // no pool holds one (RED 93)
-    if (!cur() || (!s->dsf && !(s->dsf = calloc(2 * NCHUNK, sizeof *s->dsf)))) return VK_NULL_HANDLE;
+    if (!cur() || (!s->dsf && !(s->dsf = calloc(2 * (size_t)g_nchunk, sizeof *s->dsf)))) return VK_NULL_HANDLE;
     ds_list *L = &s->dsf[2 * (C - g_ch) + !!tf];
     if (!L->used && !ds_room(&C->dt, C->ndt, &C->cdt)) return VK_NULL_HANDLE;   // the arrays grow before any set is made: a list holding sets is always in dl
     if (L->used < L->n) g_ds_reused++;

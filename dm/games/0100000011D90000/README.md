@@ -60,8 +60,10 @@ Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform
 - [iOS layouts: portrait, a half-folded Duo, iPad windows](../../../docs/reference/rendering.md#ios-layouts-portrait-a-half-folded-duo-ipad-windows), from PR #683 (iPhone Duo).
 - [AudioOut stop releases pending buffers](../../../docs/reference/audio.md#stopping-an-audioout-releases-its-pending-buffers), reported on 1.0.0 in PR #190.
 - [Unity's integer target frame rate](../../../docs/reference/frame-rate.md#unitys-integer-target-frame-rate).
+- [Eight chunks in flight on Vulkan](../../../docs/reference/frame-rate.md#eight-chunks-in-flight-on-vulkan): Eterna City on a Retroid Pocket 5 with Turnip, 47.6 fps with four chunks, 53.3 with eight.
 - [A guest thread attached to the Java VM (Android)](../../../docs/reference/memory.md#a-guest-thread-attached-to-the-java-vm-android): the software keyboard's name entry.
 - [Storage buffer write-backs read from cached memory on Vulkan](../../../docs/reference/rendering.md#storage-buffer-write-backs-read-from-cached-memory-on-vulkan): Eterna City at 20 fps on Turnip, 60 fps after.
+- [Queued commands grown by doubling](../../../docs/reference/frame-rate.md#queued-commands-grown-by-doubling): Eterna City on a Retroid Pocket 5 with Turnip at 25 fps, 38.7 after.
 
 ## Open
 
