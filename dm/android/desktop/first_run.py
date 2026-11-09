@@ -6,7 +6,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import phone_guide   # this folder's: the phone's battery and free space
+
 TODO, WORKING, WAITING, DONE, PROBLEM = 'todo', 'working', 'waiting', 'done', 'problem'
+WARN = '#f5b82e'   # the app's amber, for a warning inside a done step's text
 SETUP_TITLE = 'Set up this computer'   # the Builds page's title for --setup, from the app or the console (its journal)
 
 INTRO = ('<b>Setting up takes about half an hour the first time:</b> the tools download once (1.5 GB), and the first build of a game takes about 10–20 minutes. '
@@ -100,8 +103,9 @@ def phone_step(devs, adb, picked=None, seen=False):
     if devs is None: return Step('phone', title, WORKING, 'Looking for your phone…')
     ready = sorted((d for d in devs if d['state'] == 'device'), key=lambda d: d['serial'] != picked)
     if ready:
-        d = ready[0]
-        return Step('phone', title, DONE, f'<b>{esc(phone_name(d) or d["serial"])}</b>' + (f' · Android {esc(d["android"])}' if d.get('android') else ''))
+        d = ready[0]; low = phone_guide.battery_warning(d)
+        return Step('phone', title, DONE, f'<b>{esc(phone_name(d) or d["serial"])}</b>' + (f' · Android {esc(d["android"])}' if d.get('android') else '') +
+                    phone_guide.readout(d) + (f'<br><span style="color:{WARN}">⚠ {esc(low)}</span>' if low else ''))
     for d in devs:   # adb lists a phone that hasn't allowed this PC with no model or name: "Your phone" then
         name = esc(phone_name(d) or 'Your phone')
         if d['state'] in ('unauthorized', 'authorizing'):

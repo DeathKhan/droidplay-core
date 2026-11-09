@@ -11,6 +11,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'dm/android/desktop'))
 import first_run as fr   # noqa: E402  # pyright: ignore[reportMissingImports]  (dm/android/desktop, put on the path above)
 import explain as ex   # noqa: E402  # pyright: ignore[reportMissingImports]
+import phone_guide as pg   # noqa: E402  # pyright: ignore[reportMissingImports]
 
 ROWS_OK = [{'name': n, 'ok': True, 'detail': '', 'fix': ''} for n in ('Python module lz4', '.NET SDK 10', 'Android SDK', 'NDK', 'CMake', 'build-tools 36.0.0',
                                                                        'platform android-35', 'adb', 'JDK keytool', 'JDK javac', 'signing key', 'game hosts')]
@@ -95,6 +96,14 @@ class Phone(unittest.TestCase):
     def test_one_set_up_before_stays_done_unplugged(self):   # the step can't come undone each time a phone is unplugged, or the checklist would return at every launch
         self.assertTrue(fr.phone_step([], True, seen=True).done)
         self.assertEqual(fr.phone_step([], True).state, fr.TODO)
+
+    def test_battery_and_free_space_on_its_line(self):
+        s = fr.phone_step([dict(self.S25, battery=64, charging=False, free=212 * 10**9)], True)
+        self.assertIn('212 GB free · battery 64%', s.text); self.assertNotIn('⚠', s.text)
+
+    def test_a_nearly_flat_phone_is_warned(self):   # the S25 Edge sat at 3-4% on the test PC's USB port
+        s = fr.phone_step([dict(self.S25, battery=4, charging=True)], True)
+        self.assertTrue(s.done); self.assertIn('⚠ Battery 4%', s.text); self.assertIn('wall charger', s.text)
 
     def test_the_picked_phone_first(self):
         pad = dict(self.S25, serial='PAD', name='OnePlus Pad 3')
@@ -248,6 +257,32 @@ class Report(unittest.TestCase):   # Copy report: one Discord message, home fold
 
     def test_forward_slashed_home_is_redacted_too(self):
         self.assertNotIn('andre', ex.full_report(self.INFO, 'C:/Users/andre/x.log failed', 'C:\\Users\\andre\\j.jsonl', 'C:\\Users\\andre'))
+
+
+
+class Guide(unittest.TestCase):   # PhoneGuide: the brand picked from what adb says, and the battery and space read in the same shell call
+    def test_brand_from_the_manufacturer(self):
+        for maker, model, want in (('samsung', 'SM-S937U1', 'samsung'), ('Google', 'Pixel 9', 'pixel'), ('Xiaomi', 'Redmi Note 10 Pro', 'xiaomi'),
+                                   ('OnePlus', 'OPD2415', 'oneplus'), ('AYN', 'Odin2', 'handheld'), ('Moorechip', 'Retroid Pocket 5', 'handheld'), ('motorola', 'edge', 'other')):
+            self.assertEqual(pg.brand_for(maker, model), want, maker)
+
+    def test_a_phone_waiting_for_allow_has_only_its_model(self):   # devices -l's: a Galaxy's model code still says Samsung
+        self.assertEqual(pg.brand_for('', 'SM_S937U1'), 'samsung'); self.assertEqual(pg.brand_for('', ''), 'other')
+
+    def test_every_brand_ends_with_plugging_in(self):
+        self.assertEqual({k for k, *_ in pg.BRANDS}, {'samsung', 'pixel', 'xiaomi', 'oneplus', 'handheld', 'other'})
+        self.assertTrue(all(steps[-1] == pg.PLUG for _, _, steps, _ in pg.BRANDS))
+
+    def test_battery_and_space_from_one_shell_call(self):   # a OnePlus Pad 3 on a Mac's USB port, as it printed them
+        text = ('  AC powered: false\n  USB powered: true\n  Wireless powered: false\n  Dock powered: false\n  status: 4\n  level: 80\n'
+                '/dev/fuse      233949316 153851140  79967104  66% /storage/emulated\n')
+        self.assertEqual(pg.parse_status(text), {'battery': 80, 'charging': False, 'free': 79967104 * 1024})
+        self.assertEqual(pg.parse_status(''), {})
+
+    def test_warning_below_20_percent(self):
+        self.assertEqual(pg.battery_warning({'battery': 20}), '')
+        self.assertIn('wall charger', pg.battery_warning({'battery': 12, 'charging': False}))
+        self.assertIn("it's charging", pg.battery_warning({'battery': 15, 'charging': True}))
 
 
 if __name__ == '__main__':
