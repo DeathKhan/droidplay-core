@@ -1,4 +1,4 @@
-# droidnative's own check: the Android host builds with the NDK, and the Android packing and RomFS image tests pass, on Linux and (but for the RomFS image
+# DroidPlay Core's own check: the Android host builds with the NDK, and the Android packing and RomFS image tests pass, on Linux and (but for the RomFS image
 # tests) on Windows, where the packing script and the desktop app run too. nxnative's workflows that need its macOS
 # runners with Xcode 27 (tests, lint-c) or its labels (issue-areas, pr-areas, triage-report) are switched off in this repository's Actions settings; their files
 # stay as nxnative has them, so merges from it do not conflict. Device tests stay manual: say what you ran on a device in the pull request (CONTRIBUTING.md).

@@ -1,7 +1,7 @@
 # Android baselines
 
-The first baselines of droidnative on more than one device: six Switch 1 games on three Snapdragon devices, run the same way on each with
-`scripts/bench_android.py` (the same save, scripted input and measuring window). The first four were measured 2026-11-08 on droidnative `main` at `f4f7abb3`
+The first baselines of DroidPlay Core (then droidnative) on more than one device: six Switch 1 games on three Snapdragon devices, run the same way on each with
+`scripts/bench_android.py` (the same save, scripted input and measuring window). The first four were measured 2026-11-08 on its `main` at `f4f7abb3`
 with PR #1 (the present's vsync sleep outside the submission lock) and PR #3 (the game window keeps the screen on); The Legend of Zelda: Link's Awakening
 and Skyward Sword HD the same evening on `main` at `ee18169a`. Each game was packed by `build_android_from_nsp.py`. They are a starting point for fixes,
 not a verdict: every known problem below that is not marked fixed is open.

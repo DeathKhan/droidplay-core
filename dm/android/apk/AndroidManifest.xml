@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- DroidPlay on Android (droidnative's launcher app; the package keeps nxnative's name): a launcher of the games on the phone and a NativeActivity that runs one. lib/arm64-v8a/ holds a host per game, libdmhost_<title ID>.so
+<!-- DroidPlay on Android (DroidPlay Core's launcher app; the package keeps nxnative's name): a launcher of the games on the phone and a NativeActivity that runs one. lib/arm64-v8a/ holds a host per game, libdmhost_<title ID>.so
      (dm/android/front_android.c), and libnxloader.so (dm/android/loader.c), which starts the one the launcher picked; the launcher, the touch controls and the text box
      are in classes.dex (dm/android/java) -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"

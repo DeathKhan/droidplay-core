@@ -2,17 +2,17 @@
 
 Issues and pull requests are welcome. This page says how a change gets in; what the code does and where things are is in [AGENTS.md](AGENTS.md) and [docs/development.md](docs/development.md).
 
-## droidnative
+## <a id="droidnative"></a>DroidPlay Core
 
-droidnative is nxnative with an Android port ([README](README.md#droidnative)). The rest of this page is nxnative's and holds here too; this section adds what is
+DroidPlay Core (droidnative until 2026-11-09) is nxnative with an Android port ([README](README.md#droidplay-core)). The rest of this page is nxnative's and holds here too; this section adds what is
 particular to the port.
 
 - **Where a change goes.** Android code lives in `dm/android`: the Vulkan replay of NVN (`gfx_vk.c`, `gfx_vk_draw.inc`), the front end and Java app, the Darwin
   stand-ins (`compat/`), the shader post-processing and packing tools (`tools/`), and `scripts/build_android_from_nsp.py`. A shared file (`dm/host`, `dm/gfx`,
   `scripts/build_ipa_from_nsp.py`) changes only through a small hook: a weak symbol, `#ifdef __ANDROID__` / `DM_ANDROID`, a function the replay implements. Every
   line changed there is a line that can conflict at the next merge from nxnative.
-- **A fix for the Mac or the iPhone** goes to [seedds/nxnative](https://github.com/seedds/nxnative) first and reaches droidnative with the next merge.
-- **Staying in step with nxnative.** Its `main` is merged into droidnative's `main` often (weekly or sooner: it moves fast), never rebased:
+- **A fix for the Mac or the iPhone** goes to [seedds/nxnative](https://github.com/seedds/nxnative) first and reaches DroidPlay Core with the next merge.
+- **Staying in step with nxnative.** Its `main` is merged into DroidPlay Core's `main` often (weekly or sooner: it moves fast), never rebased:
   `git remote add upstream https://github.com/seedds/nxnative.git`, `git fetch upstream`, `git merge upstream/main`. Conflicts are resolved keeping the Android
   behaviour, and what git cannot see is followed by hand: a new or changed NVN record (`dm/gfx/nvn/nvn_obj.h`) needs the Vulkan replay's handling (compare
   `nvn_mtl.m`), a new `mtl_*` function in the replay interface needs one in `gfx_vk.c` and `gfx_null.c`, and new host code with Apple-only calls needs a stand-in

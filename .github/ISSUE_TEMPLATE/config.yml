@@ -2,13 +2,13 @@ blank_issues_enabled: true
 contact_links:
   - name: Questions and help (Discord)
     url: https://discord.gg/4wNHX3uqSU
-    about: "The DroidPlay & droidnative Discord: #help when packing or playing goes wrong, #compatibility for how a game runs on your device. No games, keys, firmware or packed APKs."
+    about: "The DroidPlay Discord: #help when packing or playing goes wrong, #compatibility for how a game runs on your device. No games, keys, firmware or packed APKs."
   - name: DroidPlay, a Mac app that packs and installs games for Android
     url: https://github.com/enjoyerofslop/droidplay
-    about: Builds droidnative games from your library and installs them on an Android device over adb, or makes game apps. Problems with the app itself go there.
+    about: Builds DroidPlay Core games from your library and installs them on an Android device over adb, or makes game apps. Problems with the app itself go there.
   - name: Packing and playing on Android
-    url: https://github.com/enjoyerofslop/droidnative/blob/main/README.md
+    url: https://github.com/enjoyerofslop/droidplay-core/blob/main/README.md
     about: How to pack a game for Android (DroidPlay, the command line or the desktop app), game apps, where logs are, and what has been tested.
   - name: The Mac and iPhone side (nxnative)
     url: https://github.com/seedds/nxnative
-    about: A problem that also happens on the Mac or the iPhone belongs to nxnative, whose fixes reach droidnative when it is merged in.
+    about: A problem that also happens on the Mac or the iPhone belongs to nxnative, whose fixes reach DroidPlay Core when it is merged in.

@@ -1,4 +1,4 @@
-# What droidnative's Android packing needs on this computer, installed where scripts/build_android_from_nsp.py finds it: its --setup, and the desktop app's
+# What DroidPlay Core's Android packing needs on this computer, installed where scripts/build_android_from_nsp.py finds it: its --setup, and the desktop app's
 # Settings > Install what's missing. Windows only for now; on a Mac, DroidPlay's Setup installs the same with Homebrew.
 #   JDK 21        Microsoft's build (aka.ms), checked against its .sha256sum.txt                             into <data>/tools/jdk
 #   .NET SDK 10   the newest 10.0 SDK in Microsoft's release metadata, checked against its SHA-512             into <data>/tools/dotnet
@@ -10,7 +10,7 @@ import hashlib, json, os, platform, shutil, subprocess, urllib.request, xml.etre
 
 REPOSITORY = 'https://dl.google.com/android/repository/'
 DOTNET_RELEASES = 'https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json'
-AGENT = {'User-Agent': 'droidnative-setup'}
+AGENT = {'User-Agent': 'droidplay-core-setup'}
 WINDOWS = os.name == 'nt'
 NOWINDOW = 0x08000000 if WINDOWS else 0   # CREATE_NO_WINDOW: no console flashing up under the desktop app
 
