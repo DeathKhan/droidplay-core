@@ -6,6 +6,8 @@ if not "%code%"=="0" pause
 exit /b %code%
 #>
 # DroidPlay for Windows (DroidPlay Core's desktop app, scripts/nxnative_android.py): installs or updates it for this user, then opens it.
+# From 0.5.0 a release carries DroidPlay-Setup-<version>.exe, the installer that replaces this file: this file downloads it, checks it and runs it, and Setup
+# moves the DroidPlay this file installed over to its own. A release before 0.5.0, or a branch named in DROIDPLAY_REF, is installed as below, by uv.
 #   Install DroidPlay.cmd              the newest DroidPlay Core release, into %LOCALAPPDATA%\DroidPlay; run it again to update
 #   Install DroidPlay.cmd uninstall    removes that folder and the shortcuts; the games, the Android SDK and the tools the app installed stay
 #   DROIDPLAY_REF=<branch or tag>      installs that instead of the newest release (testing one before it is released)
@@ -65,6 +67,28 @@ if ($args -contains 'uninstall') {
 $rel = $null
 if ($env:DROIDPLAY_REF) { $ref = $env:DROIDPLAY_REF }
 else { $rel = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = $Ua }; $ref = $rel.tag_name }
+
+# the release's Setup, when it has one: into the temporary folder, not DroidPlay's, which Setup removes while it runs. Its window is the player's; with
+# DROIDPLAY_NO_LAUNCH (an install over SSH) it runs silently, and doesn't open DroidPlay at the end
+$setup = if ($rel) { @($rel.assets | Where-Object { $_.name -like 'DroidPlay-Setup-*.exe' })[0] } else { $null }
+if ($setup) {
+    $dl = Join-Path ([IO.Path]::GetTempPath()) $setup.name
+    Say "DroidPlay has an installer now: downloading $($setup.name) (about $([math]::Ceiling($setup.size / 1MB)) MB)"
+    Fetch $setup.browser_download_url $dl $setup.size
+    if ($setup.digest -match '^sha256:([0-9a-f]{64})$' -and (Get-FileHash -LiteralPath $dl -Algorithm SHA256).Hash -ne $Matches[1]) {
+        Remove-Item -LiteralPath $dl -Force; throw "$($setup.name) doesn't match the release's checksum, so it was deleted. Run Install DroidPlay.cmd again to download it again."
+    }
+    Say 'running it: it installs DroidPlay like any Windows app and removes the copy this file installed; your games, builds and settings stay'
+    $run = @{ FilePath = $dl; PassThru = $true; Wait = $true }   # no -ArgumentList unless there are arguments: PowerShell 5.1 refuses an empty one
+    if ($env:DROIDPLAY_NO_LAUNCH) { $run.ArgumentList = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') }
+    $p = Start-Process @run
+    if ($p.ExitCode -eq 2) { Say 'Setup was cancelled: nothing changed'; exit 0 }
+    if ($p.ExitCode) { throw "Setup stopped (exit $($p.ExitCode)): its window said why. Run Install DroidPlay.cmd again once that is sorted." }
+    Remove-Item -LiteralPath $dl -Force -ErrorAction SilentlyContinue
+    Say 'done: DroidPlay is in the Start menu and on the desktop, and in Settings > Apps. DroidPlay says when a newer release is out; this file is not needed any more.'
+    exit 0
+}
+
 $asset = $null
 if ($rel) {
     $xz = (Test-Path $Tar) -and [bool](& $Tar --version | Select-String liblzma)
