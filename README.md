@@ -155,6 +155,27 @@ copied to the phone again when the phone already holds the same one.
 - **Saves** stay in the app's internal storage (`saves/<title ID>`), so updating the app keeps them; the desktop app backs them up to the computer. The log is
   `Android/data/org.nxnative.android/files/log.txt` (also `adb logcat -s nxnative`).
 
+## Another Vulkan driver (Turnip)
+
+On a phone with an Adreno GPU, a game can run on a Vulkan driver you put on the phone instead of the system's, as in Switch emulators: usually a build of Mesa's
+open-source Turnip driver, such as [Mr. Purple's](https://github.com/MrPurple666/purple-turnip/releases). The app carries what loads it
+([libadrenotools](dm/third_party/libadrenotools/README.md)), so trying one needs no new build:
+
+1. Unzip the driver package (`turnip_mrpurple_T30-toasted.adpkg.zip`, say). It holds a `.so` (`vulkan.purple.so`) and a `meta.json` that names it.
+2. Copy the `.so` into `Android/data/org.nxnative.android/files/`, beside `env.txt`: `adb push vulkan.purple.so /sdcard/Android/data/org.nxnative.android/files/`.
+   A game app reads its own folder, `Android/data/org.nxnative.game.t<title ID>/files/`.
+3. Add `DM_VK_DRIVER=vulkan.purple.so` to `env.txt` there (a path relative to that folder, or an absolute one), then start the game.
+
+The app copies the driver into its internal storage at start, since Android loads no code from shared storage, and copies it again when the file changes. The log
+names the driver that runs: `[vk] driver: … (DM_VK_DRIVER, through libadrenotools), not the system's: PurpleVK-public Adreno (TM) 740 …`. A driver that can't run
+(a wrong path, a build for another GPU) gets one `[RED] [vk] DM_VK_DRIVER …` line saying why, and the game runs on the system's driver. Remove the line from `env.txt`
+(or start it with `#`) to go back. Each driver keeps its own pipeline cache, so the first start on a new driver compiles the game's pipelines again (it can take a
+minute to the first frame, and it stutters until they are built), and the system driver's cache is still there afterwards.
+
+Whether a driver helps depends on the game and the device. With Mr. Purple's T30, Super Mario Odyssey's opening runs at 60 fps on an Odin 2 (as on its own driver)
+and at 40 fps on a Retroid Pocket 5 (38 on its own); Pokémon Brilliant Diamond, which crashes on the Retroid Pocket 5's own driver, runs there on Turnip, but slowly
+(11 fps), and on an Odin 2 it drops from 60 fps to 20.
+
 ## Packing from the command line
 
 ```

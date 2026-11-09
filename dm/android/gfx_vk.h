@@ -3,7 +3,40 @@
 #include <pthread.h>
 #include <stdint.h>
 #define VK_USE_PLATFORM_ANDROID_KHR 1
+#define VK_NO_PROTOTYPES 1   // every vk* below is a pointer, filled from the driver vk_driver.c opens: the system's, or DM_VK_DRIVER's
 #include <vulkan/vulkan.h>
+
+// The Vulkan functions the replay and the front end call. GLOBAL: loaded before there is an instance; the others through it (vk_driver_instance)
+#define VKB_FNS_GLOBAL(X) X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties)
+#define VKB_FNS(X) \
+    X(vkAcquireNextImageKHR) X(vkAllocateCommandBuffers) X(vkAllocateDescriptorSets) X(vkAllocateMemory) X(vkBeginCommandBuffer) X(vkBindBufferMemory) \
+    X(vkBindImageMemory) X(vkCmdBeginQuery) X(vkCmdBeginRenderPass) X(vkCmdBindDescriptorSets) X(vkCmdBindIndexBuffer) X(vkCmdBindPipeline) \
+    X(vkCmdBindVertexBuffers) X(vkCmdBlitImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdCopyBufferToImage) \
+    X(vkCmdCopyImage) X(vkCmdCopyImageToBuffer) X(vkCmdDispatch) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdEndQuery) X(vkCmdEndRenderPass) \
+    X(vkCmdPipelineBarrier) X(vkCmdPushConstants) X(vkCmdResetQueryPool) X(vkCmdResolveImage) X(vkCmdSetBlendConstants) X(vkCmdSetDepthBias) \
+    X(vkCmdSetScissor) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilReference) X(vkCmdSetStencilWriteMask) X(vkCmdSetViewport) X(vkCmdWriteTimestamp) \
+    X(vkCreateAndroidSurfaceKHR) X(vkCreateBuffer) X(vkCreateBufferView) X(vkCreateCommandPool) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) \
+    X(vkCreateDescriptorSetLayout) X(vkCreateDevice) X(vkCreateFence) X(vkCreateFramebuffer) X(vkCreateGraphicsPipelines) X(vkCreateImage) \
+    X(vkCreateImageView) X(vkCreatePipelineCache) X(vkCreatePipelineLayout) X(vkCreateQueryPool) X(vkCreateRenderPass) X(vkCreateSampler) \
+    X(vkCreateSemaphore) X(vkCreateShaderModule) X(vkCreateSwapchainKHR) X(vkDestroyBuffer) X(vkDestroyBufferView) X(vkDestroyFramebuffer) \
+    X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyPipeline) X(vkDestroyPipelineLayout) X(vkDestroySurfaceKHR) X(vkDestroySwapchainKHR) \
+    X(vkDeviceWaitIdle) X(vkEndCommandBuffer) X(vkEnumerateDeviceExtensionProperties) X(vkEnumeratePhysicalDevices) X(vkFreeMemory) \
+    X(vkGetBufferMemoryRequirements) X(vkGetDeviceProcAddr) X(vkGetDeviceQueue) X(vkGetImageMemoryRequirements) X(vkGetPhysicalDeviceFeatures) \
+    X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceProperties) \
+    X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
+    X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPipelineCacheData) X(vkGetQueryPoolResults) X(vkGetSwapchainImagesKHR) X(vkMapMemory) X(vkQueuePresentKHR) \
+    X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkResetCommandPool) X(vkResetDescriptorPool) X(vkResetFences) X(vkUnmapMemory) X(vkUpdateDescriptorSets) \
+    X(vkWaitForFences)
+#define VKB_DECL(f) extern __attribute__((visibility("hidden"))) PFN_##f f;
+VKB_FNS_GLOBAL(VKB_DECL) VKB_FNS(VKB_DECL)
+#undef VKB_DECL
+// vk_driver.c. vk_driver_dirs (the front end, before the device is made): DM_VK_DRIVER is looked for relative to ext, the folder env.txt is in, and copied into internal.
+// vk_driver_load: the driver opened and the GLOBAL functions loaded (0: no Vulkan); vk_driver_instance: the others, once the instance is made.
+// vk_driver_name: the DM_VK_DRIVER file running (its name), NULL on the system's driver
+void vk_driver_dirs(const char *ext, const char *internal);
+int vk_driver_load(void);
+void vk_driver_instance(VkInstance inst);
+const char *vk_driver_name(void);
 
 typedef struct {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qf;

@@ -167,6 +167,25 @@ class Library(Base):
         self.assertEqual([cmd[i + 1] for i, c in enumerate(cmd) if c == '--so'], [str(self.tmp / 'data/hosts' / g / f'libdmhost_{g}.so') for g in sorted([GID, '0100A6301214E000'])])
         self.assertIn('--loader', cmd)
 
+    def test_vk_driver_libs_in_both_kinds_of_app(self):   # DM_VK_DRIVER's libadrenotools and hooks, built beside the loader, go into the app and into a game app
+        b = self.tmp / 'build'; b.mkdir()
+        so = b / f'libdmhost_{GID}.so'; so.write_bytes(b'host'); loader = b / 'libnxloader.so'; loader.write_bytes(b'loader')
+        for n in ba.VK_DRIVER_LIBS: (b / n).write_bytes(n.encode())
+        st = self.tmp / 'st'; st.mkdir(); (st / 'main.patched.bin').write_bytes(b'x')
+        ba.library_add(GID, so, loader, st, {'name': GID})
+        ran = []
+        with mock.patch.object(ba.bi, 'run', lambda cmd, log, env=None: ran.append([str(c) for c in cmd])):
+            ba.make_apk(Path('sdk'), self.tmp, {})
+        libs = lambda cmd: [Path(cmd[i + 1]).name for i, c in enumerate(cmd) if c == '--lib']
+        self.assertEqual(libs(ran[0]), list(ba.VK_DRIVER_LIBS))
+        self.assertTrue(all((self.tmp / 'data/loader' / n).is_file() for n in ba.VK_DRIVER_LIBS))
+        self.assertEqual(ba.driver_libs(b), [b / n for n in ba.VK_DRIVER_LIBS])   # make_game_app's: beside the host it packs
+        (self.tmp / 'data/loader/libhook_impl.so').unlink()   # a library from before: its APK goes without the missing one
+        ran.clear()
+        with mock.patch.object(ba.bi, 'run', lambda cmd, log, env=None: ran.append([str(c) for c in cmd])):
+            ba.make_apk(Path('sdk'), self.tmp, {})
+        self.assertEqual(libs(ran[0]), ['libadrenotools.so', 'libmain_hook.so'])
+
     def test_no_host_no_apk(self):
         with self.assertRaises(ba.BuildError): ba.make_apk(Path('sdk'), self.tmp, {})
 
