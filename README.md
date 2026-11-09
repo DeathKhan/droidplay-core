@@ -7,8 +7,8 @@ graphics are replayed on the GPU through Vulkan. Pokémon Brilliant Diamond play
 - **Native, not emulated.** A Switch and an Android device both run ARM64 code: the game's code is rewritten only where the host needs it (system calls,
   thread registers), and a host answers the Switch's system calls and SDK services. There is no CPU emulation.
 - **A game is an app of its own**, with its name, icon and saves, installable on any arm64 device with Vulkan, or every game in one launcher app.
-- **Packed on your computer** from your own dump: NSP / XCI files, or a Switch 2 game's `.nup` or dump folder. [DroidPlay](https://github.com/enjoyerofslop/droidplay),
-  a Mac app, does it with a click; the command line works on any computer.
+- **Packed on your computer** from your own dump: NSP / XCI files, or a Switch 2 game's `.nup` or dump folder. [DroidPlay for Windows](#the-desktop-app) and
+  [DroidPlay](https://github.com/enjoyerofslop/droidplay) on a Mac do it with a click; the command line works on any computer.
 
 DroidPlay Core is [seedds/nxnative](https://github.com/seedds/nxnative) (Switch games natively on the iPhone, the iPad and the Mac) with an Android port: the engine the
 DroidPlay apps build games with. The port began as [RogelioLB/nxnative-android](https://github.com/RogelioLB/nxnative-android) (the Vulkan replay of NVN, the Android
@@ -25,12 +25,21 @@ Linux desktop apps on Android ([#40](https://github.com/enjoyerofslop/droidplay-
 
 ## Ways to play
 
+- **DroidPlay for Windows:** download **DroidPlay-Setup-&lt;version&gt;.exe** from the [latest release](https://github.com/enjoyerofslop/droidplay-core/releases/latest)
+  and run it. DroidPlay opens on **Get started**, a checklist that installs the tools it builds with, helps you set up your phone and builds your first game
+  ([The desktop app](#the-desktop-app)). The same app runs on Linux and a Mac from source (`uv run scripts/nxnative_android.py`). It has DroidPlay's name and
+  icon, but it is a separate app from DroidPlay on a Mac.
 - **DroidPlay on a Mac:** add your games folder, then **Install on Android** (one launcher app holding every game, over adb) or **Build Game App** (an APK, or an
   XAPK for an installer app). See [DroidPlay](https://github.com/enjoyerofslop/droidplay).
 - **The command line, any computer:** [Packing from the command line](#packing-from-the-command-line). `--game-apk` makes a game app; without it the game goes into
   the launcher app on a connected device.
-- **DroidPlay for Windows and Linux**, the desktop app (`python scripts/nxnative_android.py`; it runs on a Mac too): the launcher-app flow with a window
-  ([below](#the-desktop-app)). It has DroidPlay's name and icon, but it is a separate app from DroidPlay on a Mac.
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%"><img src="docs/images/windows/get-started.png" alt="DroidPlay for Windows on Get started: the keys picked, the tools for building downloading with the time left, and the phone waiting for Allow"><br><small><b>Get started</b>: your keys, the tools downloading, your phone and your first game</small></td>
+<td align="center" valign="top" width="50%"><img src="docs/images/windows/library.png" alt="DroidPlay for Windows' Library: Pokémon Brilliant Diamond with its box art, ready on a Galaxy S25 Edge, with a Play button"><br><small><b>Library</b>: a game installed on the phone, ready to play</small></td>
+</tr>
+</table>
 
 <!-- The "status" anchor keeps links made before the rename working: DroidPlay's README links to #status. -->
 ## <a id="status"></a>Game Status
@@ -150,6 +159,13 @@ modules the script names at its top; `python scripts/nxnative_android.py` works 
    - **Your first game:** add the folder with its NSP or XCI files, then **Build and install**.
 
    Until all four are done, a launch opens on the checklist and the top bar's **Setup 2 of 4** opens it; **Settings › Show the setup checklist** does any time.
+
+<table>
+<tr>
+<td align="center" valign="top" width="36%"><img src="docs/images/windows/phone-setup.png" alt="DroidPlay for Windows' Set up your phone guide for a Samsung Galaxy: Build number, Auto Blocker, USB debugging and Allow, with the phone waiting for Allow at its foot"><br><small><b>Set up my phone</b>: the steps for your phone's brand</small></td>
+<td align="center" valign="top" width="64%"><img src="docs/images/windows/build.png" alt="DroidPlay for Windows' Builds page part-way through building Pokémon Brilliant Diamond: four stages done, the shaders for Vulkan translating, with the time left"><br><small><b>Builds</b>: a first build part-way, its stages and the time left</small></td>
+</tr>
+</table>
 
 - **Library:** the games you added (**+ Build game** picks a folder with a game's NSP files), each with its box art, version and status on the phone picked at the top.
   The big button does what comes next: **Build and install**, **Install on phone** (a game built before, without building again) or **Play**. **Manage** has the rest:
