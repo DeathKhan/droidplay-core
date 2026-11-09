@@ -6,6 +6,7 @@
 #   python scripts/build_android_from_nsp.py --apk-only [--serial ...]                                  the app with every game host built on this computer, installed
 #   python scripts/build_android_from_nsp.py --migrate --title <title ID> [--serial ...]               a one-game install's folder (files/game) into files/games/<title ID>
 #   python scripts/build_android_from_nsp.py --check | --info <NSP folder>                              requirements / the game's details, as JSON (the desktop app)
+#   python scripts/build_android_from_nsp.py --setup [--accept-android-licenses]                         install what --check finds missing (Windows: dm/android/tools/host_setup.py)
 #   python scripts/build_android_from_nsp.py <NSP folder> -k <prod.keys> --game-apk [--xapk] [--out <folder>]   the game in an app of its own, to install anywhere (make_game_app)
 #   --progress json: newline-delimited JSON events on stdout (build_ipa_from_nsp.py Progress), for the desktop app (scripts/nxnative_android.py)
 #   Every build also writes those events to a journal, <data>/builds/<time>-<pid>.jsonl (start and exit events around them), whatever its --progress: the desktop app
@@ -98,6 +99,26 @@ def sdk_dir(arg):
     for c in (arg, os.environ.get('ANDROID_HOME'), os.environ.get('ANDROID_SDK_ROOT'), os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk'), os.path.expanduser('~/Android/Sdk')):
         if c and (Path(c) / 'platform-tools').is_dir(): return Path(c)
     raise BuildError('Android SDK not found: give --sdk or set ANDROID_HOME')
+
+
+sys.path.append(str(REPO / 'dm/android/tools')); import host_setup   # noqa: E402  # pyright: ignore[reportMissingImports]  (--setup; dm/android/tools, put on the path here)
+NDK, CMAKE = '28.2.13676358', '3.22.1'   # what --setup installs, and the CI builds with; a build takes the newest NDK and CMake the SDK has
+
+
+def sdk_packages(sdk):   # check()'s rows for the SDK's parts → (sdkmanager's name, a file it puts there), for --setup
+    exe = '.exe' if os.name == 'nt' else ''
+    return {'adb': ('platform-tools', sdk / 'platform-tools' / f'adb{exe}'), f'platform {PLATFORM}': (f'platforms;{PLATFORM}', sdk / 'platforms' / PLATFORM / 'android.jar'),
+            f'build-tools {BUILD_TOOLS}': (f'build-tools;{BUILD_TOOLS}', sdk / 'build-tools' / BUILD_TOOLS), 'NDK': (f'ndk;{NDK}', sdk / 'ndk' / NDK),
+            'CMake': (f'cmake;{CMAKE}', sdk / 'cmake' / CMAKE)}
+
+
+def tool_paths():   # the JDK and .NET SDK --setup installed, and the SDK's adb, on PATH for this run and what it starts (the desktop app imports this script for it too)
+    try: sdk = sdk_dir(None)
+    except BuildError: sdk = None
+    host_setup.add_tool_paths(data_dir() / 'tools', sdk)
+
+
+tool_paths()
 
 
 def newest(d, what):
@@ -562,7 +583,9 @@ def tool_version(cmd):
 
 def check(sdk_arg):
     rows = []
-    def row(name, ok, detail, fix=''): rows.append({'name': name, 'ok': bool(ok), 'detail': detail, 'fix': '' if ok else fix})
+    def row(name, ok, detail, fix=''):
+        if os.name == 'nt' and fix and not name.startswith('Python'): fix = "Install what's missing (the desktop app's Settings), or build_android_from_nsp.py --setup"
+        rows.append({'name': name, 'ok': bool(ok), 'detail': detail, 'fix': '' if ok else fix})
     for m, pip in (('lz4.block', 'lz4'), ('capstone', 'capstone'), ('fontTools', 'fonttools'), ('PySide6', 'PySide6')):
         row(f'Python module {pip}', bi._importable(m), sys.executable, f'{sys.executable} -m pip install {pip}')
     z = bi._importable('compression.zstd') or bi._importable('backports.zstd')
@@ -577,7 +600,7 @@ def check(sdk_arg):
     if sdk:
         for what, d in (('NDK', sdk / 'ndk'), ('CMake', sdk / 'cmake')):
             try: row(what, True, str(newest(d, what)))
-            except BuildError as e: row(what, False, str(e), f'sdkmanager "{"ndk;28.2.13676358" if what == "NDK" else "cmake;3.22.1"}"')
+            except BuildError as e: row(what, False, str(e), f'sdkmanager "{f"ndk;{NDK}" if what == "NDK" else f"cmake;{CMAKE}"}"')
         row(f'build-tools {BUILD_TOOLS}', (sdk / 'build-tools' / BUILD_TOOLS).is_dir(), str(sdk / 'build-tools' / BUILD_TOOLS), f'sdkmanager "build-tools;{BUILD_TOOLS}"')
         row(f'platform {PLATFORM}', (sdk / 'platforms' / PLATFORM / 'android.jar').is_file(), str(sdk / 'platforms' / PLATFORM), f'sdkmanager "platforms;{PLATFORM}"')
     a = tool_version(['adb', 'version'])
@@ -587,6 +610,19 @@ def check(sdk_arg):
     row('signing key', True, f'{KEYSTORE}' + ('' if KEYSTORE.is_file() else ' (made at the first build)'))
     hosts = library(); row('game hosts', True, f'{len(hosts)} in {data_dir() / "hosts"}' + (': ' + ', '.join(hosts) if hosts else ''))
     return rows
+
+
+def setup(sdk_arg, accept):   # --setup: what check() finds missing, installed (host_setup.py), then checked again; the Python modules stay pip's (or uv run's)
+    missing = {r['name'] for r in check(sdk_arg) if not r['ok']}
+    try: sdk = sdk_dir(sdk_arg)
+    except BuildError: sdk = Path(sdk_arg or os.path.join(os.environ.get('LOCALAPPDATA') or Path.home(), 'Android', 'Sdk')).expanduser()   # Android Studio's place
+    try: done = host_setup.setup(missing, sdk, data_dir() / 'tools', sdk_packages(sdk), accept, bi.PROG, say)
+    except host_setup.SetupError as e: raise BuildError(str(e)) from e
+    host_setup.add_tool_paths(data_dir() / 'tools', sdk)
+    still = [r for r in check(sdk_arg) if not r['ok']]
+    if done: say(f'installed: {", ".join(done)}')
+    if [r for r in still if not r['name'].startswith('Python')]: raise BuildError('still missing: ' + ', '.join(r['name'] for r in still))
+    for r in still: say(f'{r["name"]} is missing: {r["fix"]}')
 
 
 def games_table():   # {title ID: {engine, graphics, build, sdk}} from dm/games/README.md's Games table
@@ -680,6 +716,8 @@ def main(argv):
     ap.add_argument('--game-apk', action='store_true', help='the game in an app of its own, to install on any device (no phone needed; the nxnative app is left as it is)')
     ap.add_argument('--xapk', action='store_true', help='with --game-apk: one .xapk (the APK with the RomFS as its OBB file) for an XAPK installer')
     ap.add_argument('--out', help='with --game-apk: the folder for the app (default: the NSP folder)')
+    ap.add_argument('--setup', action='store_true', help='install what --check finds missing (Windows: the JDK, the .NET SDK and the Android SDK)')
+    ap.add_argument('--accept-android-licenses', action='store_true', help="with --setup: you accept the Android SDK License (https://developer.android.com/studio/terms)")
     a = ap.parse_args(argv)
     if a.xapk: a.game_apk = True
     if a.game_apk:
@@ -691,6 +729,7 @@ def main(argv):
         if a.info and not a.nsp_dir: raise BuildError('--info needs the NSP folder')
         with contextlib.redirect_stdout(sys.stderr): out = check(a.sdk) if a.check else info(Path(a.nsp_dir).expanduser().resolve(), Path(a.keys).expanduser().resolve() if a.keys else None)
         print(json.dumps(out, indent=1)); return
+    if a.setup: setup(a.sdk, a.accept_android_licenses); return
     if a.apk_only or a.migrate:
         logs = data_dir() / 'logs'; logs.mkdir(parents=True, exist_ok=True)
         serial = a.serial or os.environ.get('ANDROID_SERIAL') or pick_device()
