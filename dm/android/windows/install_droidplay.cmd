@@ -5,14 +5,15 @@ set code=%errorlevel%
 if not "%code%"=="0" pause
 exit /b %code%
 #>
-# DroidPlay for Windows (droidnative's desktop app, scripts/nxnative_android.py): installs or updates it for this user, then opens it.
-#   Install DroidPlay.cmd              the newest droidnative release, into %LOCALAPPDATA%\DroidPlay; run it again to update
+# DroidPlay for Windows (DroidPlay Core's desktop app, scripts/nxnative_android.py): installs or updates it for this user, then opens it.
+#   Install DroidPlay.cmd              the newest DroidPlay Core release, into %LOCALAPPDATA%\DroidPlay; run it again to update
 #   Install DroidPlay.cmd uninstall    removes that folder and the shortcuts; the games, the Android SDK and the tools the app installed stay
 #   DROIDPLAY_REF=<branch or tag>      installs that instead of the newest release (testing one before it is released)
 #   DROIDPLAY_NO_LAUNCH=1              installs without opening the app at the end (an install over SSH, which has no desktop to show it on)
 # uv (astral.sh) brings Python and the app's modules from the PEP 723 block at the top of the app; the app's Settings > Install what's missing brings the rest.
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
-$Repo = 'enjoyerofslop/droidnative'
+$Repo = 'enjoyerofslop/droidplay-core'
+# the source's folder keeps the name it had before the project was renamed from droidnative (2026-11-09), so installs made before then update in place
 $Home_ = Join-Path $env:LOCALAPPDATA 'DroidPlay'; $Src = Join-Path $Home_ 'droidnative'; $App = Join-Path $Src 'scripts\nxnative_android.py'
 $Bin = Join-Path $env:USERPROFILE '.local\bin'; $Uv = Join-Path $Bin 'uv.exe'; $Uvw = Join-Path $Bin 'uvw.exe'
 $Links = @((Join-Path ([Environment]::GetFolderPath('Programs')) 'DroidPlay.lnk'), (Join-Path ([Environment]::GetFolderPath('Desktop')) 'DroidPlay.lnk'))
@@ -58,8 +59,8 @@ if ($args -contains 'uninstall') {
     exit 0
 }
 
-# what to install: a branch or tag named in DROIDPLAY_REF, else the newest release. A release carries droidnative's source as assets (release-assets.yml), which
-# GitHub serves from its download network and lets a download resume: droidnative-<version>.tar.xz (about 55 MB) where Windows' tar reads xz (11's does), else
+# what to install: a branch or tag named in DROIDPLAY_REF, else the newest release. A release carries DroidPlay Core's source as assets (release-assets.yml), which
+# GitHub serves from its download network and lets a download resume: droidplay-core-<version>.tar.xz (about 55 MB) where Windows' tar reads xz (11's does), else
 # the .zip (about 90 MB). A branch, or a release without them, comes as the archive GitHub makes of it (about 130 MB, slower, and a cut-off download starts over).
 $rel = $null
 if ($env:DROIDPLAY_REF) { $ref = $env:DROIDPLAY_REF }
@@ -68,7 +69,8 @@ $asset = $null
 if ($rel) {
     $xz = (Test-Path $Tar) -and [bool](& $Tar --version | Select-String liblzma)
     $kinds = @(if ($xz) { 'tar.xz' }) + 'zip'
-    foreach ($k in $kinds) { $asset = @($rel.assets | Where-Object { $_.name -like "droidnative-*.$k" })[0]; if ($asset) { break } }
+    # droidnative-<version>: the name of the assets before the rename, which a release made before it carries
+    foreach ($k in $kinds) { foreach ($p in 'droidplay-core', 'droidnative') { $asset = @($rel.assets | Where-Object { $_.name -like "$p-*.$k" })[0]; if ($asset) { break } }; if ($asset) { break } }
 }
 $stamp = Join-Path $Home_ 'version.txt'; $have = if (Test-Path $stamp) { (Get-Content $stamp -Raw).Trim() } else { '' }
 New-Item -ItemType Directory -Force $Home_ | Out-Null
@@ -77,10 +79,10 @@ if (-not ($rel -and $have -eq $ref -and (Test-Path $App))) {
     if ($asset) { $url = $asset.browser_download_url; $name = $asset.name; $size = $asset.size; $mb = [math]::Ceiling($size / 1MB) }
     else {
         $url = if ($rel) { "https://github.com/$Repo/archive/refs/tags/$ref.zip" } else { "https://github.com/$Repo/archive/$ref.zip" }
-        $name = 'droidnative.zip'; $size = $null; $mb = 130
+        $name = 'droidplay-core.zip'; $size = $null; $mb = 130
     }
     Stop-IfOpen
-    Say ($(if ($have) { "updating from $have to $ref" } else { "installing $ref" }) + " (droidnative, about $mb MB)")
+    Say ($(if ($have) { "updating from $have to $ref" } else { "installing $ref" }) + " (DroidPlay Core, about $mb MB)")
     # downloads keep a folder of their own, where a cut-off one waits for the next run to finish it; any other there (an older release's) goes
     $cache = Join-Path $Home_ 'downloads'; $dl = Join-Path $cache $name; $tmp = Join-Path $Home_ 'download'
     New-Item -ItemType Directory -Force $cache | Out-Null

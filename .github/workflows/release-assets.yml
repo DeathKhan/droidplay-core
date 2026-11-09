@@ -1,4 +1,4 @@
-# Adds DroidPlay for Windows' installer and droidnative's source to a release. Install DroidPlay.cmd downloads the source as droidnative-<version>.tar.xz
+# Adds DroidPlay for Windows' installer and DroidPlay Core's source to a release. Install DroidPlay.cmd downloads the source as droidplay-core-<version>.tar.xz
 # (about 55 MB) or .zip (about 90 MB) rather than the archive GitHub makes of the tag (about 130 MB): GitHub serves release assets from its download network,
 # where a download that is cut off can resume, and these leave out docs/ (screenshots) and .github/, which the app doesn't use. Publishing a release runs this
 # from the release's tag; Run workflow (from main) adds the assets to a release made before the tag had this file.
@@ -35,10 +35,13 @@ jobs:
           persist-credentials: false
       - name: Pack the source and upload it with the installer
         run: |
-          name="droidnative-${TAG#v}"
+          name="droidplay-core-${TAG#v}"
           git archive --format=tar --prefix="$name/" HEAD ':!docs' ':!.github' | xz -9 -T0 > "$name.tar.xz"
           git archive --format=zip -9 --prefix="$name/" HEAD ':!docs' ':!.github' > "$name.zip"
           # GitHub turns the space of an asset's name into a dot; the label keeps it
           cp dm/android/windows/install_droidplay.cmd Install.DroidPlay.cmd
-          ls -l "$name.tar.xz" "$name.zip" Install.DroidPlay.cmd
-          gh release upload "$TAG" "$name.tar.xz" "$name.zip" "Install.DroidPlay.cmd#Install DroidPlay.cmd" --clobber --repo "$GITHUB_REPOSITORY"
+          # the same archives under the name they had before the project was renamed from droidnative: the installers of 0.2.2 and earlier look only for
+          # droidnative-<version>, and without it fall back to GitHub's slow archive of the tag
+          legacy="droidnative-${TAG#v}"; cp "$name.tar.xz" "$legacy.tar.xz"; cp "$name.zip" "$legacy.zip"
+          ls -l "$name.tar.xz" "$name.zip" "$legacy.tar.xz" "$legacy.zip" Install.DroidPlay.cmd
+          gh release upload "$TAG" "$name.tar.xz" "$name.zip" "$legacy.tar.xz" "$legacy.zip" "Install.DroidPlay.cmd#Install DroidPlay.cmd" --clobber --repo "$GITHUB_REPOSITORY"

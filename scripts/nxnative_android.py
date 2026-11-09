@@ -457,7 +457,7 @@ class LibraryPage(QWidget):
         elif state == 'install': self.run(g, ['--push-only'], 'Install')
         elif state == 'build': self.run(g, [], 'Build') if s else self.run(g, ['--no-push'], 'Build')
         elif state == 'survey':   # no profile: the script surveys the game, guesses a provisional profile and packs a best-effort APK (not installed: it may not boot)
-            box = QMessageBox(QMessageBox.Warning, 'Experimental build', f'{g.name} has no profile in droidnative, so it is not supported yet. '
+            box = QMessageBox(QMessageBox.Warning, 'Experimental build', f'{g.name} has no profile in DroidPlay Core, so it is not supported yet. '
                               'The build extracts the game, writes a survey of it (survey.md in its folder), guesses a provisional profile and packs an APK that '
                               'will most likely not boot. Nothing is installed on the phone. It is the starting point for porting the game.', parent=self)
             go = box.addButton('Build anyway', QMessageBox.AcceptRole); box.setDefaultButton(box.addButton(QMessageBox.Cancel)); box.exec()
