@@ -224,6 +224,7 @@ class Game:
     def new_shaders(self, on_phone):   # run-time shaders the phone saved beyond the ones on this computer (a provisional profile's only: build_android_from_nsp.py pull_captures)
         return max(0, (on_phone.get(self.id) or {}).get('captures', 0) - self.captures) if self.provisional else 0
     def status(self, on_phone, phone):   # (text, colour, state): state picks what Play does
+        if self.info.get('needs_keys'): return 'Needs your prod.keys to read it: pick them in Settings', ERR, 'keys'
         if self.error: return f'Could not read the folder: {self.error}', ERR, 'none'
         if not self.profile: return 'No profile: experimental build only', ERR, 'survey'
         x = 'Experimental (provisional profile, may not boot) · ' if self.provisional else ''   # an experimental build's profile, guessed from the survey
@@ -352,19 +353,27 @@ class LibraryPage(QWidget):
         self.reload()
 
     def folders(self): return [f for f in (self.win.st.value('folders', []) or []) if f]
-    def reload(self):
+    def reload(self):   # one read of the games at a time (each runs --info per folder): one asked for while it runs, as a build's stage ends do, runs once after it
+        if getattr(self, 'reading', False): self.again = True; return
         fs = list(self.folders()); seen = {str(Path(f).resolve()) for f in fs}   # resolved: a folder behind a link (Downloads moved to another drive) is the same folder
+        names = {}   # a game packed on this computer keeps its name while its folder cannot be read (no keys yet), rather than the folder's (DroidPlay's are all "android")
         for gid, (_, meta) in ba.library().items():   # packed on this computer from a folder not in the list
-            if meta.get('nsp_dir') and str(Path(meta['nsp_dir']).resolve()) not in seen: fs.append(meta['nsp_dir']); seen.add(str(Path(meta['nsp_dir']).resolve()))
+            if not meta.get('nsp_dir'): continue
+            names[str(Path(meta['nsp_dir']).resolve())] = meta.get('name')
+            if str(Path(meta['nsp_dir']).resolve()) not in seen: fs.append(meta['nsp_dir']); seen.add(str(Path(meta['nsp_dir']).resolve()))
         if not fs: self.render(); return
+        keys = self.win.keys()   # NSP and XCI files are encrypted: --info reads them with the keys (a NUP or a dump folder needs none)
         def read():
             out = {}
             for f in fs:
                 if not Path(f).is_dir(): continue
-                try: out[f] = self.win.script_json('--info', f)
-                except Exception as e: out[f] = {'error': str(e).strip().splitlines()[-1] if str(e).strip() else 'could not be read', 'name': Path(f).name}
+                try: out[f] = self.win.script_json('--info', f, *(['-k', keys] if keys else []))
+                except Exception as e:
+                    msg = str(e).strip().splitlines()[-1].removeprefix('[RED] ') if str(e).strip() else 'could not be read'
+                    out[f] = {'error': msg, 'needs_keys': not keys and 'prod.keys' in msg, 'name': names.get(str(Path(f).resolve())) or Path(f).name}
             return out
         def got(r):
+            self.reading = False
             if isinstance(r, Exception): self.win.toast(f'Reading the games failed: {r}'); r = {}
             self.games, ids = {}, set()
             for f, i in r.items():   # one card per game, from the first folder that holds it
@@ -372,7 +381,8 @@ class LibraryPage(QWidget):
                 if g.id and g.id in ids: continue
                 ids.add(g.id); self.games[f] = g
             self.render()
-        bg(read, got)
+            if getattr(self, 'again', False): self.again = False; self.reload()
+        self.reading = True; bg(read, got)
     def render(self):
         while self.rl.count() > 1:
             w = self.rl.takeAt(0).widget()
@@ -399,7 +409,8 @@ class LibraryPage(QWidget):
         if not g: self.hero.show_game(None, '', TEXT3); self.hero.play.setEnabled(False); self.hero.opts.setEnabled(False); return
         text, color, state = g.status(self.win.phone_games, self.win.phone_name())
         self.hero.show_game(g, text, color); self.hero.opts.setEnabled(bool(g.profile))
-        self.hero.play.setText({'play': '  Play', 'install': '  Install on phone', 'build': '  Build and install', 'survey': '  Experimental build', 'none': '  Not supported'}[state])
+        self.hero.play.setText({'play': '  Play', 'install': '  Install on phone', 'build': '  Build and install', 'survey': '  Experimental build', 'keys': '  Pick your prod.keys',
+                                'none': '  Not supported'}[state])
         self.hero.play.setEnabled(state != 'none')
     def current(self): return self.games.get(self.picked)
     def slide(self, d): sb = self.scroll.horizontalScrollBar(); sb.setValue(sb.value() + d * (Card.W + 20) * 2)
@@ -417,6 +428,7 @@ class LibraryPage(QWidget):
         if not g: return
         state = g.status(self.win.phone_games, self.win.phone_name())[2]
         s = self.win.serial()
+        if state == 'keys': self.win.go('settings'); return
         if state in ('play', 'install') and not s: self.win.toast('Connect a phone first (Phones)'); return
         if state == 'play':
             bg(lambda: adb_run(s, 'shell', 'am', 'start', '-n', f'{PKG}/.Launcher', '--es', 'game', g.id, '--ez', 'play', 'true'),
@@ -854,7 +866,7 @@ class SettingsPage(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(48, 32, 48, 24); lay.setSpacing(16)
         lay.addWidget(label('Settings', 'h1'))
         keys = QHBoxLayout(); keys.addWidget(label('Your prod.keys', 'meta')); self.keys = QLineEdit(win.st.value('keys', '')); self.keys.setPlaceholderText('the keys dumped from your Switch')
-        self.keys.editingFinished.connect(lambda: win.st.setValue('keys', self.keys.text().strip())); keys.addWidget(self.keys, 1)
+        self.keys.editingFinished.connect(lambda: self.set_keys(self.keys.text().strip())); keys.addWidget(self.keys, 1)
         b = QPushButton('Choose…'); b.clicked.connect(self.pick_keys); keys.addWidget(b); lay.addLayout(keys)
         lay.addSpacing(8)
         head = QHBoxLayout(); head.addWidget(label('Requirements', 'h2')); head.addStretch(); b = QPushButton('Check again'); b.setObjectName('ghost'); b.clicked.connect(lambda *_: self.run()); head.addWidget(b)
@@ -866,7 +878,10 @@ class SettingsPage(QWidget):
         lay.addWidget(self.table, 1)
     def pick_keys(self):
         f, _ = QFileDialog.getOpenFileName(self, 'Your prod.keys', '', 'Keys (*.keys);;All files (*)')
-        if f: self.keys.setText(f); self.win.st.setValue('keys', f)
+        if f: self.keys.setText(f); self.set_keys(f)
+    def set_keys(self, f):   # the library reads NSP and XCI games with the keys: read it again when they change
+        if f == (self.win.st.value('keys', '') or ''): return
+        self.win.st.setValue('keys', f); self.win.library.reload()
     def run(self, then=None):
         def got(rows):
             if isinstance(rows, Exception): rows = [{'name': 'check', 'ok': False, 'detail': str(rows), 'fix': ''}]
@@ -961,6 +976,7 @@ class Window(QMainWindow):
         if d not in fs: self.st.setValue('folders', fs + [d])
         self.go('library'); self.library.reload(); self.toast('Reading the game… then Build and install puts it on your phone')
     def stop_build(self): self.builds.stop()
+    def keys(self): k = self.st.value('keys', '') or ''; return k if k and Path(k).is_file() else None
     def script_json(self, *args):
         r = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=NOWINDOW, env=dict(os.environ, PYTHONUTF8='1'))
         if r.returncode: raise RuntimeError((r.stderr or r.stdout).strip()[-500:])
