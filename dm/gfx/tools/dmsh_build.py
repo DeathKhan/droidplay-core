@@ -163,8 +163,8 @@ def hmma_bslots(msl, open_at, end, fcalls, writers):
     for c, args in fcalls: writes[args[HMMA_ARGS.index('d1')]] += 1
     for name in writers:
         for w in re.finditer(r'\b%s\(' % name, body):
-            depth, j = 1, w.end()
-            while depth and j < len(body): depth += {'(': 1, ')': -1}.get(body[j], 0); j += 1
+            level, j = 1, w.end()   # not depth: the function's depth() below shares its scope
+            while level and j < len(body): level += {'(': 1, ')': -1}.get(body[j], 0); j += 1
             writes.update(re.findall(r'\b[A-Za-z_]\w*\b', body[w.end():j]))
     braces = [(b.start() + open_at, 1 if b.group() == '{' else -1) for b in BRACE.finditer(body)]
     at, depth_after = [p for p, _ in braces], list(itertools.accumulate(d for _, d in braces))

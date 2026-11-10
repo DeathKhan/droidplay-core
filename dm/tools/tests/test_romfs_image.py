@@ -6,6 +6,7 @@ import shutil
 import shlex
 import struct
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -261,6 +262,7 @@ else: sys.exit(f'fake afcclient: no command {cmd}')
 '''
 
 
+@unittest.skipUnless(sys.platform == 'darwin', 'push_romfs.sh to an iPhone or iPad: BSD stat and Apple device tools (DroidPlay Core runs this file on Linux too)')
 class DlcTransfers(unittest.TestCase):
     """The DLC set replaces Documents/aoc over AFC, and nothing else in the app's data container: devicectl's --remove-existing-content empties the whole
     container (CoreDevice 651.32, docs/reference/packing.md), saves included, so the script never passes it."""
@@ -354,6 +356,7 @@ class DlcTransfers(unittest.TestCase):
         self.assertNotIn('--remove-existing-content', self.xcrun_calls.read_text())
 
 
+@unittest.skipUnless(sys.platform == 'darwin', 'push_romfs.sh to an iPhone or iPad: BSD stat and Apple device tools (DroidPlay Core runs this file on Linux too)')
 class AfcTransfers(unittest.TestCase):
     """The image goes over AFC (afcclient), which streams it, where devicectl copies the whole file through CoreDeviceService's memory."""
 
