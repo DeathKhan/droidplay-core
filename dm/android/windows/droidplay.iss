@@ -5,6 +5,8 @@
 ; nx_extract, Python's caches). Games, builds, the Android SDK, the tools Install what's missing brought, the signing key and the settings live outside it,
 ; so an update replaces the folder whole and uninstalling leaves them.
 ;   Setup.exe /VERYSILENT /SUPPRESSMSGBOXES [/RELAUNCH]   an update from the app: closes it (Restart Manager), installs, and opens it again with /RELAUNCH
+;   With /RELAUNCH and /VERYSILENT it shows a small window of its own while it works ("Updating DroidPlay", with the install's progress): DroidPlay has closed
+;   by then, and the wizard's own window is hidden.
 
 #ifndef Version
   #define Version "0.0.0"
@@ -90,6 +92,8 @@ const
 
 var
   DeleteTools: Boolean;
+  UpdateForm: TSetupForm;
+  UpdateBar: TNewProgressBar;
 
 function Relaunch: Boolean;
 var
@@ -98,6 +102,64 @@ begin
   Result := False;
   for I := 1 to ParamCount do
     if CompareText(ParamStr(I), '/RELAUNCH') = 0 then Result := True;
+end;
+
+function VerySilent: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/VERYSILENT') = 0 then Result := True;
+end;
+
+// An update DroidPlay started (Update: /VERYSILENT /RELAUNCH) shows nothing of the wizard, and DroidPlay has closed: without a window of its own, nothing on
+// screen says anything is happening until DroidPlay opens again
+procedure ShowUpdateWindow;
+var
+  Title, Body: TNewStaticText;
+  M, W: Integer;
+begin
+  UpdateForm := CreateCustomForm(ScaleX(400), ScaleY(110), False, False);
+  UpdateForm.Caption := 'Updating DroidPlay';
+  UpdateForm.BorderIcons := [];
+  UpdateForm.Position := poScreenCenter;
+  M := ScaleX(16); W := UpdateForm.ClientWidth - 2 * M;   // the form scales itself: the text and the bar follow its width, and its height them
+  Title := TNewStaticText.Create(UpdateForm);
+  Title.Parent := UpdateForm;
+  Title.Left := M; Title.Top := ScaleY(14);
+  Title.Font.Style := [fsBold];
+  Title.Caption := 'Updating DroidPlay to {#Version}';
+  Body := TNewStaticText.Create(UpdateForm);
+  Body.Parent := UpdateForm;
+  Body.Left := M; Body.Top := Title.Top + Title.Height + ScaleY(8);
+  Body.WordWrap := True; Body.Width := W;
+  Body.Caption := 'DroidPlay opens again when it''s done. Your games, builds and settings stay.';
+  UpdateBar := TNewProgressBar.Create(UpdateForm);
+  UpdateBar.Parent := UpdateForm;
+  UpdateBar.Left := M; UpdateBar.Top := Body.Top + Body.Height + ScaleY(12); UpdateBar.Width := W; UpdateBar.Height := ScaleY(16);
+  UpdateBar.Style := npbstMarquee;   // until the files start: closing DroidPlay, unpacking
+  UpdateForm.ClientHeight := UpdateBar.Top + UpdateBar.Height + M;
+  UpdateForm.Show;
+  Log('Showing the update window');
+end;
+
+procedure CurInstallProgressChanged(CurProgress, MaxProgress: Integer);
+begin
+  if (UpdateBar = nil) or (MaxProgress <= 0) then Exit;
+  UpdateBar.Style := npbstNormal;
+  UpdateBar.Max := MaxProgress;
+  UpdateBar.Position := CurProgress;
+end;
+
+procedure InitializeWizard;
+begin
+  if Relaunch and VerySilent then ShowUpdateWindow;
+end;
+
+procedure DeinitializeSetup;
+begin
+  if UpdateForm <> nil then UpdateForm.Close;
 end;
 
 // Whether a running program's command line names Path: DroidPlay's window, or a build it started, run from that folder. Replacing a folder under a
