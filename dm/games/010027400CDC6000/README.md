@@ -32,7 +32,15 @@ Status: brought up on Android, on an Ayn Odin 2 (Adreno 740, Android 13). The ti
 ## First area
 
 - The opening cinematic (painted, narrated) plays through, then the Merryweather's hold with Magister Siwan's first dialogue. 30 fps (frame time p50 33.3 ms, p95 35.2), GPU 6.1 ms a frame, 331 draws, 1.5 GB resident in the replay (Odin).
-- `DM_KEYS=32:A,36:B,39:A,42:A,45:A,48:A,51:A,70:A~1.0,76:PLUS,82:A` reaches it in about 2 minutes 30 s.
+- `DM_KEYS=32:A,36:B,39:A,42:A,45:A,48:A,51:A,70:A~1.0,76:PLUS,82:A` reaches it in about 2 minutes 30 s; the `tohold` route below does the same from a fresh save.
+- Quick Save (Plus, then A) writes `Save0000/Save0000.lsv` and its thumbnail; Continue loads it again (`hold` below). The game autosaves on its own a few seconds into play.
+
+## Routes
+
+[`bench_android.tsv`](bench_android.tsv), for `scripts/bench_android.py`:
+
+- `tohold`: a fresh save through New Game, character creation, the opening cinematic and Magister Siwan's first lines, then Quick Save in the hold at about 205 s. With `--keep-save <game folder>/saves/hold` it makes the save `hold` starts from (`Story - QuickSave_0`, 3.7 MB).
+- `hold`: Continue from that save (in the hold 6 s after the press), a short walk, then idling; measured from 96 s for 30 s. Odin 2, warm-up and 2 runs (2026-11-10): 30.0 fps, frame p50 33.3 / p95 33.9 / p99 34.2 ms, GPU 5.9 ms, PSS 1.38 GB, the same in all three.
 
 ## Frame rate
 
