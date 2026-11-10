@@ -391,12 +391,36 @@ static size_t spv_fit_wide(const uint32_t *code, size_t nw, const char *what, ui
         LOG("[RED] [vk] %s uses subgroup operations spv_wide does not rewrite for the GPU's %u-lane subgroups: made as it is, lanes 32 and up may read other lanes", what, g_sg_size);
     *out = o; return k;
 }
+// The module with each subgroup a warp of its own on a GPU whose subgroups are narrower than Maxwell's 32 lanes (spv_narrow.h: the Pixel 9 Pro XL's Mali-G715,
+// 16 lanes), in *out (to free); 0 when it needs nothing: 32 lanes or more, a stage that runs no subgroup operations (spv_limits'), or a module with no shuffle.
+// DM_SPV_NARROW=0 (env.txt): modules as translated
+static size_t spv_fit_narrow(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_NARROW"); on = !(e && *e == '0'); }
+    *out = NULL;
+    if (!on || g_sg_size >= 32 || !spv_narrow_wanted(code, nw)) return 0;
+    size_t sm = 4096; uint32_t *s = malloc((9 * (size_t)code[3] + 2 * sm) * 4), *o = NULL; size_t need = 0, k = 0; int got = 0;
+    if (!s) return 0;
+    spv_narrow(code, nw, g_sg_stages, g_sg_size, s, sm, NULL, 0, &need, &got);
+    if (need && (o = malloc(need * 4))) k = spv_narrow(code, nw, g_sg_stages, g_sg_size, s, sm, o, need, &need, &got);
+    free(s);
+    if (!k) { free(o); o = NULL; }
+    static _Atomic int logged, steps, nred;
+    if (k && !atomic_exchange(&logged, 1))
+        LOG("[vk] the GPU's subgroups have %u lanes: each runs as a warp of its own (a shuffle from past it reads the lane's own value, and a whole-warp reduction step "
+            "past it is the value itself). First: %s", g_sg_size, what);
+    if (k && (got & SPV_NARROW_STEP) && !atomic_exchange(&steps, 1)) LOG("[vk] %s: whole-warp reduction steps past the %u-lane subgroup made the value itself (the first such shader)", what, g_sg_size);
+    if (k && vk_debug()) LOG("[vk] %s: subgroups of %u lanes as warps%s", what, g_sg_size, got & SPV_NARROW_STEP ? ", reduction steps past them the value itself" : "");
+    if ((got & SPV_NARROW_KEPT) && atomic_fetch_add(&nred, 1) < 8)
+        LOG("[RED] [vk] %s: a whole-warp reduction step past the GPU's %u-lane subgroup whose result spv_narrow does not follow: left as translated (its shuffle reads the lane's own value)", what, g_sg_size);
+    *out = o; return k;
+}
 // The module without subgroup operations in a stage where the GPU runs none (spv_limits.h), in *out (to free); 0 when it needs nothing. A GPU that runs them in
 // every graphics stage gets every module as translated, untouched; so does one that runs them in the module's stage. DM_SPV_LIMITS=0 (env.txt): modules as translated
 static size_t spv_fit(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_LIMITS"); on = !(e && *e == '0'); }
     *out = NULL;
     size_t wk = spv_fit_wide(code, nw, what, out); if (wk) return wk;   // a stage that runs them: as wide as the GPU's subgroups
+    size_t nk = spv_fit_narrow(code, nw, what, out); if (nk) return nk;   // or as narrow
     if (!on || (g_sg_stages & VK_SHADER_STAGE_ALL_GRAPHICS) == VK_SHADER_STAGE_ALL_GRAPHICS || !spv_lim_wanted(code, nw, g_sg_stages)) return 0;
     uint32_t *s = malloc(2 * (size_t)code[3] * 4), *o = NULL; size_t need = 0, k = 0; int got = 0;
     if (!s) return 0;
