@@ -66,7 +66,7 @@ Screen captures from the test runs, taken on the device. The round button at the
 
 | Game | Device | State |
 |---|---|---|
-| Pokémon Brilliant Diamond 1.3.0 | Ayn Odin 2, OnePlus Pad 3 | Playable: 60 fps in Eterna City's overworld. **Crashes at launch on a Retroid Pocket 5** (Adreno 650: its driver's shader compiler) |
+| Pokémon Brilliant Diamond 1.3.0 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Playable: 60 fps in Eterna City's overworld. On a Retroid Pocket 5 it no longer crashes at launch, but Eterna City runs at 15 fps on its own driver (58 with [Turnip](#another-vulkan-driver-turnip)) |
 | Animal Crossing: New Horizons 3.0.3 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Runs at 30 fps (as on the Switch) in the new game's airport on all three, and outside the player's house on the Odin 2 and Pad 3; not played through |
 | Super Mario Odyssey 1.4.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | The Start menu at 60 fps, the opening cutscene at 60 (38 on the Retroid Pocket 5), and play in the Cap Kingdom at 60 on the Odin 2, past the hint video that used to crash it (the host's AVC decoder, fixed) |
 | Super Smash Bros. Ultimate 13.0.5 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Boots to its opening movie at 60 fps on all three, with the hinted shared font the packer now ships (Android's Roboto made it crash); battles at 40–59 fps on the Odin 2, 13–30 fps on the other two (pipelines built during play) |
@@ -220,8 +220,8 @@ names the driver that runs: `[vk] driver: … (DM_VK_DRIVER, through libadrenoto
 minute to the first frame, and it stutters until they are built), and the system driver's cache is still there afterwards.
 
 Whether a driver helps depends on the game and the device. With Mr. Purple's T30, Super Mario Odyssey's opening runs at 60 fps on an Odin 2 (as on its own driver)
-and at 40 fps on a Retroid Pocket 5 (38 on its own); Pokémon Brilliant Diamond, which crashes on the Retroid Pocket 5's own driver, runs there on Turnip at 25 fps,
-and at 60 fps on an Odin 2, as on its own driver.
+and at 40 fps on a Retroid Pocket 5 (38 on its own); Pokémon Brilliant Diamond's Eterna City runs at 58 fps on a Retroid Pocket 5 with
+Turnip (15 on its own driver), and at 60 fps on an Odin 2, as on its own driver.
 
 ## Packing from the command line
 

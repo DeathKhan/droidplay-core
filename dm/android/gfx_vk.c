@@ -26,6 +26,7 @@
 #include "nvn_fmt_mtl.h"
 #include "gfx_vk.h"
 #include "spv_readonly.h"
+#include "spv_limits.h"
 #include "nvn_fstep.h"   // FSTEP_FIT: the performance hint's target (hint_frame)
 #include "nvn_queue.h"   // the queue scheduler (hle_nvn.c nvn_queue.inc): event publication and GPU progress
 #include <stdatomic.h>
@@ -40,6 +41,7 @@ static int vk_debug(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_DEBU
 static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one thread's at a time: submissions, CPU reads, texture lifetimes
 
 // ---------------- The device ----------------
+static uint32_t g_sg_stages = VK_SHADER_STAGE_ALL;   // the stages that run subgroup operations (subgroupSupportedStages; spv_limits.h); all when not known
 static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
 static int g_fmt_list;   // VK_KHR_image_format_list enabled (vt_create)
 static void pb_dump(void);   // gfx_vk_draw.inc: the pipelines being built, for a crash dump
@@ -66,6 +68,11 @@ static void vk_create(void) {
     uint32_t n = 1; VkResult r = vkEnumeratePhysicalDevices(g_vk.inst, &n, &g_vk.pd);
     if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || !n) { LOG("[RED] [vk] no GPU"); return; }
     vkGetPhysicalDeviceProperties(g_vk.pd, &g_vk.props); vkGetPhysicalDeviceMemoryProperties(g_vk.pd, &g_vk.mp);
+    if (VK_API_VERSION_MINOR(g_vk.props.apiVersion) >= 1 || VK_API_VERSION_MAJOR(g_vk.props.apiVersion) > 1) {
+        VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
+        vkGetPhysicalDeviceProperties2(g_vk.pd, &p2); g_sg_stages = sg.supportedStages;
+    }
     VkPhysicalDeviceFeatures f; vkGetPhysicalDeviceFeatures(g_vk.pd, &f);
     g_vk.has_bc = f.textureCompressionBC; g_vk.has_astc = f.textureCompressionASTC_LDR;
     uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_vk.pd, &nq, NULL);
@@ -116,7 +123,7 @@ static void vk_create(void) {
     if (hqr && !(g_qreset = (PFN_vkResetQueryPoolEXT)vkGetDeviceProcAddr(g_vk.dev, "vkResetQueryPoolEXT"))) LOG("[RED] [vk] VK_EXT_host_query_reset is enabled but vkResetQueryPoolEXT was not found");
     LOG("[vk] query resets: %s", g_qreset ? "on the host, the queries each chunk used, once read (VK_EXT_host_query_reset)" : qr_used() ? "in the command buffer, the queries the chunk used last time"
                                                                                                                                      : "in the command buffer, every pool at every chunk begin (DM_VK_QRESET_USED=0)");
-    LOG("[vk] descriptor sets bound at once: %u, subgroup size / ops / stages: see vulkan probe", g_vk.props.limits.maxBoundDescriptorSets);
+    LOG("[vk] descriptor sets bound at once: %u, subgroup operations in stages %#x", g_vk.props.limits.maxBoundDescriptorSets, g_sg_stages);
     { void crash_set_gfx_hook(void (*)(void)); crash_set_gfx_hook(pb_dump); }   // a crash dump lists the pipelines being built (gfx_vk_draw.inc)
     LOG("[vk] %s (Vulkan %u.%u.%u): BC %s, ASTC %s", g_vk.props.deviceName, VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion),
         VK_API_VERSION_PATCH(g_vk.props.apiVersion), g_vk.has_bc ? "native" : "decoded on the CPU", g_vk.has_astc ? "native" : "missing");
