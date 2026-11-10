@@ -1,0 +1,5 @@
+# Android benchmark routes for scripts/bench_android.py: name <TAB> DM_KEYS or - <TAB> save or - <TAB> window start s <TAB> window length s <TAB> ready pattern or - <TAB> description [<TAB> KEY=VALUE;KEY=VALUE]
+# outdoors: the smoke route's save and keys (smoke.tsv). Despite its name the save loads in the Shrine of Resurrection (its load prompt and the title card say so): Link standing
+# in the dark chamber with the Move / Controls / Camera prompts, from about 45 s after launch on a OnePlus Pad 3 (about 3,600 draws a frame). Frame-numbered keys, so a slower
+# load moves them in time but not in the game
+outdoors	f300:A,f500:A,f700:A,f900:A,f1100:B,f1300:A,f1500:A,f1700:A	saves/outdoors	70	40	-	the outdoors save: the title's Continue, the load prompt and the DLC notice's B, then Link standing in the Shrine of Resurrection's chamber

@@ -164,6 +164,24 @@ Every kind of cold start also shows the game's own 130–220 ms frames every 9�
 
 On this Mac the background prewarm also ends before the save loads, so the step changes the first minute only where the prewarm is slower than the way into play: a slower device, fewer cores, a longer list, a player who skips through the title. Frames over 25 ms without pipeline work (20–71 per run) are the game's own and vary with the machine's other load.
 
+## Android (OnePlus Pad 3)
+
+Measured 2026-11-10 on a OnePlus Pad 3 (Snapdragon 8 Elite, Adreno 830, driver 0x8032004a, Android 16) with the `outdoors` route of [`bench_android.tsv`](bench_android.tsv): the save loads in the Shrine of Resurrection, about 3,600 draws a frame, window 70-110 s after launch. [Android baselines](../../android/baselines.md), problem 14.
+
+- **The GPU is lost at the first frame in the field (open).** One draw, vertex `2decd3e894b3736a` and fragment `26ae1640f3448ba4`, the vertical pass of a two-pass blur into a 640×360 RGBA8 target, hangs the GPU every frame. The driver recovers it about 250 ms in, until one runs past 3 s: `vkQueueSubmit` -4, then the loading screen stays up for good. Found through the slow-submission report of droidplay-core#90. Things that changed nothing are listed in [problem 14](../../android/baselines.md). With that draw skipped (a local test switch, not in main) the game runs, and the numbers below are taken so.
+- **Main (with the draw skipped):** 20 fps (hold 3). The replay takes 33.5 ms of CPU a frame, the GPU 22.3 ms, NVN submit+present 35.7 ms (p50).
+- **Steady 30 fps** with these open PRs:
+  - descriptor sets bound again (droidplay-core#91): replay −1.3 ms, 87% of sets not written;
+  - 512 draws a chunk in mid-pass (#93): replay −1.5 ms, GPU −2.9 ms;
+  - the vkCmd* calls and submissions on a recorder thread (#97);
+  - this game's Android defaults taking the recorder and a 30 fps target (#102).
+
+  Together: 30.0 fps in four runs, frame p50 33.1-33.4 ms / p95 38.2-38.9 ms, replay 17.2-17.5 ms, GPU 15.5-16.6 ms, NVN submit+present p95 28.3 ms. With the 30 fps target alone, 29.2-29.6 fps (frame p95 41-44 ms). At the 60 fps target the frame step stays at 20: at 3 vsyncs the clocks stay low and the step down rarely fits.
+- **60 fps** needs the frame's cost at or under 14.2 ms. At 30 fps the replay takes 17 ms and the GPU 16 ms, so both have to come down. Next leads, in order:
+  - the replay's host work (`stage_set` 38% of the thread with the recorder on: constant buffer compares, hash lookups, dirty-page checks);
+  - Turnip, which needs a driver build for the Adreno 830;
+  - fewer passes ended and begun again.
+
 ## Mac routes
 
 ### The regression route (2026-10-29, current)
@@ -264,6 +282,8 @@ General host changes first needed here; each applies to every game:
 - **Resolved: type-compatible views read as not resident** (`tex_fit`): [Compatible views made from the texture under a view](../../../docs/reference/rendering.md#compatible-views-made-from-the-texture-under-a-view). Found by replaying the outdoors frame under shader validation; validation is clean after it, and the replayed digest without validation is unchanged.
 
 ## Open
+
+- **Android, OnePlus Pad 3: the GPU hangs on one blur draw and is lost at the first frame in the field** (vertex `2decd3e894b3736a`, fragment `26ae1640f3448ba4`; [Android (OnePlus Pad 3)](#android-oneplus-pad-3), [Android baselines](../../android/baselines.md) problem 14). Its cause is not found.
 
 - **1.6.0 (v786432): the corrupted picture of [issue #251](https://github.com/seedds/nxnative/issues/251) has another cause (current, open):** the 1.9.0 shader map lacks 178 keys that the 1.6.0 shaders use. Not retested after the crash fix.
 
