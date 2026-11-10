@@ -12,7 +12,9 @@
 #     mapped to Vulkan's 0..1 (nvn_mtl.m adds the same as its main0_z entry point; Vulkan without VK_EXT_depth_clip_control has no other way);
 #   the uniform slots' size table (bank 25, which the translator's TranslationFlags.MetalUniformBounds reads before each read of c[3..16]) is taken out, its bound
 #     tests made true and its binding dropped from res.json (cbsize_strip): the reads are the ones the translator wrote before the table;
-#   res.json cbufs[].ext: how many bytes of each constant buffer the shader can read (cb_extents, on the final module; the .z / .tf variants add no constant buffer read).
+#   res.json cbufs[].ext: how many bytes of each constant buffer the shader can read (cb_extents, on the final module; the .z / .tf variants add no constant buffer read);
+#   a task or mesh shader (res.json "mesh", spv_build.py), translated as compute, made a Vulkan task or mesh module (spv_mesh.py), a mesh shader's .z.spv with the depth
+#   -1..1 mapping as a vertex shader's; res.json stage 'ts' / 'ms' and prim_locs, the locations it writes per primitive.
 # Usage: spv_android.py <dmsh_xlate output dir> <out dir> [key ...]   (all keys of the input dir by default); prints one line per shader and a summary
 import itertools, json, struct, sys
 from pathlib import Path
@@ -21,7 +23,7 @@ ANDROID_CHAIN = 5   # res.json 'android': bumped when this post-pass or spv_buil
                     # 5: the size table taken out (cbsize_strip), so a chain 4 output of the merged translator, which reads it, is translated again
 EXT_FROM = 3   # 4 added res.json cbufs[].ext (cb_extents) and nothing else: spv_build.py brings an output of chain 3 up to date from its .spv (add_ext), without the translator,
                # only while ANDROID_CHAIN is EXT_FROM + 1 (upgrade stamps that chain, so a later bump for a change to the .spv translates chain 3's outputs again)
-SET_OF = {'vs': 0, 'ps': 1, 'gs': 2, 'tc': 3, 'te': 3, 'cs': 0}
+SET_OF = {'vs': 0, 'ps': 1, 'gs': 2, 'tc': 3, 'te': 3, 'cs': 0, 'ms': 0, 'ts': 2}   # a mesh pipeline: mesh in the vertex shader's set, task in the geometry shader's
 OP_CAP, OP_EXT, OP_EXECMODE, OP_ENTRY, OP_DECORATE, OP_MEMBERDECORATE = 17, 10, 16, 15, 71, 72
 OP_FUNCTION, OP_FUNCTIONEND, OP_RETURN, OP_VARIABLE, OP_TYPEPOINTER, OP_TYPEINT, OP_TYPEFLOAT, OP_TYPEVECTOR, OP_CONSTANT = 54, 56, 253, 59, 32, 21, 22, 23, 43
 OP_ACCESSCHAIN, OP_LOAD, OP_STORE, OP_COMPOSITEEXTRACT, OP_COMPOSITEINSERT, OP_FADD, OP_FMUL, OP_LABEL = 65, 61, 62, 81, 82, 129, 133, 248
@@ -758,7 +760,19 @@ def main():
         res = json.loads((src / f'{k}.res.json').read_text(encoding='utf-8'))
         stage = res.get('stage', 'vs')
         cs = next((c['binding'] for c in res.get('cbufs') or [] if c.get('slot') == CBSIZE_BANK), None)
-        hdr, ins, interlock, stripped = process((src / f'{k}.spv').read_bytes(), stage, cs)
+        data = (src / f'{k}.spv').read_bytes()
+        if res.get('mesh'):   # a task or mesh shader translated as compute (spv_build.py): the stage module, and a mesh shader's depth -1..1 variant
+            import spv_mesh
+            mesh = res.pop('mesh'); stage = res['stage'] = mesh['info']['kind']
+            try:
+                plain, res['prim_locs'] = spv_mesh.wrap(data, mesh['info'], mesh['lay'])
+                zdata = spv_mesh.wrap(data, mesh['info'], mesh['lay'], gl=True)[0] if stage == 'ms' else None
+            except ValueError as e:
+                print(f'[RED] {k}: {e}: no {"task" if stage == "ts" else "mesh"} module'); bad += 1; continue
+            data = plain
+            if zdata:
+                zh, zi, _, _ = process(zdata, stage, cs); (dst / f'{k}.z.spv').write_bytes(emit(zh, zi)); nz += 1
+        hdr, ins, interlock, stripped = process(data, stage, cs)
         (dst / f'{k}.spv').write_bytes(emit(hdr, ins)); n += 1
         if interlock: res.setdefault('notes', []).append('android: fragment shader interlock removed (no ordering of overlapping fragments)')
         if stripped: res['cbufs'] = [c for c in res['cbufs'] if c.get('slot') != CBSIZE_BANK]; ncs += 1

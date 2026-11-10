@@ -41,6 +41,8 @@ static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one 
 
 // ---------------- The device ----------------
 static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
+// NVN2 task and mesh shaders (gfx_vk_mesh.inc): VK_EXT_mesh_shader with its task stage, the draw calls, and the most workgroups a draw's X may launch (task, mesh)
+static int g_mesh; static PFN_vkCmdDrawMeshTasksEXT g_draw_mesh; static uint32_t g_mesh_max[2];
 static int g_fmt_list;   // VK_KHR_image_format_list enabled (vt_create)
 static void pb_dump(void);   // gfx_vk_draw.inc: the pipelines being built, for a crash dump
 static int g_stencil_export;   // VK_EXT_shader_stencil_export enabled: a fragment shader writes the stencil test's value (gfx_vk_dscopy.inc)
@@ -74,7 +76,7 @@ static void vk_create(void) {
     if (g_vk.qf == nq) { LOG("[RED] [vk] no graphics queue"); return; }
     uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, NULL);
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
-    const char *dext[5]; uint32_t nde = 0;
+    const char *dext[10]; uint32_t nde = 0;
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
     int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
@@ -84,6 +86,10 @@ static void vk_create(void) {
     // colour images name the formats they are viewed in (vt_create: Adreno's framebuffer compression); core only from Vulkan 1.2, and the instance asks for 1.1
     if ((g_fmt_list = has_ext(de, nd, "VK_KHR_image_format_list"))) dext[nde++] = "VK_KHR_image_format_list";
     int hqr = qr_host_env() && has_ext(de, nd, "VK_EXT_host_query_reset");   // the completion thread resets the queries a chunk used (Query resets below); core only from Vulkan 1.2
+    // NVN2's task and mesh shaders as Vulkan's (Adreno 840: Qualcomm's driver has it, Turnip and the Adreno 7xx drivers do not). Its modules are SPIR-V 1.4, which the
+    // Vulkan 1.1 instance takes through VK_KHR_spirv_1_4 (and the float controls it builds on). DM_VK_MESH=0 (env.txt): the draws are skipped, as on GPUs without it
+    int mesh = has_ext(de, nd, "VK_EXT_mesh_shader") && has_ext(de, nd, "VK_KHR_spirv_1_4") && has_ext(de, nd, "VK_KHR_shader_float_controls");
+    { const char *e = getenv("DM_VK_MESH"); if (e && *e == '0') mesh = 0; }
     free(de);
     VkPhysicalDeviceFeatures want = {.textureCompressionBC = f.textureCompressionBC, .textureCompressionASTC_LDR = f.textureCompressionASTC_LDR,
                                      .textureCompressionETC2 = f.textureCompressionETC2, .independentBlend = f.independentBlend, .geometryShader = f.geometryShader,
@@ -104,15 +110,25 @@ static void vk_create(void) {
     if (VK_API_VERSION_MINOR(g_vk.props.apiVersion) >= 1 || VK_API_VERSION_MAJOR(g_vk.props.apiVersion) > 1) vkGetPhysicalDeviceFeatures2(g_vk.pd, &f2);
     hqr = hqr && hq.hostQueryReset;
     if (hqr) dext[nde++] = "VK_EXT_host_query_reset";
+    VkPhysicalDeviceMeshShaderFeaturesEXT msf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    if (mesh) { VkPhysicalDeviceFeatures2 mf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &msf}; vkGetPhysicalDeviceFeatures2(g_vk.pd, &mf); mesh = msf.meshShader && msf.taskShader; }
+    VkPhysicalDeviceMeshShaderFeaturesEXT mse = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, .meshShader = VK_TRUE, .taskShader = VK_TRUE};
+    if (mesh) { dext[nde++] = "VK_EXT_mesh_shader"; dext[nde++] = "VK_KHR_spirv_1_4"; dext[nde++] = "VK_KHR_shader_float_controls";
+        VkPhysicalDeviceMeshShaderPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT}; VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &mp};
+        vkGetPhysicalDeviceProperties2(g_vk.pd, &p2); g_mesh_max[0] = mp.maxTaskWorkGroupCount[0]; g_mesh_max[1] = mp.maxMeshWorkGroupCount[0]; }
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dve = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, .vertexAttributeInstanceRateDivisor = dv.vertexAttributeInstanceRateDivisor};
     VkPhysicalDeviceHostQueryResetFeaturesEXT hqe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, .pNext = divisor ? &dve : NULL, .hostQueryReset = VK_TRUE};
     VkPhysicalDeviceShaderDrawParametersFeatures dpe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hqe : divisor ? (void *)&dve : NULL, .shaderDrawParameters = dp.shaderDrawParameters};
     g_divisor = divisor && dv.vertexAttributeInstanceRateDivisor;
     if (!dp.shaderDrawParameters) LOG("[RED] [vk] no shaderDrawParameters: translated vertex shaders declare DrawParameters");
+    if (mesh) { mse.pNext = dpe.pNext; dpe.pNext = &mse; }
     VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &dpe, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qc, .enabledExtensionCount = nde, .ppEnabledExtensionNames = dext,
                              .pEnabledFeatures = &want};
     if (vkCreateDevice(g_vk.pd, &dc, NULL, &g_vk.dev) != VK_SUCCESS) { LOG("[RED] [vk] no Vulkan device"); return; }
     vkGetDeviceQueue(g_vk.dev, g_vk.qf, 0, &g_vk.q);
+    if (mesh) { g_draw_mesh = (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(g_vk.dev, "vkCmdDrawMeshTasksEXT");
+        g_mesh = g_draw_mesh != NULL && g_mesh_max[0] && g_mesh_max[1]; }
+    LOG("[vk] task / mesh shaders: %s", g_mesh ? "on (VK_EXT_mesh_shader)" : mesh ? "[RED] VK_EXT_mesh_shader enabled but vkCmdDrawMeshTasksEXT was not found: their draws are skipped" : "no VK_EXT_mesh_shader (or DM_VK_MESH=0): their draws are skipped");
     if (hqr && !(g_qreset = (PFN_vkResetQueryPoolEXT)vkGetDeviceProcAddr(g_vk.dev, "vkResetQueryPoolEXT"))) LOG("[RED] [vk] VK_EXT_host_query_reset is enabled but vkResetQueryPoolEXT was not found");
     LOG("[vk] query resets: %s", g_qreset ? "on the host, the queries each chunk used, once read (VK_EXT_host_query_reset)" : qr_used() ? "in the command buffer, the queries the chunk used last time"
                                                                                                                                      : "in the command buffer, every pool at every chunk begin (DM_VK_QRESET_USED=0)");
@@ -1519,6 +1535,7 @@ static void clear_tex(const p_clear_tex *ct) {
 
 static int png_texels(const char *path, VkFormat f, int bpp, const uint8_t *p, uint32_t w, uint32_t x, uint32_t y, uint32_t cw, uint32_t ch, int flip);   // below (the pass dump's PNGs)
 #include "gfx_vk_draw.inc"
+#include "gfx_vk_mesh.inc"
 #include "gfx_vk_dscopy.inc"
 
 // ---------------- Submission ----------------
@@ -1688,8 +1705,9 @@ void mtl_exec(const uint8_t *p) {
             case OP_DRAW: if (rc_skips()) break;
                 if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
                 { p_draw t; const p_draw *dw = draw_rec(a, h.size, &t);   // short records: draw_rec (nvn_obj.h)
-                  if (dw->prim == DM_PRIM_MESH_TASKS) {   // NVN2's DrawMeshTasks: the Adreno 740's driver (Vulkan 1.3.128) has no VK_EXT_mesh_shader, and no lowering is ported (nvn_mtl.m runs them as Metal mesh draws)
-                      RED_ONCE(131, "task / mesh shader draws (NVN2 DrawMeshTasks) are skipped: no mesh shaders on this replay (Mario Kart World's roadside bushes and grass tufts)"); g_mesh_skipped++; break; }
+                  if (dw->prim == DM_PRIM_MESH_TASKS) {   // NVN2's DrawMeshTasks: on VK_EXT_mesh_shader (gfx_vk_mesh.inc); the Adreno 7xx drivers and Turnip have none, and no lowering is ported
+                      if (g_mesh) { if (!vk_mesh_draw(dw)) g_draws_dropped++; break; }
+                      RED_ONCE(131, "task / mesh shader draws (NVN2 DrawMeshTasks) are skipped: no VK_EXT_mesh_shader on this GPU (Mario Kart World's roadside bushes and grass tufts)"); g_mesh_skipped++; break; }
                   if (!vk_draw(dw, NULL)) g_draws_dropped++; break; }
             case OP_DRAW_IDX: if (rc_skips()) break;
                 if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();

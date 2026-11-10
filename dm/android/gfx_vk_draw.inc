@@ -112,7 +112,7 @@ static void pcache_made(void) {   // pipe_get made a pipeline (under g_bk)
 typedef struct { int binding, slot; uint32_t ext; } rb_cbuf;   // ext: bytes the shader reads of it (cb_ext_pick: res.json's or spv_cb_ext2's; 0 = all)
 typedef struct { int binding, slot, cb_slot, cb_off, flags; } rb_sbuf;
 typedef struct { int binding, type, cbuf_slot, handle, array, separate, flags; VkFormat fmt; int samp_slot; } rb_tex;   // fmt: an image's declared format (0: Unknown); cbuf_slot / samp_slot: the banks of the texture and sampler handles (rb_tex_read)
-enum { SH_VS, SH_PS, SH_GS, SH_TS, SH_CS };
+enum { SH_VS, SH_PS, SH_GS, SH_TS, SH_CS, SH_MS, SH_TK };   // SH_TS tessellation; SH_MS / SH_TK NVN2's mesh and task shaders (gfx_vk_mesh.inc)
 // constant buffers a shader may bind: up to 18 of banks 0 to 17, plus NVN2's push constants (c24, DMSH_PUSH_BANK) and the uniform slots' size table (c25,
 // DMSH_CBSIZE_BANK), which the translator adds to every shader that reads a uniform slot: a binding past the cap would be dropped without a word
 #define CB_MAX 20
@@ -123,7 +123,9 @@ typedef struct {
     char vin[16];   // vertex inputs' types: 'f' float, 'u' uint, 's' int (res.json "vin")
     int vid;   // a vertex shader reading gl_VertexIndex: its draws keep their vertex numbers (bind_vbufs lo 0)
     uint32_t io_in, io_out;   // the locations of its user-defined inputs and outputs (bit n: location n)
+    uint32_t io_prim;   // a mesh shader's per-primitive outputs (res.json prim_locs, spv_mesh.py): its fragment shaders read them PerPrimitiveEXT
     struct { uint32_t miss; VkShaderModule m; } var[4]; int nvar;   // fragment shaders: variants with unwritten inputs made constants (ps_variant)
+    struct { uint32_t miss, prim; VkShaderModule m; } pvar[2]; int npvar;   // fragment shaders: variants reading a mesh shader's per-primitive outputs (gfx_vk_mesh.inc ps_variant_prim)
     int b0;   // a module of its set (.spv, .z.spv, .tf.spv; ps_variant only makes inputs private) reads binding 0, the support buffer (spv_b0_used): stage_set writes it only then
     int wlayer;   // a vertex, tessellation or geometry shader that writes the layer (spv_layer_out): its draws get every layer of their targets (rp_prepare)
     ds_list *dsf;   // its descriptor sets kept by each chunk, [2 chunk + tf] (dsl, dsl_tf): made at its first set (ds_get), never freed (as the shader)
@@ -436,9 +438,12 @@ static vshader *sh_get(const char *key) {
     fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET); char *txt = calloc(1, (size_t)len + 1); fread(txt, 1, (size_t)len, f); fclose(f);
     jv r; js_parse(txt, &r); free(txt);
     const jv *st = js_get(&r, "stage"); const char *sn = st && st->s ? st->s : "vs";
-    s->stage = !strcmp(sn, "ps") ? SH_PS : !strcmp(sn, "gs") ? SH_GS : !strcmp(sn, "cs") ? SH_CS : !strcmp(sn, "vs") ? SH_VS : SH_TS;
-    s->vkstage = s->stage == SH_PS ? VK_SHADER_STAGE_FRAGMENT_BIT : s->stage == SH_GS ? VK_SHADER_STAGE_GEOMETRY_BIT : s->stage == SH_CS ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_VERTEX_BIT;
-    s->set = js_int(&r, "set", s->stage == SH_PS ? 1 : s->stage == SH_GS ? 2 : 0);
+    s->stage = !strcmp(sn, "ps") ? SH_PS : !strcmp(sn, "gs") ? SH_GS : !strcmp(sn, "cs") ? SH_CS : !strcmp(sn, "vs") ? SH_VS : !strcmp(sn, "ms") ? SH_MS : !strcmp(sn, "ts") ? SH_TK : SH_TS;
+    s->vkstage = s->stage == SH_PS ? VK_SHADER_STAGE_FRAGMENT_BIT : s->stage == SH_GS ? VK_SHADER_STAGE_GEOMETRY_BIT : s->stage == SH_CS ? VK_SHADER_STAGE_COMPUTE_BIT
+               : s->stage == SH_MS ? VK_SHADER_STAGE_MESH_BIT_EXT : s->stage == SH_TK ? VK_SHADER_STAGE_TASK_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT;
+    s->set = js_int(&r, "set", s->stage == SH_PS ? 1 : s->stage == SH_GS || s->stage == SH_TK ? 2 : 0);
+    s->io_prim = (uint32_t)js_int(&r, "prim_locs", 0);
+    if ((s->stage == SH_MS || s->stage == SH_TK) && !g_mesh) { js_free(&r); RED_ONCE(161, "task / mesh shader %s on a GPU without VK_EXT_mesh_shader: its draws are skipped", s->key); return NULL; }
     const jv *a = js_get(&r, "cbufs"); uint32_t rext[CB_MAX] = {0};   // rext: res.json's extents (cb_ext_pick)
     for (int i = 0; a && i < a->n && s->ncb < CB_MAX; i++) { rext[s->ncb] = (uint32_t)js_int(&a->kid[i], "ext", 0); s->cb[s->ncb++] = (rb_cbuf){js_int(&a->kid[i], "binding", 0), js_int(&a->kid[i], "slot", 0), 0}; }
     a = js_get(&r, "sbufs");
@@ -453,7 +458,7 @@ static vshader *sh_get(const char *key) {
     snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key); s->mod = sh_module(p, &s->b0);
     { size_t nw = 0; uint32_t *w = spv_read(p, &nw);
       if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); s->wlayer = s->stage != SH_PS && s->stage != SH_CS && spv_layer_out(w, nw); uint32_t ext[CB_MAX]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
-    if (s->stage == SH_VS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p, &s->b0); }
+    if (s->stage == SH_VS || s->stage == SH_MS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p, &s->b0); }
     if (s->tf_stride[0] | s->tf_stride[1] | s->tf_stride[2] | s->tf_stride[3]) { snprintf(p, sizeof p, "%s/%s.tf.spv", g_spv_dir, s->key); s->modtf = sh_module(p, &s->b0); }
     if (!s->mod) return NULL;
     // the set's layout: support buffer, constant buffers, storage buffers, textures, images
@@ -673,7 +678,8 @@ static int draw_state_is(uint32_t op) {
 static int draw_state_op(uint32_t op, const void *a) {
     if (!g_d_init) draw_state_reset();   // NVN's defaults, once (the state carries over between submissions, as in nvn_mtl.m)
     switch (op) {
-        case OP_BIND_PROGRAM: { const p_bind_program *b = a; for (int st = 0; st < 5; st++) if (b->stages >> st & 1) D.bst[st] = b->prog; if (b->stages & 0x20) D.cprog = b->prog; return 1; }
+        case OP_BIND_PROGRAM: { const p_bind_program *b = a; int bits = (b->stages & 0x1f) | (b->stages & 0x40 ? 8 : 0) | (b->stages & 0x80 ? 16 : 0);   // NVN2's task and mesh bits: stages 3 and 4 (nvn_mtl.m gfx_stage_bits)
+            for (int st = 0; st < 5; st++) if (bits >> st & 1) D.bst[st] = b->prog; if (b->stages & 0x20) D.cprog = b->prog; return 1; }
         case OP_BIND_STATE: { const p_bind_state *b = a; blend_st bs;
             if (pso_memo_on() && b->kind >= 0 && b->kind <= 5) {   // g_pso_gen: the fields the key takes (vk_draw_), before they are stored (colour's alpha test and multisample's
                 int ch = 0;                                         // fields but alpha-to-coverage are not in the key)
@@ -1406,16 +1412,23 @@ static void pb_dump(void) {   // crash.c, on the crashing thread, after its back
 }
 // The pipeline of key k into pp (its layout and pipeline). Under the replay's lock from pipe_get; the start-up list (prewarm_thread) calls it without the lock after pipe_prep,
 // so a compile there no longer holds the game's draws up (the driver's pipeline cache is internally synchronized)
+#define MESH_PC_BYTES 16   // a task / mesh pipeline's push constant block (spv_mesh.py, gfx_vk_mesh.inc): the draw's first workgroup at 0
+static VkShaderModule pipe_ps_mod(const pipe_key *k, vshader *s);
+static VkShaderModule ps_variant_prim(vshader *s, uint32_t miss, uint32_t prim);   // gfx_vk_mesh.inc
+// the stage before the fragment shader: the geometry shader (a task shader in slot 2 comes before the mesh shader), else the vertex or mesh shader
+static const vshader *pipe_ps_prev(const pipe_key *k) { return k->sh[2] && k->sh[2]->stage == SH_GS ? k->sh[2] : k->sh[0]; }
 static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t *onva, VkPrimitiveTopology *otp) {
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &g_empty_dsl); }
     VkDescriptorSetLayout sets[4] = {g_empty_dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl}; uint32_t nset = 1;
     VkPipelineShaderStageCreateInfo st[4]; uint32_t ns = 0;
     for (int i = 0; i < 4; i++) { vshader *s = k->sh[i]; if (!s) continue;
         sets[s->set & 3] = k->tf ? s->dsl_tf : s->dsl; if ((uint32_t)(s->set & 3) + 1 > nset) nset = (uint32_t)(s->set & 3) + 1;
-        VkShaderModule mod = k->tf ? s->modtf : s->stage == SH_VS && k->z && s->modz ? s->modz : s->mod;
-        if (s->stage == SH_PS) { const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0; if (miss) mod = ps_variant(s, miss); }   // see spv_drop_inputs
+        VkShaderModule mod = k->tf ? s->modtf : (s->stage == SH_VS || s->stage == SH_MS) && k->z && s->modz ? s->modz : s->mod;
+        if (s->stage == SH_PS) mod = pipe_ps_mod(k, s);   // see spv_drop_inputs
         st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .module = mod, .pName = "main"}; }
-    VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nset, .pSetLayouts = sets};
+    int mesh = k->sh[0] && k->sh[0]->stage == SH_MS;   // a task / mesh pipeline (gfx_vk_mesh.inc): no vertex input, the draw's first workgroup in a push constant
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, 0, MESH_PC_BYTES};
+    VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nset, .pSetLayouts = sets, .pushConstantRangeCount = mesh ? 1u : 0u, .pPushConstantRanges = &pcr};
     if (vkCreatePipelineLayout(g_vk.dev, &lc, NULL, &pp->pl) != VK_SUCCESS) return VK_ERROR_INITIALIZATION_FAILED;
     VkVertexInputBindingDescription vb[32]; VkVertexInputAttributeDescription va[16]; VkVertexInputBindingDivisorDescriptionEXT vd[32]; uint32_t nvd = 0; uint32_t nvb = 0, nva = 0; uint32_t used = 0;
     for (int i = 0; i < 16; i++) {
@@ -1470,11 +1483,11 @@ static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                             VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = sizeof dyn / sizeof *dyn, .pDynamicStates = dyn};
-    VkGraphicsPipelineCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = ns, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+    VkGraphicsPipelineCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = ns, .pStages = st, .pVertexInputState = mesh ? NULL : &vi, .pInputAssemblyState = mesh ? NULL : &ia,
         .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb_, .pDynamicState = &dy, .layout = pp->pl, .renderPass = k->rp};
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     const char *pbk[4]; uint32_t miss = 0; for (int i = 0; i < 4; i++) { pbk[i] = k->sh[i] ? k->sh[i]->key : NULL;
-        if (k->sh[i] && k->sh[i]->stage == SH_PS) { const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; miss = pv ? k->sh[i]->io_in & ~pv->io_out : 0; } }
+        if (k->sh[i] && k->sh[i]->stage == SH_PS) { const vshader *pv = pipe_ps_prev(k); miss = pv ? k->sh[i]->io_in & ~pv->io_out : 0; } }
     int pb = pb_begin('g', pbk, (uint8_t)tp, (uint8_t)k->ncolor, (uint8_t)(k->z != 0), miss);
     VkResult pr = vkCreateGraphicsPipelines(g_vk.dev, pcache(), 1, &pc, NULL, &pp->p);
     pb_end(pb);
@@ -1483,7 +1496,8 @@ static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t
     return pr;
 }
 static VkShaderModule pipe_ps_mod(const pipe_key *k, vshader *s) {   // the fragment shader's module: a variant when the earlier stage leaves inputs unwritten (spv_drop_inputs)
-    const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0;
+    const vshader *pv = pipe_ps_prev(k); uint32_t miss = pv ? s->io_in & ~pv->io_out : 0;
+    if (pv && pv->stage == SH_MS && (s->io_in & pv->io_prim & ~miss)) return ps_variant_prim(s, miss, s->io_in & pv->io_prim & ~miss);   // inputs a mesh shader writes per primitive
     return miss ? ps_variant(s, miss) : s->mod;
 }
 static void pipe_prep(const pipe_key *k) {   // under the lock: what pipe_make would otherwise create in shared state
@@ -1682,7 +1696,7 @@ static void ds_chunk_done(chunk *c) {
     for (int i = 0; i < c->ndl; i++) c->dl[i]->n = 0;
     c->dp_cur = 0; c->ndl = 0; c->nds = 0; atomic_fetch_add(&g_ds_resets, 1);
 }
-static const uint8_t c_bases[6] = {0x11, 0x51, 0x41, 0, 0, 0x31};   // c0 storage-buffer address table per NVN stage (×0x10): vertex 0x110, fragment 0x510, geometry 0x410, compute 0x310
+static const uint8_t c_bases[6] = {0x11, 0x51, 0x41, 0x67, 0x77, 0x31};   // c0 storage-buffer address table per NVN stage (×0x10): vertex 0x110, fragment 0x510, geometry 0x410, compute 0x310, NVN2 task 0x670 and mesh 0x770 (dmsh_abi.h)
 // The driver banks of a stage, made from the bound state: c0 (storage buffer addresses, base instance at 0x644) and c2 (texture, image and sampler handles)
 static uint32_t g_cdim[3];   // the current dispatch's group counts (c0 + 0x200 for compute)
 static void bank_c0(int nst, uint8_t *b, uint32_t base_inst) {
@@ -1732,7 +1746,7 @@ static const uint8_t *c2_bank(int nst, uint8_t *buf) {
     static uint32_t nb; if (c2_check() && !(nb++ & 63)) for (uint32_t b = 0; b < C2_SIZE; b += 4) { uint32_t w; memcpy(&w, buf + b, 4); uint32_t d = c2_word(nst, b); g_c2_checked++; if (w != d) c2_differs(nst, b, w, d); }
     return buf;
 }
-static int nvn_stage_of(int s) { return s == SH_PS ? 1 : s == SH_GS ? 2 : s == SH_CS ? 5 : 0; }
+static int nvn_stage_of(int s) { return s == SH_PS ? 1 : s == SH_GS ? 2 : s == SH_CS ? 5 : s == SH_TK ? 3 : s == SH_MS ? 4 : 0; }   // task and mesh: the host's stages 3 and 4 (hle_nvn.c st_host)
 // a word of a constant bank: c2 (c2_bank: NULL reads it with c2_word), or a game uniform buffer (c3 + slot)
 static uint32_t bank_word(int nst, const uint8_t *c2, int slot, uint32_t byte) {
     uint32_t w = 0;
@@ -1903,7 +1917,7 @@ typedef struct { int tid; treg_t r; vtex *v; } tc_ent;   // r: the registry entr
 typedef struct { const vshader *s; uint64_t gen, tok; int n, cap; tc_ent *e; } tc_stage;   // gen, tok: g_vt_gen and nvn_dirty_now() when stage_textures began
 static tc_stage g_tc[5];   // by stage slot (tc_slot); s NULL: nothing kept
 static uint64_t g_tc_hit, g_tc_again, g_sc_hit, g_sc_made;   // elements stage_set took from stage_textures / resolved again; samplers found per ID / made or looked up
-static int tc_slot(int stage) { return stage == SH_VS ? 0 : stage == SH_PS ? 1 : stage == SH_GS ? 2 : stage == SH_CS ? 4 : 3; }
+static int tc_slot(int stage) { return stage == SH_VS || stage == SH_MS ? 0 : stage == SH_PS ? 1 : stage == SH_GS || stage == SH_TK ? 2 : stage == SH_CS ? 4 : 3; }   // a mesh draw has no vertex or geometry shader
 static void tc_clear(void) { for (int i = 0; i < 5; i++) g_tc[i].s = NULL; }
 static const tc_ent *tc_el(const tc_stage *c, int ci, int tid) {   // stage_set's element ci (the stage's texture then image elements, buffer textures left out) as kept, or NULL
     if (!c || ci >= c->n || c->e[ci].tid != tid || (c->e[ci].r.ok && !c->e[ci].v) || c->gen != g_vt_gen || c->tok != nvn_dirty_now()) { g_tc_again++; return NULL; }   // no image made: asked again
@@ -2505,6 +2519,28 @@ static void pipe_key_build(pipe_key *k, int prim) {
       ms_st m; memset(&m, 0, sizeof m); m.a2c = k->ms.a2c; k->ms = m;
       if (!k->sh[0]->modz) k->z = 0; }
 }
+// a draw's dynamic state: the viewport (see the file header for the origin), the scissor, stencil, blend constants, depth bias (vk_draw_, gfx_vk_mesh.inc vk_mesh_draw_);
+// *ov / *osc: the viewport and scissor set, for the dump's log
+static void draw_dyn_state(VkCommandBuffer c, VkViewport *ov, VkRect2D *osc) {
+    float vx = 0, vy = 0, vw = (float)P.w, vh = (float)P.h; if (D.has_vp) { vx = D.vp[0][0]; vy = D.vp[0][1]; vw = D.vp[0][2]; vh = D.vp[0][3]; }
+    float n = D.dr[0] < 0 ? 0 : D.dr[0] > 1 ? 1 : D.dr[0], f = D.dr[1] < 0 ? 0 : D.dr[1] > 1 ? 1 : D.dr[1];
+    VkViewport v = g_origin_ll ? (VkViewport){vx, vy, vw, vh, n, f} : (VkViewport){vx, vy + vh, vw, -vh, n, f};
+    if (!bf_same(c, BF_VP, &g_bf.vp, &v, sizeof v)) vkCmdSetViewport(c, 0, 1, &v);
+    VkRect2D sc = {{0, 0}, {P.w, P.h}};
+    if (R.has_sc) { int x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y; int64_t x1 = (int64_t)R.sc.x + R.sc.w, y1 = (int64_t)R.sc.y + R.sc.h;
+        if (x1 > (int64_t)P.w) x1 = P.w; if (y1 > (int64_t)P.h) y1 = P.h;
+        sc = (VkRect2D){{x0, y0}, {(uint32_t)(x1 > x0 ? x1 - x0 : 0), (uint32_t)(y1 > y0 ? y1 - y0 : 0)}}; }
+    if (!bf_same(c, BF_SC, &g_bf.sc, &sc, sizeof sc)) vkCmdSetScissor(c, 0, 1, &sc);
+    if (!bf_same(c, BF_BC, g_bf.bc, D.blend_color, sizeof g_bf.bc)) vkCmdSetBlendConstants(c, D.blend_color);
+    if (!bf_same(c, BF_CM0, &g_bf.cm[0], &D.st_vmask[0], 4)) vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, D.st_vmask[0]);
+    if (!bf_same(c, BF_CM1, &g_bf.cm[1], &D.st_vmask[1], 4)) vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, D.st_vmask[1]);
+    if (!bf_same(c, BF_WM0, &g_bf.wm[0], &D.st_wmask[0], 4)) vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, D.st_wmask[0]);
+    if (!bf_same(c, BF_WM1, &g_bf.wm[1], &D.st_wmask[1], 4)) vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, D.st_wmask[1]);
+    if (!bf_same(c, BF_REF0, &g_bf.ref[0], &D.st_ref[0], 4)) vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, D.st_ref[0]);
+    if (!bf_same(c, BF_REF1, &g_bf.ref[1], &D.st_ref[1], 4)) vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, D.st_ref[1]);
+    { float db[3] = {D.po.units, g_vk_feat.depthBiasClamp ? D.po.clamp : 0, D.po.factor}; if (!bf_same(c, BF_DB, g_bf.db, db, sizeof db)) vkCmdSetDepthBias(c, db[0], db[1], db[2]); }
+    *ov = v; *osc = sc;
+}
 static uint64_t g_drop[8];   // draws not made, by reason: 0 shader missing, 1 targets, 2 pipeline, 3 descriptors, 4 an invalid binding, 5 pass, 6 vertex buffers
 static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!g_d_init) draw_state_reset();
@@ -2527,7 +2563,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
         for (unsigned i = 0; i < pr->nstage && i < 6; i++) {
             uint8_t key[8]; char hx[17]; if (!prog_key(pr, i, key)) continue; key_hex(key, hx);
             vshader *s = sh_get(hx); if (!s) { g_drop[0]++; return 0; }
-            if (s->stage == SH_CS) continue;
+            if (s->stage == SH_CS || s->stage == SH_MS || s->stage == SH_TK) continue;   // a mesh program's stages: its DrawMeshTasks (gfx_vk_mesh.inc)
             if (s->stage == SH_TS) { RED_ONCE(100, "tessellation shaders are not on Vulkan yet: draw skipped (shader %s)", s->key); return 0; }
             int slot = s->stage == SH_VS ? 0 : s->stage == SH_PS ? 1 : s->stage == SH_GS ? 2 : 3;
             if (D.bst[slot] != pr) continue;
@@ -2565,24 +2601,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     occl_begin();
     bf_pipeline(c, pp->p);   // binds the command buffer already holds are left out (bf_*)
     for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], 0, NULL);
-    // dynamic state: the viewport (see the file header for the origin), the scissor, stencil, blend constants, depth bias
-    float vx = 0, vy = 0, vw = (float)P.w, vh = (float)P.h; if (D.has_vp) { vx = D.vp[0][0]; vy = D.vp[0][1]; vw = D.vp[0][2]; vh = D.vp[0][3]; }
-    float n = D.dr[0] < 0 ? 0 : D.dr[0] > 1 ? 1 : D.dr[0], f = D.dr[1] < 0 ? 0 : D.dr[1] > 1 ? 1 : D.dr[1];
-    VkViewport v = g_origin_ll ? (VkViewport){vx, vy, vw, vh, n, f} : (VkViewport){vx, vy + vh, vw, -vh, n, f};
-    if (!bf_same(c, BF_VP, &g_bf.vp, &v, sizeof v)) vkCmdSetViewport(c, 0, 1, &v);
-    VkRect2D sc = {{0, 0}, {P.w, P.h}};
-    if (R.has_sc) { int x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y; int64_t x1 = (int64_t)R.sc.x + R.sc.w, y1 = (int64_t)R.sc.y + R.sc.h;
-        if (x1 > (int64_t)P.w) x1 = P.w; if (y1 > (int64_t)P.h) y1 = P.h;
-        sc = (VkRect2D){{x0, y0}, {(uint32_t)(x1 > x0 ? x1 - x0 : 0), (uint32_t)(y1 > y0 ? y1 - y0 : 0)}}; }
-    if (!bf_same(c, BF_SC, &g_bf.sc, &sc, sizeof sc)) vkCmdSetScissor(c, 0, 1, &sc);
-    if (!bf_same(c, BF_BC, g_bf.bc, D.blend_color, sizeof g_bf.bc)) vkCmdSetBlendConstants(c, D.blend_color);
-    if (!bf_same(c, BF_CM0, &g_bf.cm[0], &D.st_vmask[0], 4)) vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, D.st_vmask[0]);
-    if (!bf_same(c, BF_CM1, &g_bf.cm[1], &D.st_vmask[1], 4)) vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, D.st_vmask[1]);
-    if (!bf_same(c, BF_WM0, &g_bf.wm[0], &D.st_wmask[0], 4)) vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, D.st_wmask[0]);
-    if (!bf_same(c, BF_WM1, &g_bf.wm[1], &D.st_wmask[1], 4)) vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, D.st_wmask[1]);
-    if (!bf_same(c, BF_REF0, &g_bf.ref[0], &D.st_ref[0], 4)) vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, D.st_ref[0]);
-    if (!bf_same(c, BF_REF1, &g_bf.ref[1], &D.st_ref[1], 4)) vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, D.st_ref[1]);
-    { float db[3] = {D.po.units, g_vk_feat.depthBiasClamp ? D.po.clamp : 0, D.po.factor}; if (!bf_same(c, BF_DB, g_bf.db, db, sizeof db)) vkCmdSetDepthBias(c, db[0], db[1], db[2]); }
+    VkViewport v; VkRect2D sc; draw_dyn_state(c, &v, &sc);
     // indices: copied, quads made triangles; vertex range for the vertex data copy
     int64_t vlo = 0, vhi = 0; uint32_t count = dw ? (uint32_t)dw->count : (uint32_t)di->count, inst = (uint32_t)(dw ? dw->instances : di->instances); if (!inst) inst = 1;
     int quads = prim == 7, qstrip = prim == 8; VkBuffer ib = VK_NULL_HANDLE; VkDeviceSize ioff = 0; uint32_t icount = count; int i32 = 0;
