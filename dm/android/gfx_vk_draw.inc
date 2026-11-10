@@ -3016,18 +3016,20 @@ static int is_int_fmt(VkFormat f) {
 // The pass a clear of colour slot `slot` (-1: the depth target) is made in: a layered one when the target's view covers more than one layer or slice, as a layered draw
 // gets, so the clear reaches all of them in either order, clear then draw or draw then clear (as nvn_mtl.m clears a view of more layers than its pass in a pass of its
 // own: rendering.md, "Clears of layered render targets in a pass that is not layered"). In a pass of one layer, a clear before the first layered draw cleared slice 0
-// alone, and that draw reopened the pass layered and loaded the other slices as they were. → *nl: the layers the view covers (1: one)
-static int clear_rp_prepare(int slot, uint32_t *nl) {
+// alone, and that draw reopened the pass layered and loaded the other slices as they were. full: the clear writes every channel / stencil bit, so it can be a rect of every
+// layer (clear_rect_layers); a masked clear is a draw of layer 0 whatever the pass, so it asks for no layered pass, which would only end the open one. → *nl: the layers
+// the view covers (1: one), 1 for a masked clear
+static int clear_rp_prepare(int slot, int full, uint32_t *nl) {
     vtex *v = NULL; const view_t *vw = NULL; *nl = 1;
     if (slot >= 0 && slot < R.rt.n && R.rt.color[slot]) { v = vt_get(R.rt.color[slot]); vw = R.rt.has_cview[slot] ? &R.rt.cview[slot] : NULL; }
     else if (slot < 0 && R.rt.depth) { v = vt_get(R.rt.depth); vw = R.rt.has_dview ? &R.rt.dview : NULL; }
-    if (v) { uint32_t lv = vw && vw->set_levels ? vw->base_level : 0, ly = vw && vw->set_layers ? vw->min_layer : 0; if (lv < v->levels) *nl = rt_layers(v, vw, lv, ly); }
+    if (v && full) { uint32_t lv = vw && vw->set_levels ? vw->base_level : 0, ly = vw && vw->set_layers ? vw->min_layer : 0; if (lv < v->levels) *nl = rt_layers(v, vw, lv, ly); }
     return rp_prepare_(*nl > 1);
 }
 // A full clear in the bound targets' pass when its target is the pass's size and the pass has every layer its view covers; else (DM_VK_LAYERED=0, or a pass whose other
 // targets have fewer layers) the clear is made outside the pass, on the whole view (gfx_vk.c clear_color, clear_ds)
 static int clear_in_pass(const vtex *v, int slot, unsigned level, int depth) {
-    uint32_t nl; if (!clear_rp_prepare(slot, &nl) || (depth && !P.key.depth) || (nl > 1 && P.layers < nl)) return 0;
+    uint32_t nl; if (!clear_rp_prepare(slot, 1, &nl) || (depth && !P.key.depth) || (nl > 1 && P.layers < nl)) return 0;
     return (v->w >> level ? v->w >> level : 1) == P.w && (v->h >> level ? v->h >> level : 1) == P.h;
 }
 // A clear in the pass covers every layer of its framebuffer (clear_rp_prepare above makes it layered for a view of several): NVN clears the whole bound target, and in a layered pass (a 3D or array target attached whole for a draw
@@ -3039,7 +3041,7 @@ static VkClearRect clear_rect_layers(VkRect2D r) { return (VkClearRect){r, 0, P.
 // A colour clear of target idx limited by the scissor and / or a channel mask (gfx_vk.c clear_color takes the full ones)
 static void clear_color_pass(const p_clear_color *cc) {
     bf_reset();   // its pipeline and dynamic state are set behind the bind filter (bf_*)
-    uint32_t nl; if (!clear_rp_prepare(cc->index, &nl) || !rp_start()) return;
+    uint32_t nl; if (!clear_rp_prepare(cc->index, (cc->mask & 0xf) == 0xf, &nl) || !rp_start()) return;
     VkRect2D r = clear_rect(); if (!r.extent.width || !r.extent.height) return;
     int ci = dup_slot(cc->index); VkFormat f = P.key.color[ci];
     if (nl > 1 && P.layers < nl) RED_ONCE(172, "clear of colour slot %d in a pass of %u layers, its view %u: the layers past the pass are not cleared", cc->index, P.layers, nl);
@@ -3059,7 +3061,7 @@ static void clear_color_pass(const p_clear_color *cc) {
 // A depth-stencil clear limited by the scissor and / or a partial stencil mask
 static void clear_ds_pass(const p_clear_ds *cd, VkImageAspectFlags a) {
     bf_reset();   // as clear_color_pass
-    uint32_t nl; if (!clear_rp_prepare(-1, &nl) || !rp_start() || !P.key.depth) return;
+    uint32_t nl; if (!clear_rp_prepare(-1, !(a & VK_IMAGE_ASPECT_STENCIL_BIT) || (cd->stencil_mask & 0xff) == 0xff, &nl) || !rp_start() || !P.key.depth) return;
     if (nl > 1 && P.layers < nl) RED_ONCE(172, "depth-stencil clear in a pass of %u layers, its view %u: the layers past the pass are not cleared", P.layers, nl);
     VkRect2D r = clear_rect(); if (!r.extent.width || !r.extent.height) return;
     uint32_t sm = (uint32_t)cd->stencil_mask & 0xff;
