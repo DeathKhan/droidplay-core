@@ -158,8 +158,12 @@ Numbered in the order they were found, so links to a number stay right:
    `main` at `54711866` (2026-11-09) measured 59.4–59.5 fps there, and `main` at `54e21235` runs it at 59.3–59.4 (frame p95 18.7–18.9 ms, GPU 12.3–12.4 ms),
    the same with `DM_VK_WB_READBACK=0`, so problem 13's fix plays no part. Most likely fixed by droidplay-core#28 (queued NVN commands grow by doubling),
    which `54711866` holds; not measured on its own.
-7. **The Pad 3's H.264 decoder takes no input** in `dm/android/tests/t_media` (`[RED] movie: the AVC decoder took no input for 2 s`), before and
-   after the fix in problem 1. Not yet tried in a game: an H.264 movie there may show black.
+7. **Not seen in a game: the Pad 3's H.264 decoder took no input** in `dm/android/tests/t_media` (`[RED] movie: the AVC decoder took no input for 2 s`), before
+   and after the fix in problem 1.
+   - **In a game it decodes (2026-11-10, no build):** Super Mario Odyssey's first hint video (`MovieData/PlayGuideMovieRStick.mp4`, H.264 High, 480×272) played in
+     the Look Around hint box on the Pad 3, with DroidPlay 0.7.0-1-g4743c9da and the SMO it held (`make_save` route). The log has `[movie] AVC: MediaCodec decoding,
+     profile 100` and 19 pictures of 195,840 bytes (NV12) before the route answers the hint, with no red line and no crash.
+   - `t_media` was not run again, so why it saw no input there is still unknown.
 8. **Fixed: Link's Awakening drew wrongly on all three devices.** Its movies and two of its HUD icons came out in ring-banded colours, and in play the 3D
    world was black behind the HUD, without ambient occlusion. Pass dumps (`dump_now`) of the overworld on the Odin 2 showed where:
    - **Fixed: the colours, a raw copy between two formats.** The frame's last target (`s4`, R11G11B10F) holds the right colours; the game then copies it
