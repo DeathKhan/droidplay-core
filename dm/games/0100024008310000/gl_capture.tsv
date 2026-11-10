@@ -1,0 +1,7 @@
+# GLSL shaders the Eclipse engine puts together at run time (the Mac host's DM_GL_CAPTURE, booting to the title screen): GLSL ES 1.00 (#version 100), in no game file;
+# <key>.vert / <key>.frag, key = sha256(GLSL)[:16]. The NSP script's GL shader capture runs until every one here is captured; gl_shaders.py translates the capture.
+# The Arcade menu and a fight in Street Fighter (1987) used no others (the GL layer made 3 pipelines in all)
+05a14c0441d7e88c.frag
+826a27552a774be7.frag
+c144482cf08fe3f4.vert
+c30e2edbb3773812.vert
