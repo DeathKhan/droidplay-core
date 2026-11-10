@@ -3,21 +3,27 @@
 // segment mask, the result valid up to lane 31 only) and shuffles to that lane, S2R SR_LANEID and the lane masks read the built-ins as they are, BALLOT takes
 // the ballot's first 32 bits and VOTE is the whole subgroup's. On 64-lane subgroups (the Adreno 830's fragment and compute shaders: subgroupSize 64, its minimum
 // and maximum) lanes 32-63 then read lanes 0-31, or keep their own value where Maxwell's derivative idiom (SHFL within the 2x2 quad, fwidth) wants a neighbour's: half
-// of each wave's pixels get a wrong derivative. spv_wide rewrites such a module into what Ryujinx makes for a host subgroup over 32 (QueryHostSubgroupSize in
-// HelperFunctionManager, InstEmitMove, InstEmitWarp), each 32 lanes of the subgroup one warp:
+// of each wave's pixels get a wrong derivative. spv_wide rewrites such a fragment shader into what Ryujinx makes for a host subgroup over 32 (QueryHostSubgroupSize
+// in HelperFunctionManager, InstEmitMove, InstEmitWarp), each 32 lanes of the subgroup one warp:
 // - the lane ID: lane & 31, the lane within its warp;
 // - OpGroupNonUniformShuffle: the index | (lane & ~31), the lane of its own warp;
 // - a ballot's first component and a mask's component 0: its warp's component, lane >> 5;
 // - All, Any and AllEqual (of a predicate): from its warp's ballot, as Ryujinx's EmitVote;
 // - the subgroup size: 32.
 // Exact on any subgroup of 32 lanes or more (on 32, lane & ~31 and lane >> 5 are 0). A module with other subgroup operations or other uses of the built-ins
-// is left as it is. spv_limits.h has the stages that run none. Self-contained (no libc), so that dm/tools/tests/test_spv_wide.py builds it alone.
+// is left as it is, and so is one of another stage (SPV_WIDE_STAGES). spv_limits.h has the stages that run none. Self-contained (no libc), so that
+// dm/tools/tests/test_spv_wide.py builds it alone.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 #include "spv_lit.h"
 
-enum { SPV_WIDE_DONE = 1, SPV_WIDE_KEPT = 2 };   // rewritten; uses it cannot rewrite: as it is
+enum { SPV_WIDE_DONE = 1, SPV_WIDE_KEPT = 2, SPV_WIDE_STAGE = 4 };   // rewritten; uses it cannot rewrite: as it is; of a stage it leaves: as it is
+// The stages spv_wide rewrites: fragment shaders, whose quad shuffles (Maxwell's derivatives) t_quad_shuffle checks on a device. A compute, mesh or task module's
+// shuffles and votes are left as translated, its stage named by spv_wide_wanted for the replay's log, until a device test covers that stage
+#define SPV_WIDE_STAGES 0x10u
+// The most words one use becomes: AllEqual's 44 (two ballots, the lane's load and shift, two extracts, two compares, an OR). A shuffle becomes 20, a lane load 9
+#define SPV_WIDE_SITE 48u
 // The kinds of ids the scan follows: the built-in variables, a pointer to a mask's component 0, a ballot's result; 32-bit integer types and constants, the
 // Input uint pointer types; bool values
 enum { SWK_LANE = 1, SWK_SIZE, SWK_MASK, SWK_MPTR, SWK_BALLOT, SWK_OTHER, SWK_I32, SWK_CONST, SWK_PU, SWK_BOOL = 0x100 };
@@ -26,27 +32,40 @@ static uint32_t spv_wide_bi(uint32_t b) {   // BuiltIn → its kind: SubgroupLoc
     switch (b) { case 41: return SWK_LANE; case 36: return SWK_SIZE; case 38: case 40: return SWK_OTHER; default: return b >= 4416 && b <= 4420 ? SWK_MASK : 0; }
 }
 static int spv_wide_k(uint32_t k) { k &= 0xff; return k >= SWK_LANE && k <= SWK_OTHER; }
-static size_t spv_wide_put(uint32_t *o, size_t k, uint32_t op, const uint32_t *a, uint32_t na) { o[k++] = (na + 1) << 16 | op; for (uint32_t q = 0; q < na; q++) o[k++] = a[q]; return k; }
-#define SPV_WIDE_PUT(op, ...) do { const uint32_t a_[] = {__VA_ARGS__}; k = spv_wide_put(o, k, (op), a_, (uint32_t)(sizeof a_ / sizeof *a_)); } while (0)
+// An execution model's stage bit (VkShaderStageFlagBits): vertex 0x1 .. compute 0x20, task 0x40 and mesh 0x80 (EXT's and NV's); 0 for any other
+static uint32_t spv_wide_stage(uint32_t model) { return model <= 5 ? 1u << model : model == 5267 || model == 5364 ? 0x40 : model == 5268 || model == 5365 ? 0x80 : 0; }
+// o[k..]: the instruction op with its na operands, when it fits in cap words; else *full, and nothing (the result is then dropped)
+static size_t spv_wide_put(uint32_t *o, size_t k, size_t cap, int *full, uint32_t op, const uint32_t *a, uint32_t na) {
+    if (k + 1 + na > cap) { *full = 1; return k; }
+    o[k++] = (na + 1) << 16 | op; for (uint32_t q = 0; q < na; q++) o[k++] = a[q];
+    return k;
+}
+#define SPV_WIDE_PUT(op, ...) do { const uint32_t a_[] = {__VA_ARGS__}; k = spv_wide_put(o, k, cap, &full, (op), a_, (uint32_t)(sizeof a_ / sizeof *a_)); } while (0)
+#define SPV_WIDE_COPY() (k = spv_wide_put(o, k, cap, &full, op, x + 1, len - 1))   // the instruction as it is
 
-// 1 when the module may need spv_wide: a subgroup instruction or built-in in a module whose stage (its first entry point's) runs them. One pass over the
-// instruction heads, without the scratch, so that the modules that use none cost next to nothing
-static int spv_wide_wanted(const uint32_t *w, size_t n, uint32_t sg_stages) {
+// The module's stage bit when it may need spv_wide: a subgroup instruction or built-in in a module whose stage (its entry points') runs them; else 0. spv_wide
+// rewrites SPV_WIDE_STAGES only: of another, the caller says what it leaves. One pass over the instruction heads, without the scratch, so that the modules that
+// use none cost next to nothing
+static uint32_t spv_wide_wanted(const uint32_t *w, size_t n, uint32_t sg_stages) {
     if (n < 5 || w[0] != 0x07230203) return 0;
-    int any = 0;
+    uint32_t st = 0; int any = 0;
     for (size_t i = 5; i < n; ) {
         uint32_t len = w[i] >> 16, op = w[i] & 0xffff;
         if (!len || i + len > n) return 0;
-        if (op == 15 && len >= 3 && (w[i + 1] > 5 || !(sg_stages & (1u << w[i + 1])))) return 0;   // OpEntryPoint of a stage that runs none (spv_limits'), or not a shader stage
+        if (op == 15 && len >= 3) {   // OpEntryPoint: of a stage that runs none (spv_limits'), of no shader stage or of two stages, none
+            uint32_t s = spv_wide_stage(w[i + 1]);
+            if (!(sg_stages & s) || (st && st != s)) return 0;
+            st = s;
+        }
         if (spv_wide_sgop(op) || (op == 71 && len >= 4 && w[i + 2] == 11 && spv_wide_bi(w[i + 3]))) any = 1;
         i += len;
     }
-    return any;
+    return any ? st : 0;
 }
 
 // w[n]: the module. sg_stages: subgroupSupportedStages. scratch: 2 × bound words (w[3]). o[cap]: the result.
-// → the result's word count, or 0 when it is left as it is: its stage runs no subgroup operations or it uses none (*need 0), *what SPV_WIDE_KEPT, or o is
-// NULL or smaller than *need, the words a rewrite takes (call again with that much)
+// → the result's word count, or 0 when it is left as it is: its stage runs no subgroup operations or it uses none (*need 0), *what SPV_WIDE_KEPT or
+// SPV_WIDE_STAGE, or o is NULL or smaller than *need, the words a rewrite takes at most (call again with that much)
 static size_t spv_wide(const uint32_t *w, size_t n, uint32_t sg_stages, uint32_t *scratch, uint32_t *o, size_t cap, size_t *need, int *what) {
     *what = 0; *need = 0;
     if (n < 5 || w[0] != 0x07230203) return 0;
@@ -93,16 +112,17 @@ static size_t spv_wide(const uint32_t *w, size_t n, uint32_t sg_stages, uint32_t
         else if (fn) for (uint32_t q = 1; q < len; q++) if (!spv_lit(op, q) && ID(x[q]) && spv_wide_k(kind[x[q]])) bad = 1;   // any other use of one: not followed
         i += len;
     }
-    if (!used || neps != 1 || model > 5 || !(sg_stages & (1u << model))) return 0;   // the execution model is the stage's bit (vertex 0x1 .. compute 0x20)
+    if (!used || neps != 1 || !(sg_stages & spv_wide_stage(model))) return 0;
+    if (!(spv_wide_stage(model) & SPV_WIDE_STAGES)) { *what = SPV_WIDE_STAGE; return 0; }
     if (bad || !tu) { *what = SPV_WIDE_KEPT; return 0; }
     *what = SPV_WIDE_DONE;
-    *need = n + 32 * (size_t)sites + 64;
+    *need = n + SPV_WIDE_SITE * (size_t)sites + 64;   // each use at its most, and the 45 words of declarations at most
     if (!o || cap < *need) return 0;
     uint32_t nb = bound, new_lane = 0, new_tpu = 0, new_v4u = 0;
     if (!lane) { lane = new_lane = nb++; if (!tpu) tpu = new_tpu = nb++; }   // the ballot, the masks and the votes read no lane ID as translated
     if (votes && !tv4u) tv4u = new_v4u = nb++;
     uint32_t c31 = nb++, cn31 = nb++, c5 = nb++, c32 = nb++, c0 = nb++, ct = votes ? nb++ : 0;
-    size_t k = 0; int capped = 0, decorated = 0, placed = 0; fn = 0;
+    size_t k = 0; int capped = 0, decorated = 0, placed = 0, full = 0; fn = 0;
     for (size_t i = 0; i < 5; i++) o[k++] = w[i];
     for (size_t i = 5; i < n; ) {
         uint32_t len = w[i] >> 16, op = w[i] & 0xffff;
@@ -113,6 +133,7 @@ static size_t spv_wide(const uint32_t *w, size_t n, uint32_t sg_stages, uint32_t
             decorated = 1; SPV_WIDE_PUT(71, lane, 11, 41); if (model == 4) SPV_WIDE_PUT(71, lane, 14);
         }
         if (op == 15 && at == ep && new_lane) {   // the entry point with the lane ID in its interface
+            if (k + len + 1 > cap) { full = 1; continue; }
             size_t s = k; for (uint32_t q = 0; q < len; q++) o[k++] = x[q];
             o[k++] = lane; o[s] = (uint32_t)(k - s) << 16 | op;
             continue;
@@ -125,7 +146,7 @@ static size_t spv_wide(const uint32_t *w, size_t n, uint32_t sg_stages, uint32_t
             if (ct) SPV_WIDE_PUT(41, tb, ct);
             if (new_lane) SPV_WIDE_PUT(59, tpu, lane, 1);
         }
-        if (!fn) { for (uint32_t q = 0; q < len; q++) o[k++] = x[q]; continue; }
+        if (!fn) { SPV_WIDE_COPY(); continue; }
         uint32_t l = nb, wv = nb + 1;   // the subgroup's lane ID, loaded where each use is, and its warp (lane >> 5)
         if (op == 345) {   // Shuffle: to the lane of its own warp
             uint32_t hi = nb + 1, id = nb + 2; nb += 3;
@@ -156,10 +177,12 @@ static size_t spv_wide(const uint32_t *w, size_t n, uint32_t sg_stages, uint32_t
             nb += 2; SPV_WIDE_PUT(61, tu, l, lane); SPV_WIDE_PUT(194, tu, wv, l, c5); SPV_WIDE_PUT(77, x[1], x[2], x[3], wv);
             continue;
         }
-        for (uint32_t q = 0; q < len; q++) o[k++] = x[q];
+        SPV_WIDE_COPY();
     }
 #undef ID
+    if (full) { *what = SPV_WIDE_KEPT; return 0; }   // past *need, which counts each use at its most: as translated rather than past the buffer
     o[3] = nb;
     return k;
 }
 #undef SPV_WIDE_PUT
+#undef SPV_WIDE_COPY

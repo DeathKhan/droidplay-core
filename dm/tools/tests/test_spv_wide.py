@@ -1,5 +1,6 @@
-"""dm/android/spv_wide.h (Maxwell's 32-lane warps as 32-lane parts of a wider subgroup: fragment and compute shaders on the Adreno 830, whose subgroups have
-64 lanes), built for the PC and run on modules assembled with the NDK's spirv-as; spirv-val checks each result. Skipped without the NDK.
+"""dm/android/spv_wide.h (Maxwell's 32-lane warps as 32-lane parts of a wider subgroup: fragment shaders on the Adreno 830, whose subgroups have 64 lanes;
+compute, mesh and task modules are left), built for the PC and run on modules assembled with the NDK's spirv-as; spirv-val checks each result, and a guard
+after the words it asked for checks that it writes no further. Skipped without the NDK.
 With DM_SPV_DIR=<a game's packed spv folder>, also run over every module there with the Adreno 830's stages (each result must pass spirv-val).
 With DM_TEST_SERIAL=<adb serial>, dm/android/tests/t_quad_shuffle.c is built for Android and run on that device with a fragment shader whose quad shuffles are
 the translator's SHFL helpers: rewritten, every pixel must read the right lanes of its quad; as translated, on a subgroup over 32 lanes, the pixels of lanes
@@ -18,8 +19,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_spv_readonly import NDK, HOST, EXE, REPO   # noqa: E402
 from test_spv_limits import DEV_VS, instructions   # noqa: E402
 
-DONE, KEPT = 1, 2   # SPV_WIDE_*
-ADRENO_650, ADRENO_830 = 0x20, 0x30   # subgroupSupportedStages: compute; fragment and compute
+DONE, KEPT, STAGE = 1, 2, 4   # SPV_WIDE_*
+FRAGMENT, COMPUTE, MESH = 0x10, 0x20, 0x80   # stage bits, as spv_wide_wanted gives them
+ADRENO_650, ADRENO_830, FOLD = 0x20, 0x30, 0xf0   # subgroupSupportedStages: compute; fragment and compute; fragment, compute, task and mesh (the Z Fold's)
+GUARD = 0xa5a5a5a5
 
 # A fragment shader as the translator writes Maxwell's warp instructions for a 32-lane host: SHFL.IDX and SHFL.BFLY within the quad (mask 0x1c03) as Ryujinx's
 # Shuffle and ShuffleXor helpers (the lane ID & the segment mask, valid up to the clamp), BALLOT as the ballot's first word, a mask's component 0 through an
@@ -172,6 +175,65 @@ OpFunctionEnd
 '''
 
 
+# Votes alone, AllEqual the most: each becomes the most words a use can (SPV_WIDE_SITE), in a module that lacks every declaration the rewrite adds (the
+# ballot capability, uvec4, the lane ID and its pointer type): the largest result for its input
+VOTES_HEAD = '''OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformVote
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %fc %out
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %fc BuiltIn FragCoord
+OpDecorate %out Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%u32 = OpTypeInt 32 0
+%pi = OpTypePointer Input %v4
+%fc = OpVariable %pi Input
+%po = OpTypePointer Output %u32
+%out = OpVariable %po Output
+%scope = OpConstant %u32 3
+%u0 = OpConstant %u32 0
+%u1 = OpConstant %u32 1
+%half = OpConstant %f32 64
+%main = OpFunction %void None %fn
+%l = OpLabel
+%c = OpLoad %v4 %fc
+%cx = OpCompositeExtract %f32 %c 0
+%p = OpFOrdLessThan %bool %cx %half
+%a0 = OpGroupNonUniformAny %bool %scope %p
+%s0 = OpSelect %u32 %a0 %u1 %u0
+'''
+def votes_fs(n): return (VOTES_HEAD + ''.join(f'%e{i} = OpGroupNonUniformAllEqual %bool %scope %p\n%q{i} = OpSelect %u32 %e{i} %u1 %u0\n'
+                                              f'%s{i + 1} = OpIAdd %u32 %s{i} %q{i}\n' for i in range(n)) + f'OpStore %out %s{n}\nOpReturn\nOpFunctionEnd\n')
+# A compute shader with SHFL.BFLY by 1 as the translator writes it for a 32-lane host
+COMPUTE_CS = '''OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformShuffle
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %lane
+OpExecutionMode %main LocalSize 64 1 1
+OpDecorate %lane BuiltIn SubgroupLocalInvocationId
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%pu = OpTypePointer Input %u32
+%lane = OpVariable %pu Input
+%scope = OpConstant %u32 3
+%u1 = OpConstant %u32 1
+%main = OpFunction %void None %fn
+%l = OpLabel
+%L = OpLoad %u32 %lane
+%x = OpBitwiseXor %u32 %L %u1
+%s = OpGroupNonUniformShuffle %u32 %scope %L %x
+OpReturn
+OpFunctionEnd
+'''
+
+
 def ops(data): return [op for op, _ in instructions(data)]
 def builtins(data): return {x[0]: x[2] for op, x in instructions(data) if op == 71 and len(x) >= 3 and x[1] == 11}
 def interface(data): return next(x for op, x in instructions(data) if op == 15)
@@ -189,7 +251,7 @@ class SpvWide(unittest.TestCase):
         export = '__declspec(dllexport)' if os.name == 'nt' else '__attribute__((visibility("default")))'
         src.write_text(f'#include "spv_wide.h"\n{export} size_t run(const uint32_t *w, size_t n, uint32_t sg, uint32_t *s, uint32_t *o, size_t cap, size_t *need, int *what) '
                        f'{{ return spv_wide(w, n, sg, s, o, cap, need, what); }}\n'
-                       f'{export} int wanted(const uint32_t *w, size_t n, uint32_t sg) {{ return spv_wide_wanted(w, n, sg); }}\n')
+                       f'{export} uint32_t wanted(const uint32_t *w, size_t n, uint32_t sg) {{ return spv_wide_wanted(w, n, sg); }}\n')
         env = dict(os.environ, MSYS_NO_PATHCONV='1')
         if os.name == 'nt':   # no C library: a DLL linked by lld alone, as test_spv_limits
             subprocess.run([cls.bin / 'clang.exe', '--target=x86_64-pc-windows-msvc', '-ffreestanding', '-nostdlib', '-O1', '-Wall', '-Werror', '-I', REPO / 'dm/android', '-c', src,
@@ -200,7 +262,7 @@ class SpvWide(unittest.TestCase):
             cc = ['xcrun', 'clang'] if sys.platform == 'darwin' else [shutil.which('clang') or cls.bin / 'clang']
             subprocess.run([*cc, '-shared', '-fPIC', '-O1', '-Wall', '-Wextra', '-Werror', '-I', REPO / 'dm/android', src, '-o', cls.tmp / 'w.so'], check=True)
             cls.lib = ctypes.CDLL(str(cls.tmp / 'w.so'))
-        cls.lib.run.restype = ctypes.c_size_t
+        cls.lib.run.restype = ctypes.c_size_t; cls.lib.wanted.restype = ctypes.c_uint32
 
     def run_on(self, data, stages=ADRENO_830):   # → (the rewritten module or None, SPV_WIDE_* bits)
         n = len(data) // 4; w = (ctypes.c_uint32 * n).from_buffer_copy(data)
@@ -208,9 +270,10 @@ class SpvWide(unittest.TestCase):
         self.assertEqual(self.lib.run(w, n, stages, s, None, 0, ctypes.byref(need), ctypes.byref(what)), 0)
         if need.value or what.value: self.assertTrue(self.lib.wanted(w, n, stages))   # the replay's pre-check never passes over a module that needs it
         if not need.value: return None, what.value
-        o = (ctypes.c_uint32 * need.value)()
-        k = self.lib.run(w, n, stages, s, o, need.value, ctypes.byref(need), ctypes.byref(what))
-        self.assertTrue(k)
+        cap = need.value; o = (ctypes.c_uint32 * (cap + 64))(*[GUARD] * (cap + 64))
+        k = self.lib.run(w, n, stages, s, o, cap, ctypes.byref(need), ctypes.byref(what))
+        self.assertTrue(0 < k <= cap)
+        self.assertEqual(list(o[cap:]), [GUARD] * 64, 'written past the words it asked for')
         return bytes(o)[:4 * k], what.value
 
     def val(self, data, name):
@@ -264,7 +327,24 @@ class SpvWide(unittest.TestCase):
         data = self.asm(FS, 'fs_650')
         self.assertEqual(self.run_on(data, ADRENO_650), (None, 0))
         w = (ctypes.c_uint32 * (len(data) // 4)).from_buffer_copy(data)
-        self.assertEqual((self.lib.wanted(w, len(w), ADRENO_650), self.lib.wanted(w, len(w), ADRENO_830)), (0, 1))
+        self.assertEqual((self.lib.wanted(w, len(w), ADRENO_650), self.lib.wanted(w, len(w), ADRENO_830)), (0, FRAGMENT))
+
+    def test_votes_fit_the_words_asked(self):   # AllEqual becomes 44 words: ten of them once went 51 words past what the rewrite asked for
+        for n in (1, 3, 10, 40):
+            out, what = self.run_on(self.asm(votes_fs(n), f'votes{n}'))
+            self.assertEqual(what, DONE)
+            self.val(out, f'votes{n}_out.spv')
+            self.assertEqual([op for op in ops(out) if op in (334, 335, 336)], [])
+
+    def test_compute_and_mesh_left(self):   # only fragment shaders' shuffles were checked on a device
+        data = self.asm(COMPUTE_CS, 'cs')
+        w = (ctypes.c_uint32 * (len(data) // 4)).from_buffer_copy(data)
+        self.assertEqual((self.lib.wanted(w, len(w), ADRENO_830), self.lib.wanted(w, len(w), FRAGMENT)), (COMPUTE, 0))
+        self.assertEqual(self.run_on(data), (None, STAGE))
+        ep = next(i for i in range(5, len(w)) if w[i] & 0xffff == 15 and w[i] >> 16 >= 3)   # its entry point as MeshEXT's (not a valid mesh shader: scanned only)
+        w[ep + 1] = 5365
+        self.assertEqual((self.lib.wanted(w, len(w), FOLD), self.lib.wanted(w, len(w), ADRENO_830)), (MESH, 0))
+        self.assertEqual(self.run_on(bytes(w), FOLD), (None, STAGE))
 
     def test_module_without_subgroup_use_left(self):
         text = HEAD[:HEAD.index('%L = OpLoad')] + 'OpReturn\nOpFunctionEnd\n'
