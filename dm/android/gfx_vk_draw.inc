@@ -135,8 +135,9 @@ typedef struct {
 // buffers and per-submission set cache (9013fc9, 2b7e2a1), BOTWRecompAndroid's (7cdb67e, 37aaefe) and triasbrata's nxnative-android (DM_VK_STAGE_REUSE), written anew here.
 // A shader has at most maxDescriptorSetUniformBuffersDynamic / 2 of them (a pipeline layout's limit covers all its sets: the vertex and fragment shaders' halves), compute
 // all it can take, a geometry shader none; the rest stay plain, their offsets part of the set. Binding 0 (the support buffer) stays plain: it is unwritten in most sets.
-// DM_VK_SET_REUSE=0 (env.txt): plain uniform buffers and a write for every set, as before (the A/B of this alone)
-static int set_reuse(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SET_REUSE"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_SET_REUSE=0: every descriptor set written for its draw, plain uniform buffers"); } return v; }
+// DM_VK_SET_REUSE=1 (env.txt, or a game's android_defaults.txt): on. Off by default (plain uniform buffers and a write for every set, as before): it changes every shader's set
+// layout, so each device's pipeline cache and start-up list miss once, and dynamic uniform buffers have run only on the Pad 3's Adreno 830 so far
+static int set_reuse(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SET_REUSE"); v = e && *e == '1'; if (v) LOG("[vk] DM_VK_SET_REUSE=1: dynamic uniform buffers, and a descriptor set written in the chunk is bound again"); } return v; }
 static void sh_dyn(vshader *s) {   // which constant buffers are dynamic (cbdyn, ndyn): the first that fit, offsets ordered by binding as vkCmdBindDescriptorSets takes them
     memset(s->cbdyn, 0xff, sizeof s->cbdyn); s->ndyn = 0;
     uint32_t lim = g_vk.props.limits.maxDescriptorSetUniformBuffersDynamic, n = s->stage == SH_CS ? lim : s->stage == SH_VS || s->stage == SH_PS ? lim / 2 : 0;
@@ -2219,7 +2220,8 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
     if (g_ds_stats) {   // every descriptor of the layout written (binding 0 only where it is used): a set handed out again (ds_get) must keep none of an earlier draw's
         uint32_t nd = 0; for (uint32_t i = 0; i < nw; i++) nd += wr[i].descriptorCount;
         g_ds_checked++; if (nd + (s->b0 || !support_skip() ? 0u : 1u) != s->ndesc && g_ds_short++ < 16) LOG("[RED] [vk] shader %s: its descriptor set written with %u of its layout's %u descriptors", s->key, nd, s->ndesc); }
-    int hit = 0; sr_ent *e = !tf && set_reuse() ? sr_find(s->dsl, wr, nw, &hit) : NULL;
+    // the chunk dseq names, still recorded: with DM_VK_SET_RECYCLE=0 ds_moved is always 0, and a sync inside stage_set may have closed it (C NULL, or another chunk)
+    int hit = 0; sr_ent *e = !tf && set_reuse() && C && C->seq == dseq ? sr_find(s->dsl, wr, nw, &hit) : NULL;
     if (hit) { *pset = e->set; g_sr_hit++; if (own) { free(ii); free(bvs); } return 1; }
     if (!(set = ds_get(s, tf))) { if (own) { free(ii); free(bvs); } return 0; }
     for (uint32_t i = 0; i < nw; i++) wr[i].dstSet = set;

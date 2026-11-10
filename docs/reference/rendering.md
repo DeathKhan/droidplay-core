@@ -1779,6 +1779,22 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Check:** Breath of the Wild on a OnePlus Pad 3: three submissions of 249, 277 and 281 ms, each with its end timestamp unwritten and each holding the draw of vertex shader `2decd3e894b3736a` and fragment shader `26ae1640f3448ba4`, before the device was lost; with chunks of one draw, that draw alone. `VK_EXT_device_fault` gave no address and no vendor record (a hang, not a page fault).
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) on a OnePlus Pad 3 (the hang itself is open there).
 
+### Descriptor sets bound again within a chunk (Android)
+
+- **Symptom:** a game with thousands of draws a frame spends a large part of the replay thread in `vkUpdateDescriptorSets`: about 7,300 sets a frame in Breath of the Wild. The Odin 2's profile of 2026-11-07 put it at 3.4 ms a frame.
+- **Cause:** every draw copies its constant buffers to new arena offsets, and the offsets were part of each set. So no set matched the draw before, and `stage_set` wrote every set of every stage.
+- **Fix:** `DM_VK_SET_REUSE=1` (off by default) (`gfx_vk_draw.inc` `sh_dyn`, `sr_find`, `sr_put`).
+  - Constant buffers become dynamic uniform buffers, at most `maxDescriptorSetUniformBuffersDynamic / 2` for a vertex or fragment shader, and their offsets go to the bind.
+  - A set already written with the same descriptors in the chunk being recorded is bound again. Lookup is a hash of the layout and every descriptor, compared whole.
+  - An entry holds only for its recording, because a set is one chunk's and written once per recording.
+  - It is off by default because it changes every shader's set layout, so pipeline caches and start-up lists miss once. Dynamic uniform buffers have run only on the Adreno 830 so far.
+  - The design is nx2android's, BOTWRecompAndroid's and triasbrata's nxnative-android's, written anew.
+- **Check:** Breath of the Wild on a OnePlus Pad 3, with one draw skipped by a local test switch (it hangs that GPU, [Android baselines](../../dm/android/baselines.md) problem 14):
+  - 86.9% of sets bound again (6,312 of 7,267 a frame);
+  - the replay's CPU 33.4–33.6 → 32.1–32.3 ms a frame, interleaved runs;
+  - GPU and picture unchanged.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
+
 ### Pipeline keys built from the state objects' fields
 
 - **Symptom:** new graphics pipelines made all through play, also in a level seen before (a few per frame, about 1 to 2 ms each on the Adreno); the start-up list of pipelines grew past 186,000 keys over a few sessions, and making it again took the fast cores for most of an hour.
