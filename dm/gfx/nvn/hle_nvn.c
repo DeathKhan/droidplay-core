@@ -1891,7 +1891,7 @@ __attribute__((weak)) void dm_fps_lock_tick(void) {}   // hle_fpslock.c: engine 
 static int g_engine_stub = 1;   // the weak dm_fps_lock_engine's answer, for graphics unit tests (t_nvn sets it)
 __attribute__((weak)) int dm_fps_lock_engine(void) { return g_engine_stub; }   // hle_fpslock.c: the host writes fps_target into an engine limiter of this main
 __attribute__((weak)) void dm_ue_cvar_tick(void) {}   // hle_uecvar.c: Unreal's texture streaming pool (profile ue_texture_pool)
-__attribute__((weak)) void dm_ue_dynres_tick(void) {}   // hle_uecvar.c: Unreal's dynamic-resolution frame-time budget (DM_UE_DYNRES_BUDGET)
+__attribute__((weak)) void dm_ue_dynres_tick(void) {}   // dm/android/ue_dynres_android.c: Unreal's dynamic-resolution frame-time budget (DM_UE_DYNRES_BUDGET); Mac and iOS keep this empty one
 __attribute__((weak)) int dm_movie_playing(void) { return 0; }   // hle_movie.c: a movie's pictures are being handed out; graphics unit tests have no movie decoder
 // Thermal cap (iOS): while the device is thermally serious or worse (NSProcessInfo thermalState >= 2) the frame step holds 30 fps, and it goes back to the cap after the device
 // has been fair or better for THERMAL_CALM_NS, so it does not flap. At "serious" iOS caps the GPU clock to about a third: Breath of the Wild's vistas (about 3,000 G-buffer draws)
