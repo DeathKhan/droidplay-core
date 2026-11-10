@@ -1675,6 +1675,7 @@ static void clear_tex(const p_clear_tex *ct) {
 }
 
 static int png_texels(const char *path, VkFormat f, int bpp, const uint8_t *p, uint32_t w, uint32_t x, uint32_t y, uint32_t cw, uint32_t ch, int flip);   // below (the pass dump's PNGs)
+#include "gfx_vk_posrows.inc"   // the vertex shaders whose position reads its constant buffer rows at run time (vk_pos_rows)
 #include "gfx_vk_draw.inc"
 #include "gfx_vk_dscopy.inc"
 #include "gfx_vk_readback.inc"   // arena write-backs read through a cached copy where the arena reads slowly (DM_VK_WB_READBACK)

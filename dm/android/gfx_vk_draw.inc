@@ -1579,7 +1579,8 @@ static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t
         lmod *mod = k->tf ? s->modtf : s->stage == SH_VS && k->z && s->modz ? s->modz : s->mod;
         if (s->stage == SH_PS) { const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0; if (miss) mod = ps_variant(s, miss); }   // see spv_drop_inputs
         if (!mod) return VK_ERROR_INITIALIZATION_FAILED;
-        lms[ns] = mod; st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .pName = "main"};   // its module: lm_pipeline
+        lms[ns] = mod; st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .pName = "main",
+            .pSpecializationInfo = s->stage == SH_VS && pos_rows_for(s->key) ? &g_pr_spec : NULL};   // its module: lm_pipeline; run-time rows in the position (gfx_vk_posrows.inc)
         if (s->pool) { sets[POOL_SET] = g_pool_dsl; nset = POOL_SET + 1; } }
     VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nset, .pSetLayouts = sets};
     if (vkCreatePipelineLayout(g_vk.dev, &lc, NULL, &pp->pl) != VK_SUCCESS) return VK_ERROR_INITIALIZATION_FAILED;

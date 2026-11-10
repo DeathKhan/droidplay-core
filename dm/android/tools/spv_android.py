@@ -13,15 +13,16 @@
 #   the uniform slots' size table (bank 25, which the translator's TranslationFlags.MetalUniformBounds reads before each read of c[3..16]) is taken out, its bound
 #     tests made true and its binding dropped from res.json (cbsize_strip): the reads are the ones the translator wrote before the table;
 #   res.json cbufs[].ext: how many bytes of each constant buffer the shader can read (cb_extents; the .z / .tf variants add no constant buffer read);
-#   for a vertex shader, the constant buffer reads its position is made of read their row through a value known only at run time (pos_rows), after cb_extents,
+#   for a vertex shader, the constant buffer reads its position is made of can read their row through a value known only at run time (pos_rows), after cb_extents,
 #     which these reads would otherwise make the whole buffer: Qualcomm's Adreno 740 driver lost those rows in the position-only copy of a shader it bins with.
+#     A specialization constant the host sets only where it is needed turns them on; off, the rows are the constant ones.
 # Usage: spv_android.py <dmsh_xlate output dir> <out dir> [key ...]   (all keys of the input dir by default); prints one line per shader and a summary
 import itertools, json, struct, sys
 from pathlib import Path
 
 ANDROID_CHAIN = 6   # res.json 'android': bumped when this post-pass or spv_build.py's translation changes what they make (spv_build.py translates older outputs again).
                     # 5: the size table taken out (cbsize_strip), so a chain 4 output of the merged translator, which reads it, is translated again
-                    # 6: a vertex shader's position reads its constant buffer rows at run time (pos_rows)
+                    # 6: a vertex shader's position can read its constant buffer rows at run time (pos_rows, behind a specialization constant)
 EXT_FROM = 3   # 4 added res.json cbufs[].ext (cb_extents) and nothing else: spv_build.py brings an output of chain 3 up to date from its .spv (add_ext), without the translator,
                # only while ANDROID_CHAIN is EXT_FROM + 1 (upgrade stamps that chain, so a later bump for a change to the .spv translates chain 3's outputs again)
 SET_OF = {'vs': 0, 'ps': 1, 'gs': 2, 'tc': 3, 'te': 3, 'cs': 0}
@@ -270,14 +271,20 @@ def z_variant(hdr, ins):
 # ---- The position's constant buffer rows read at run time (pos_rows) ----
 OP_EXTINST, OP_FNEGATE, OP_FSUB, OP_SLESSTHAN, OP_COMPOSITECONSTRUCT, OP_COPYOBJECT_ = 12, 127, 131, 177, 80, 83
 STORAGE_UNIFORM, STORAGE_FUNCTION, BUILTIN_INSTANCEINDEX, GLSL_FMA = 2, 7, 43, 50
+OP_SPECCONSTANTFALSE, DEC_SPECID = 49, 1
+POS_ROWS_SPEC = 7401   # the specialization constant (a bool, false unless the host sets it) that turns the run-time rows on: gfx_vk_posrows.inc POS_ROWS_SPEC_ID
 def pos_rows(hdr, ins):
     """→ (header, instructions, reads changed). A vertex shader's constant buffer reads that its position is made of by arithmetic alone (OpFAdd, OpFSub, OpFMul,
-    OpFNegate, Fma, copies, selects, and the Function variables the translator keeps each value in, when stored once) read their row as row + min(gl_InstanceIndex, 0): the
-    same row (an instance index counts up from the draw's base instance, never below 0), but one the driver's compiler cannot know. Qualcomm's Adreno 740 driver
+    OpFNegate, Fma, copies, selects, and the Function variables the translator keeps each value in, when stored once) read their row as row + (on ? min(gl_InstanceIndex, 0) : 0):
+    the same row (an instance index counts up from the draw's base instance, never below 0). `on` is a specialization constant (SpecId POS_ROWS_SPEC),
+    false unless the host sets it: false, the zero is a constant and the row folds back to the constant one, so a GPU the host leaves alone compiles the
+    shader as it did; true, the row is one the driver's compiler cannot know. Qualcomm's Adreno 740 driver
     (V@0676.32, the Ayn Odin 2) bins a pass with a position-only copy of each vertex shader that has other outputs; in Final Fantasy Resonance's vertex shader
     19274e72bf8f5d0d that copy read c3's rows 0-3 (Unreal's TranslatedWorldToClip, constant indices it loads ahead into constant registers) as garbage, the cards'
     triangles were binned nowhere and the field's flames never drew; the full shader read them right, as Turnip and the Adreno 830 did. A run-time row is loaded
-    when it is read. These are the matrix the last transform multiplies by (16 reads in a shader of Unreal's); a value stored in more than one place ends the walk"""
+    when it is read. These are the matrix the last transform multiplies by (16 reads in a shader of Unreal's); a value stored in more than one place ends the walk.
+    Run-time rows cost GPU time (on in every vertex shader, Animal Crossing's island took 25% more on the Odin 2), so the host turns them on only on Qualcomm's
+    Adreno 7xx driver and only for the vertex shaders a game's profile names (vk_pos_rows; gfx_vk_posrows.inc)"""
     pv = pos_var(ins)
     if pv is None: return hdr, ins, 0
     var, member = pv
@@ -338,14 +345,15 @@ def pos_rows(hdr, ins):
         if pi is None: pi = new(); glob.append([OP_TYPEPOINTER, pi, STORAGE_INPUT, rt])
         iv = new(); glob.append([OP_VARIABLE, pi, iv, STORAGE_INPUT]); decs.append([OP_DECORATE, iv, DEC_BUILTIN, BUILTIN_INSTANCEINDEX]); it = ty[rt]; add_iv = True
     else: add_iv = False
-    zero, head = {}, []   # row type → its run-time zero, computed at the top of the entry point
+    zero, head = {}, []   # row type → its zero, computed at the top of the entry point: on ? min(gl_InstanceIndex, 0) : 0
+    on = new(); glob.append([OP_SPECCONSTANTFALSE, tb, on]); decs.append([OP_DECORATE, on, DEC_SPECID, POS_ROWS_SPEC])
     li = new(); head.append([OP_LOAD, it[1], li, iv])
     for t in sorted({ctype[row_of(defs[c][0])] for c in marked}):
         c0 = next((x[2] for x in ins if x[0] == OP_CONSTANT and x[1] == t and x[3] == 0), None)
         if c0 is None: c0 = new(); glob.append([OP_CONSTANT, t, c0, 0])
         v = li
         if t != it[1]: v = new(); head.append([OP_BITCAST, t, v, li])
-        lt, z = new(), new(); head += [[OP_SLESSTHAN, tb, lt, v, c0], [OP_SELECT, t, z, lt, v, c0]]; zero[t] = z
+        lt, m, z = new(), new(), new(); head += [[OP_SLESSTHAN, tb, lt, v, c0], [OP_SELECT, t, m, lt, v, c0], [OP_SELECT, t, z, on, m, c0]]; zero[t] = z
     last_dec = max(i for i, x in enumerate(ins) if x[0] in (OP_DECORATE, OP_MEMBERDECORATE))
     out, in_entry, labelled, done_glob = [], False, False, False
     for i, x in enumerate(ins):

@@ -140,11 +140,15 @@ class PosRows(unittest.TestCase):
         const = {x[2]: x[3] for x in ins if x[0] == sa.OP_CONSTANT}
         bound = {x[1] for x in ins if x[0] == sa.OP_DECORATE and x[2] == sa.DEC_BINDING}
         defs = {x[2]: x for x in ins if x[0] in (sa.OP_IADD, sa.OP_SELECT, sa.OP_SLESSTHAN, sa.OP_LOAD, sa.OP_BITCAST)}
+        specid = {x[1]: x[3] for x in ins if x[0] == sa.OP_DECORATE and x[2] == sa.DEC_SPECID}
+        spec = {x[2] for x in ins if x[0] == sa.OP_SPECCONSTANTFALSE and specid.get(x[2]) == sa.POS_ROWS_SPEC}   # false unless the host sets it
         got = []
         for x in ins:
             if x[0] != sa.OP_ACCESSCHAIN or x[3] not in bound or x[5] in const: continue   # chains into the constant buffers with a run-time row
             add = defs[x[5]]; self.assertEqual(add[0], sa.OP_IADD)
-            row, z = add[3], add[4]; sel = defs[z]; lt = defs[sel[3]]
+            row, z = add[3], add[4]; gate = defs[z]   # on ? min(i, 0) : 0
+            self.assertEqual((gate[0], gate[3] in spec, const.get(gate[5])), (sa.OP_SELECT, True, 0))
+            sel = defs[gate[4]]; lt = defs[sel[3]]
             self.assertEqual((sel[0], lt[0], sel[4], lt[3], const.get(sel[5]), const.get(lt[4])), (sa.OP_SELECT, sa.OP_SLESSTHAN, lt[3], sel[4], 0, 0))   # min(i, 0)
             self.assertEqual((defs[lt[3]][0], defs[lt[3]][3]), (sa.OP_LOAD, iid))
             got.append(const[row])
