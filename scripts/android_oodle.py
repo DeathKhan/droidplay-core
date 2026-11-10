@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+# Unreal Engine shaders decoded with the game's own Oodle on the phone, for build_android_from_nsp.py on a computer that cannot run the game's code.
+# An Unreal game's shaders are Oodle-compressed (Octopath Traveler 0: each shader in its paks' shader code archives; FINAL FANTASY RESONANCE: its IoStore container's blocks and
+# each shader group), and only the decoder statically linked into main undoes it (dm/host/hle_oodle.c). The NSP scripts run it in the Mac host; a Windows or Linux PC cannot run
+# the game's arm64 code, but the phone can: the game's Android host runs the same job (DM_OODLE_JOB, before nnMain, then it exits), with only the game's rewritten code on the
+# phone (no RomFS: the job reads none). FINAL FANTASY RESONANCE's decoded shader group matched the Mac's archive byte for byte (35 of 35 shaders, OnePlus Pad 3).
+# A job is one launch of the game, so the decodes uepak.py asks for one at a time are batched (Rounds): uepak runs with a decoder that answers from what the phone decoded so far
+# and records the rest, the records go to the phone as one job, and uepak runs again until it asks for nothing new. An IoStore container takes two or three rounds (its blocks,
+# then the shader groups inside them).
+import hashlib, struct, time
+from pathlib import Path
+
+JOB_SECS = 600   # the longest a job may take: FINAL FANTASY RESONANCE's 5,919 shader groups (707 MB decoded) took three jobs of 2 to 3 s each on a OnePlus Pad 3, the boot up to nnMain included
+CHUNK = 256 << 20   # decoded bytes per job, so neither the phone's free space nor this computer's memory holds more than about that at once
+
+
+def oodle_head(b):   # whether the bytes start as an Oodle LZ block does (header byte: low nibble 0xC, bits 4-5 clear; bit 6 uncompressed, bit 7 decoder restart)
+    return len(b) > 1 and (b[0] & 0x3F) == 0x0C
+
+
+def job_bytes(records):   # hle_oodle.c's job file: "DMOJ", u32 count, then per record u32 compressed length, u32 raw length and the compressed bytes
+    out = bytearray(b'DMOJ' + struct.pack('<I', len(records)))
+    for c, n in records: out += struct.pack('<II', len(c), n) + c
+    return bytes(out)
+
+
+def read_out(path, count):   # its output: "DMOR", u32 count, then per record u32 decoded length (0: failed) and the bytes → [bytes or None]
+    b = Path(path).read_bytes()
+    if b[:4] != b'DMOR' or struct.unpack_from('<I', b, 4)[0] != count: raise ValueError(f'{path}: not the output of a {count}-record Oodle job')
+    o, out = 8, []
+    for _ in range(count):
+        n = struct.unpack_from('<I', b, o)[0]; o += 4
+        out.append(b[o:o + n] if n else None); o += n
+    if o != len(b): raise ValueError(f'{path}: {len(b) - o} bytes left after its {count} records')
+    return out
+
+
+class Rounds:
+    """decode(compressed, raw length) for uepak.py: what the phone decoded so far, else zeros, the stream kept for the next job. Only a stream that starts as Oodle's do is kept:
+    bytes made from an earlier round's zeros never do, so no record is a guess (uepak's checks on such bytes raise ValueError, which run() counts as a round to finish)"""
+    def __init__(self): self.have, self.want = {}, {}
+    def __call__(self, comp, n):
+        comp = bytes(comp); k = (hashlib.blake2b(comp, digest_size=16).digest(), n)
+        if k in self.have: return self.have[k]
+        if oodle_head(comp): self.want[k] = comp
+        return bytes(n)
+    def run(self, fn, phone, rounds=8):
+        """fn() until a run asks for nothing new → (its result, the rounds that went to the phone). phone(records) → [bytes or None]"""
+        for r in range(rounds + 1):
+            self.want = {}
+            try: res = fn()
+            except ValueError:
+                if not self.want: raise   # a damaged file, not a round to finish
+                res = None
+            if not self.want: return res, r
+            keys = list(self.want); got = phone([(self.want[k], k[1]) for k in keys])
+            for k, d in zip(keys, got):
+                if d is None or len(d) != k[1]: raise ValueError(f'the game\'s Oodle on the phone failed on a {len(self.want[k])} → {k[1]} byte stream')
+                self.have[k] = d
+        raise ValueError(f'uepak still asked for new Oodle streams after {rounds} rounds')
+
+
+class Phone:
+    """Oodle jobs run by the game's Android host on the phone: the host and the game's rewritten code must be installed (build_android_from_nsp.py ue_decode).
+    adb(serial, *args, check=True) and sh(text) are build_android_from_nsp.py's; remote = the app's external files folder"""
+    def __init__(self, adb, serial, gid, remote, pkg, work, logs, say):
+        self.adb, self.serial, self.gid, self.remote, self.pkg, self.work, self.logs, self.say = adb, serial, gid, remote, pkg, Path(work), Path(logs), say
+        self.jobs = 0
+    def sh(self, cmd, check=True): return self.adb(self.serial, 'shell', cmd, check=check)
+    def __call__(self, records):   # → [bytes or None], in jobs of at most CHUNK decoded bytes
+        out, part = [], []
+        for c, n in records:
+            if part and sum(x[1] for x in part) + n > CHUNK: out += self.job(part); part = []
+            part.append((c, n))
+        return out + (self.job(part) if part else [])
+    def job(self, records):
+        self.jobs += 1; t0 = time.time()
+        local = self.work / 'tmp' / 'oodle_phone.job'; local.parent.mkdir(parents=True, exist_ok=True); local.write_bytes(job_bytes(records))
+        rjob, rlog, renv = f'{self.remote}/oodle.job', f'{self.remote}/log.txt', f'{self.remote}/env.txt'
+        env_before = self.sh(f'cat {renv} 2>/dev/null', check=False)   # the player's env.txt, put back after the job
+        try:
+            self.sh(f'am force-stop {self.pkg}; rm -f {rjob} {rjob}.out {rlog}')
+            self.adb(self.serial, 'push', local, rjob)
+            envf = self.work / 'tmp' / 'oodle_env.txt'; envf.write_text(f'DM_OODLE_JOB={rjob}\n', encoding='utf-8', newline='\n')
+            self.adb(self.serial, 'push', envf, renv)
+            self.sh(f'chmod 666 {rjob} {renv}', check=False)   # Android 16 (a OnePlus Pad 3): the game cannot read what adb's shell user wrote otherwise
+            self.sh(f'am start -n {self.pkg}/.Launcher --es game {self.gid} --ez play true')
+            done, fail, log = None, None, ''
+            while time.time() - t0 < JOB_SECS:
+                time.sleep(1)
+                log = self.sh(f'grep -E "DM_OODLE_JOB|FATAL|CRASH" {rlog} 2>/dev/null', check=False)
+                if 'records decoded' in log: done = True; break
+                if 'FATAL' in log or 'CRASH' in log or 'cannot' in log: fail = log; break
+                if time.time() - t0 > 20 and not self.sh(f'pidof {self.pkg}:game', check=False).strip() and 'records decoded' not in log: fail = log or 'the game stopped before it decoded anything'; break
+            (self.logs / f'oodle_phone_{self.jobs}.log').write_text(self.sh(f'cat {rlog} 2>/dev/null', check=False), encoding='utf-8', errors='replace')
+            if not done: raise ValueError(f'the Oodle job on the phone did not finish ({(fail or f"no answer in {JOB_SECS} s").strip()[-400:]}); its log: {self.logs / f"oodle_phone_{self.jobs}.log"}')
+            res = self.work / 'tmp' / 'oodle_phone.job.out'; self.adb(self.serial, 'pull', f'{rjob}.out', res)
+            got = read_out(res, len(records)); res.unlink()
+        finally:
+            self.sh(f'am force-stop {self.pkg}; rm -f {rjob} {rjob}.out', check=False)
+            if env_before.strip():
+                envb = self.work / 'tmp' / 'oodle_env_before.txt'; envb.write_text(env_before, encoding='utf-8', newline='\n'); self.adb(self.serial, 'push', envb, renv, check=False)
+            else: self.sh(f'rm -f {renv}', check=False)
+            local.unlink(missing_ok=True)
+        self.say(f'Oodle job {self.jobs} on the phone: {len(records):,} streams, {sum(n for _, n in records) / 1048576:.1f} MB decoded in {time.time() - t0:.0f} s')
+        return got
+
+
+def decode(uepak, romfs, main, jd, out, phone):
+    """uepak.job / uepak.finish as build_ipa_from_nsp.py decode_ue_shaders runs them, with the phone for the game's Oodle: the IoStore containers' streams in rounds (Rounds),
+    then the paks' Oodle job as it is → (uepak's listing, the shaders decoded by job records)"""
+    import shutil
+    rounds = Rounds()
+    def one():
+        shutil.rmtree(jd, ignore_errors=True); return uepak.job(str(romfs), str(main), str(jd), decode=rounds)
+    res, _ = rounds.run(one, phone)
+    if res is None: raise ValueError('uepak gave no listing')   # (run returns only once a run asked for nothing new, which returns one)
+    listing, n = res
+    if n:   # the paks' shaders (Octopath Traveler 0): uepak wrote the job; the phone decodes it whole
+        jf = Path(jd) / 'oodle.job'; b = jf.read_bytes(); cnt = struct.unpack_from('<I', b, 4)[0]; recs, o = [], 8
+        for _ in range(cnt):
+            cl, rl = struct.unpack_from('<II', b, o); o += 8; recs.append((b[o:o + cl], rl)); o += cl
+        got = phone(recs)
+        res = bytearray(b'DMOR' + struct.pack('<I', cnt))
+        for d in got: res += struct.pack('<I', len(d) if d else 0) + (d or b'')
+        (Path(jd) / 'oodle.job.out').write_bytes(bytes(res))
+    uepak.finish(str(jd), str(out))
+    return listing, n
