@@ -172,3 +172,8 @@ python3 scripts/bench_android.py <NSP folder> [<NSP folder> ...] -s <serial> [-s
 
 The routes are in each game's `dm/games/<id>/bench_android.tsv` ([dm/android/README.md, Benchmarks](README.md#benchmarks)). Smash needs its packed
 `font/standard.ttf` (problem 3); a game packed before that change needs packing again.
+
+One run or install at a time on a device: `bench_android.py` locks every device it uses for the whole run, and `build_android_from_nsp.py` locks the phone
+while it installs or decodes shaders there, so a second one is refused with who holds the device and since when (`--wait-device <s>` waits instead). Two
+benches on one device used to force-stop each other's game and overwrite each other's `env.txt`, voiding both. `python3 dm/android/tools/device_lock.py`
+lists who holds which device, and `NXNATIVE_DEVICE_HOLDER=<name>` names a run in that list. A crashed run gives its lock up.
