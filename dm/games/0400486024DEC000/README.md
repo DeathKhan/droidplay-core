@@ -91,7 +91,12 @@ DroidPlay Core's first Switch 2 attempt, on a Galaxy Z Fold 8 (SM-F971U1: Snapdr
 - The black picture is not the texture pool. The forest stays black with the pool set, and also with #83's task and mesh shaders added (main with #83 and the pool set, a local test build in which the main pass's task and mesh draws run).
   - The main pass's fragment shader (`a1a56cf6d62ae798`) reads its textures through slots, not the pool.
   - The HUD (hearts, minimap, prompts, the area name) draws in every case.
-  - Where the frame turns black is open.
+  - Where it turns black, from a `files/dump_now` dump of a forest frame (frame 1712; the test build):
+    - The 1440x810 `B10G11R11` scene target (s13685) holds only the sky and its haze after the lighting (pass 71). The linear depth at that size (pass 49) covers about 30% of the pixels.
+    - Pass 90 is 49 forward draws into that target with no blending. After it, the brightest percent of the target is NaN.
+    - The full-screen passes after it (91-101) spread the NaN until every pixel is NaN, which the tone mapping makes black.
+    - Smaller targets look wrong too: the 360x202 `R32F` target of pass 52 holds 50,000 in every pixel, and the `RGBA32F` target of pass 55 holds values in the tens of thousands.
+    - Open: which draw of pass 90 writes the NaN, and why the lit scene has no geometry in it.
 - Open, in order: why the forest's frame is black with the pool set and #83 (#83 is still a draft, and conflicts with main); the CPU's `submit+present` (about 460 ms a frame); memory (10.2 GB of the 11.3, with 4.9 GB in zram: tight once the forest draws; leads: fewer texture bytes on the GPU, a file-backed guest pool as `DM_GUEST_FILE` gives the iPhone, or guest memory as Vulkan memory, as Banana Native maps it); the GPU time (Banana Native found agl's NDSR upscaler at 58.5 ms a frame on this GPU from register spills of gathered HMMA tiles, and false colours from shader-image views made without storage use, `vt_create`); the title's movie picture without nn::ndve's network; the CPU read of indirect mesh records.
 - Banana Native (git.eden-emu.dev/moceure/BananaNative) runs this game on Adreno 840 phones and documents most of the above; its notes are where #85's cause came from.
 
