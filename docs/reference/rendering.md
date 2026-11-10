@@ -1820,6 +1820,20 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** 3D images that can be colour attachments are created `VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT` (`gfx_vk.c`), and `rp_start` asks `view_get` (`g_view_slice`) for a 2D view of the target's slice (`gfx_vk_draw.inc`). The pass dump copies such a slice by its depth offset. Open: a clear outside a render pass (`vkCmdClearColorImage`) still clears every slice of a 3D image.
 - **Found on:** [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (Bowser's Fury), on a POCO X5 5G (Adreno 619).
 
+### Layered draws get every layer of their targets
+
+- **Symptom:** Android only: the 3D scene comes out as white specks and edges on black after the tone-mapping pass, while the G-buffer and the HDR scene colour in a pass dump look right. The 3D LUT the tone mapper reads holds values that follow no colour ramp.
+- **Cause:** the game draws a volume texture in one pass: one instance per slice, and a geometry shader (or a vertex shader) writes the layer. `rp_prepare` attached every target a layer at a time: a 2D view of the view's first slice and a framebuffer of one layer. Every write to another layer was lost, and the LUT's other slices kept whatever their memory held.
+- **Fix:**
+  - `sh_get` marks a vertex, tessellation or geometry shader whose SPIR-V decorates an output `BuiltIn Layer` (`spv_layer_out`, `vshader.wlayer`).
+  - A draw with such a stage asks `rp_prepare_` for a layered pass. It attaches each 3D or array target whole, as a 2D array view of the slices or layers its view covers (all of them from its first, without a layer range), and the framebuffer gets that many layers.
+  - A layered pass serves draws that write no layer too (they write layer 0, as before), so only a layered draw that meets a pass of one layer ends it and starts it again.
+  - A view of one layer stays that layer, as in [A 3D render target drawn one slice at a time](#a-3d-render-target-drawn-one-slice-at-a-time).
+  - The `[vk] render passes with every layer of their targets attached` line counts them. `DM_VK_LAYERED=0` attaches one layer, as before.
+- **Found on:** [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md)'s first field, on an Ayn Odin 2 and a OnePlus Pad 3.
+  - Unreal's slice geometry shader (`e2f17523c090feaf`, `gl_Layer` from the vertex shader's instance-based slice index) writes the 32×32×32 A2B10G10R10 colour-grading LUT. Two pairs of 32×32 RGBA16F volume targets in each frame (32 instances per draw) are drawn the same way.
+  - With the fix the field shows its lit, burning road, as the game's own tutorial picture of it does.
+
 ### A shader's own constants (c1) read after the control section is gone
 
 - **Symptom:** Android only: a movie plays black (its sound runs) and the game's picture is fine before and after it; in a pass dump the decoded luma and chroma planes hold the picture, but the YUV-to-RGB pass that reads them writes all zero.

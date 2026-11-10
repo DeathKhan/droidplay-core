@@ -70,6 +70,7 @@ General host changes first needed here; each applies to every game:
 - **Bindless reads through a phi that also carries non-handle values** (the vendored translator's `TryTableHandle`): [Bindless reads whose handle phi also carries other values](../../../docs/reference/shaders.md#bindless-reads-whose-handle-phi-also-carries-other-values).
 - **Buffer texture views below the 16-byte alignment read through an aligned copy** (`tbuf_shadow`): [Buffer textures at offsets below 16 bytes](../../../docs/reference/rendering.md#buffer-textures-at-offsets-below-16-bytes).
 - **Android Vulkan replay:** buffer textures and images synced by their own range, and buffers a dispatch wrote read on the GPU by later shaders (`buf_fwd`): [Buffer textures synced by their range, and dispatch outputs read on the GPU](../../../docs/reference/rendering.md#buffer-textures-synced-by-their-range-and-dispatch-outputs-read-on-the-gpu). The real-time opening went from 15.9 to 40.6 fps on an Ayn Odin 2 and from 10.3 to 41.0 on a OnePlus Pad 3.
+- **Android Vulkan replay:** a draw whose geometry shader writes the layer gets every slice of its 3D target (`rp_prepare_`): [Layered draws get every layer of their targets](../../../docs/reference/rendering.md#layered-draws-get-every-layer-of-their-targets). Without it the colour-grading LUT kept 31 of its 32 slices unwritten, and the first field was white specks on black.
 
 ## Open
 
