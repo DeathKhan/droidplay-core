@@ -439,56 +439,37 @@ static void sc_follow_window(void) {
     LOG("window now %dx%d (swapchain %ux%u%s): swapchain made again", ww, wh, g_ext2.width, g_ext2.height, g_sc_stale ? ", out of date" : "");
     g_sc_stale = 0; vk_window_down(); vk_window_up(g_app->window); g_shown = 0;
 }
-// ---------- Presents at the game's own times (VK_GOOGLE_display_timing) ----------
-// The game's frames come on the host's pacing grid (gfx_vk.c mtl_present_pace) plus however long each frame's work took, and the FIFO swapchain showed each at the display's
-// first vsync after it was presented. A frame that came early was shown a vsync early and the next, on time, a vsync late: Divinity: Original Sin 2 at 30 fps on a OnePlus
-// Pad 3 at 60 Hz had two 16.7 + 50 ms pairs in 126 frames (SurfaceFlinger's frame times). Each present now carries a desired time on an absolute schedule of the game's present
-// period, started half a refresh before a vsync the swapchain reported (vkGetPastPresentationTimingGOOGLE), so an early frame waits for its slot. A frame late by up to 1.5
-// periods is shown at once and the schedule keeps its phase (it catches up); a later one starts the schedule again. Only where a frame spans a whole number of refreshes, 2
-// or more (30 fps at 60 Hz, 40 or 60 at 120 Hz): at one refresh a frame a little late missed a vsync for its slot (60 fps at 60 Hz showed 91 frames of 500 twice), and with
-// no whole number the frames fall between vsyncs whatever their times. The host's own pacing still sets how often the game runs. DM_VK_PRESENT_TIMING=0: as before
-static _Atomic uint64_t g_pt_period;   // the game's present period in ns (0 = unpaced), from the present thread (gfx_vk.c mtl_present)
-void front_present_period(uint64_t ns) { atomic_store_explicit(&g_pt_period, ns, memory_order_relaxed); }
-static PFN_vkGetRefreshCycleDurationGOOGLE g_pt_refresh; static PFN_vkGetPastPresentationTimingGOOGLE g_pt_past;
-static VkSwapchainKHR g_pt_sc;   // the swapchain the values below are for
-static uint64_t g_pt_next, g_pt_vsync, g_pt_r;   // the next frame's slot, a vsync the swapchain reported, the refresh period (ns; 0 = not known)
-static uint32_t g_pt_id; static uint64_t g_pt_k = ~0ull;   // the refreshes a frame spans that the log last named
-static uint64_t g_pt_n[3];   // presents in their slot, late ones shown at once, schedule restarts
+// ---------- The display's vsyncs, for frames shown on them (VK_GOOGLE_display_timing) ----------
+// gfx_vk.c locks the host's pacing grid to the display's vsyncs and gives each frame the time it is to be shown (vkb_frame.show_at; gfx_vk_vsync.inc says why). This side
+// reads the vsyncs from the swapchain: its refresh period (vkGetRefreshCycleDurationGOOGLE) and the vsync the newest shown frame came up at (vkGetPastPresentationTimingGOOGLE),
+// on the main thread before each present, for the replay thread to read (front_vsync); and it presents each frame with its time
+static _Atomic uint64_t g_vs_at, g_vs_r;   // a vsync the swapchain reported, and the refresh period (CLOCK_MONOTONIC ns; 0 = not known)
+static PFN_vkGetRefreshCycleDurationGOOGLE g_vs_refresh; static PFN_vkGetPastPresentationTimingGOOGLE g_vs_past;
+static VkSwapchainKHR g_vs_sc; static uint32_t g_vs_id;
+static uint64_t g_vs_n[2];   // frames presented with a time, of them presented after it
+uint64_t front_vsync(uint64_t *refresh) { *refresh = atomic_load_explicit(&g_vs_r, memory_order_relaxed); return atomic_load_explicit(&g_vs_at, memory_order_relaxed); }
 static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }   // the swapchain's clock
-static uint64_t pt_desired(void) {   // the main thread, for the frame about to be presented: its desired present time (0 = as soon as it can)
-    vkb_ctx *c = vkb(); uint64_t T = atomic_load_explicit(&g_pt_period, memory_order_relaxed);
-    if (!c || !c->has_display_timing || !T) { g_pt_next = 0; return 0; }
-    if (!g_pt_past) {
-        g_pt_refresh = (PFN_vkGetRefreshCycleDurationGOOGLE)vkGetDeviceProcAddr(g_dev, "vkGetRefreshCycleDurationGOOGLE");
-        g_pt_past = (PFN_vkGetPastPresentationTimingGOOGLE)vkGetDeviceProcAddr(g_dev, "vkGetPastPresentationTimingGOOGLE");
-        if (!g_pt_refresh || !g_pt_past) { c->has_display_timing = 0; LOG("[front] VK_GOOGLE_display_timing has no functions: frames are shown as soon as drawn"); return 0; }
+static void vs_read(void) {   // the main thread, before a present
+    vkb_ctx *c = vkb(); if (!c || !c->has_display_timing) return;
+    if (!g_vs_past) {
+        g_vs_refresh = (PFN_vkGetRefreshCycleDurationGOOGLE)vkGetDeviceProcAddr(g_dev, "vkGetRefreshCycleDurationGOOGLE");
+        g_vs_past = (PFN_vkGetPastPresentationTimingGOOGLE)vkGetDeviceProcAddr(g_dev, "vkGetPastPresentationTimingGOOGLE");
+        if (!g_vs_refresh || !g_vs_past) { c->has_display_timing = 0; LOG("[front] VK_GOOGLE_display_timing has no functions: frames are paced on the host's own clock"); return; }
     }
-    if (g_pt_sc != g_sc) {   // a new swapchain (window): its refresh, and a schedule of its own
-        VkRefreshCycleDurationGOOGLE rc = {0}; g_pt_sc = g_sc; g_pt_next = g_pt_vsync = 0;
-        g_pt_r = g_pt_refresh(g_dev, g_sc, &rc) == VK_SUCCESS ? rc.refreshDuration : 0;
-        LOG("[front] frames shown at the game's own times (VK_GOOGLE_display_timing, DM_VK_PRESENT_TIMING=0 turns it off): the display refreshes every %.3f ms, the game presents every %.3f ms", g_pt_r / 1e6, T / 1e6);
+    if (g_vs_sc != g_sc) {   // a new swapchain (window): its refresh; no vsync known until a frame of it is shown
+        VkRefreshCycleDurationGOOGLE rc = {0}; g_vs_sc = g_sc; atomic_store(&g_vs_at, 0);
+        atomic_store(&g_vs_r, g_vs_refresh(g_dev, g_sc, &rc) == VK_SUCCESS ? rc.refreshDuration : 0);
+        LOG("[front] the swapchain reports its vsyncs (VK_GOOGLE_display_timing; DM_VK_PRESENT_TIMING=0 turns their use off): the display refreshes every %.3f ms", atomic_load(&g_vs_r) / 1e6);
     }
-    // the refreshes a frame spans: a schedule only for a whole number of 2 or more (see above)
-    uint64_t k = g_pt_r ? (T + g_pt_r / 2) / g_pt_r : 0, off = g_pt_r ? (T > k * g_pt_r ? T - k * g_pt_r : k * g_pt_r - T) : 0;
-    if (k < 2 || off > g_pt_r / 8) {
-        if (g_pt_k != k) { g_pt_k = k; LOG("[front] frames shown as soon as drawn: the game presents every %.3f ms, the display refreshes every %.3f ms", T / 1e6, g_pt_r / 1e6); }
-        g_pt_next = 0; return 0;
-    }
-    if (g_pt_k != k) { g_pt_k = k; LOG("[front] frames shown every %llu refreshes on the game's schedule (%.3f ms)", (unsigned long long)k, T / 1e6); }
-    VkPastPresentationTimingGOOGLE past[8]; uint32_t n = 8;   // the newest vsync a frame was shown at (VK_INCOMPLETE: the older ones are dropped next time)
-    VkResult r = g_pt_past(g_dev, g_sc, &n, past);
-    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && n && past[n - 1].actualPresentTime) g_pt_vsync = past[n - 1].actualPresentTime;
-    uint64_t now = mono_ns(), d;
-    if (!g_pt_next || now > g_pt_next + T + T / 2) {   // no schedule yet, or later than 1.5 periods: a new one from now, half a refresh before a vsync where one is known
-        g_pt_next = now;
-        if (g_pt_vsync && g_pt_r && g_pt_vsync <= now) g_pt_next = g_pt_vsync + (now - g_pt_vsync + g_pt_r / 2 + g_pt_r - 1) / g_pt_r * g_pt_r - g_pt_r / 2;
-        d = g_pt_next; g_pt_n[2]++;
-    } else if (now > g_pt_next) { d = 0; g_pt_n[1]++; }   // late by less: at once, and the next frame is back on the schedule
-    else { d = g_pt_next; g_pt_n[0]++; }
-    g_pt_next += T;
-    if (!((g_pt_n[0] + g_pt_n[1] + g_pt_n[2]) % 1800))
-        LOG("[front] presents at their time %llu, late and shown at once %llu, schedule started again %llu (cumulative)", (unsigned long long)g_pt_n[0], (unsigned long long)g_pt_n[1], (unsigned long long)g_pt_n[2]);
-    return d;
+    VkPastPresentationTimingGOOGLE past[8]; uint32_t n = 8;   // VK_INCOMPLETE: the older ones are dropped next time
+    VkResult r = g_vs_past(g_dev, g_sc, &n, past);
+    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && n && past[n - 1].actualPresentTime) atomic_store_explicit(&g_vs_at, past[n - 1].actualPresentTime, memory_order_relaxed);
+}
+static uint64_t vs_show_at(uint64_t at) {   // the main thread: the present time a frame is given (its show_at; 0 = as soon as it can), counted
+    if (!at || !vkb()->has_display_timing) return 0;
+    g_vs_n[0]++; g_vs_n[1] += mono_ns() > at;
+    if (!(g_vs_n[0] % 1800)) LOG("[front] frames given a time to be shown %llu, presented after it %llu (cumulative)", (unsigned long long)g_vs_n[0], (unsigned long long)g_vs_n[1]);
+    return at;
 }
 
 static int frame_draw(void) {
@@ -526,7 +507,7 @@ static int frame_draw(void) {
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_acq, .pWaitDstStageMask = &ws, .commandBufferCount = 1, .pCommandBuffers = &g_cb,
                        .signalSemaphoreCount = 1, .pSignalSemaphores = &g_done};
-    VkPresentTimeGOOGLE pt = {g_pt_id++, pt_desired()};
+    vs_read(); VkPresentTimeGOOGLE pt = {g_vs_id++, vs_show_at(fr.show_at)};
     VkPresentTimesInfoGOOGLE pti = {.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, .swapchainCount = 1, .pTimes = &pt};
     pthread_mutex_lock(&vkb()->qmu); vkQueueSubmit(g_q, 1, &si, g_fence);
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = vkb()->has_display_timing ? &pti : NULL, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_done, .swapchainCount = 1,
