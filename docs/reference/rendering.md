@@ -1974,9 +1974,14 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
     - 2: the same samplers made with comparison on, which a depth read takes.
     - 3: the reads' marks.
   - Indices are clamped to the binding and decorated `NonUniform` (`VK_EXT_descriptor_indexing`).
-  - Only the textures the shaders read are made, as on the Mac (`pool_gpu`). Each read sets its view type's bit in a word per ID; the word is read first and stored only when the bit is clear. A chunk's first pool draw makes the textures of the IDs marked since and looks again at every ID read so far, which picks up CPU rewrites and new registrations. An ID not made yet reads 0 (a null descriptor, `VK_EXT_robustness2`).
-  - The set is never written while a chunk that bound it may run. A change goes to a version no chunk in flight holds (3 at most), brought up to date with the elements changed since it was last written; a view that is dropped takes every version holding it out of use until it is rewritten.
+  - Only the textures the shaders read are made, as on the Mac (`pool_gpu`).
+    - Each read sets its view type's bit in a word per ID. The word is read first, and stored only when the bit is clear.
+    - A chunk's first pool draw takes the IDs marked since and clears their marks, so a later read marks an ID again. It makes their textures and views, and looks again at the IDs read in that chunk only, as `stage_textures` looks at a draw's own. That picks up CPU rewrites and new registrations, and brings no released texture back.
+    - A registration whose storage is in no memory pool the host maps (the game finalized it) is not made: `vt_create` would read the freed pool object. The Mac guards the same with `tex_storage_live`.
+    - An ID not made yet reads 0 through a null descriptor (`VK_EXT_robustness2`), whatever type it is read as. The pool set is off on a GPU without null descriptors.
+  - The set is never written while a chunk that bound it may run. A change goes to a version no chunk in flight holds (3 at most), brought up to date with the elements changed since it was last written. When every version is in flight, the newest serves as it is only if it lacks nothing but new views. If a view was replaced or dropped since, the oldest version's chunk is waited for, since the replaced view may be destroyed later.
   - A fragment shader whose result the mark's store cannot change keeps its depth test before it runs (`EarlyFragmentTests`), as `dmsh_build.py` does on the Mac.
+  - The first shader that has a pool array starts the pool set, so a game without one never makes it. Room is left for the stages' own descriptors, and `maxPerStageResources` is checked too.
   - `DM_VK_POOL=0` turns it off; `DM_VK_POOL_LOG=1` logs each ID as it is first read.
 - **Check:** `dm/tools/tests/test_spv_pool.py`; with `DM_SPV_DIR`, all 4,892 of Ocarina of Time's modules with pool arrays are rewritten and pass `spirv-val`, 3,759 of them with early depth tests added. Ocarina of Time's Kokiri Forest on a Galaxy Z Fold 8 (`bench_android.tsv` route `kokiri`, two runs each, `DM_VK_POOL=0` against on):
   - before, the run's 103 pool shaders were refused and 49,592 of their draws dropped in its first minute in the forest; after, none refused or dropped, and 6,031 draws bound the set;
