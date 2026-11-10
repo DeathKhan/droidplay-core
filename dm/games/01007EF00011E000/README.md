@@ -174,7 +174,7 @@ Measured 2026-11-10 on a OnePlus Pad 3 (Snapdragon 8 Elite, Adreno 830, driver 0
   - descriptor sets bound again (droidplay-core#91): replay −1.3 ms, 87% of sets not written;
   - 512 draws a chunk in mid-pass (#93): replay −1.5 ms, GPU −2.9 ms;
   - the vkCmd* calls and submissions on a recorder thread (#97);
-  - this game's Android defaults turning on set reuse and the recorder, with a 30 fps target (#102).
+  - this game's Android defaults turning on set reuse and the recorder, with a 30 fps target (#108, held until it has run on a second device).
 
   Together: 30.0 fps in four runs, frame p50 33.1-33.4 ms / p95 38.2-38.9 ms, replay 17.2-17.5 ms, GPU 15.5-16.6 ms, NVN submit+present p95 28.3 ms. With the 30 fps target alone, 29.2-29.6 fps (frame p95 41-44 ms). At the 60 fps target the frame step stays at 20: at 3 vsyncs the clocks stay low and the step down rarely fits.
 - **60 fps** needs the frame's cost at or under 14.2 ms. At 30 fps the replay takes 17 ms and the GPU 16 ms, so both have to come down. Next leads, in order:
