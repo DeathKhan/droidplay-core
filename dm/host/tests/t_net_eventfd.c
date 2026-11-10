@@ -1,4 +1,5 @@
 // nn::socket::EventFd offline (hle_net.c): a descriptor that works with no network, which gRPC's poll engine needs at startup, and that Poll waits on. Socket and the rest stay offline
+#include "../hle_loopback.c"   // hle_net.c's Close and Poll ask it about loopback sockets; none is made here
 #include "../hle_net.c"
 #include <assert.h>
 #include <stdio.h>

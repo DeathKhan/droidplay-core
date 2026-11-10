@@ -1,0 +1,51 @@
+# Divinity: Original Sin 2 - Definitive Edition: Larian Studios' Divinity Engine (FW3.5), SDK 8.2.0, NVN, Wwise sound, RakNet 15.03.26; update 1.0.3.1 (v196608).
+# Its shaders are in the .bshd files of Data/*.pak, Larian's LSPK packages (shader_split.py lspk_shaders).
+# Started from the NSP script's provisional profile (dm/games/profile_guess.py) and brought up on Android (README.md)
+# Format: see dm/games/README.md
+
+# ---- Identity ----
+title_id	010027400CDC6000
+program_id	010027400CDC6000
+
+# ---- App ----
+name	Divinity Original Sin 2
+ipa	DivinityOriginalSin2.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v196608	1.0.3.1	main=f821dc8cc9a45414b69edcbccf0e52b5	subsdk0=3ae34e689d7a35f13cbf42bfd672af8b	sdk=3ae34e689d7a35f13cbf42bfd672af8b
+package	v196608
+shader_versions	v196608
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	Data/Localization/Voice.pak
+zip_store	.nsp:.pak:.yaml:.metallib
+
+# ---- Memory ----
+# the NPDM declares 4 MB of system resource (virtual address memory) and main sets a heap: a 5 GB block with a large alias region; the heap check sizes the heap region from the heap the game asks for
+mem_reserve	0x140000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 4 MB of system resource
+sys_resource	0x400000
+
+# ---- Network ----
+# Single player is a RakNet server and a client in one process, talking UDP over 127.0.0.1: on New Game the server opens its socket (main+0x1adc06c), and with no socket it
+# sat in its LoadSession state while the client waited in StartServer, at the loading screen. A Switch with no network still has loopback, so the game gets it (hle_loopback.c)
+net_loopback	on
+
+# ---- Shader split ----
+shader_groups	/Data/=data
+shader_note	Divinity Original Sin 2 shaders
+
+# ---- Heap check on the Mac ----
+# the game asked for a 2.96 GB heap: a 3.000 GB heap region
+mem_alias	0x60000000
+# the game calls nvnDeviceSetDepthMode with near = 0 in the check boot: the pipeline bases made before it runs are made for that mode
+depth_mode	zero
+
+# heap check: 2026-11-09, the heap request did not fit, then heap 2.96 GB; set mem_alias, depth_mode
+
+# address regions: 2026-11-09, in its first 15 s in nnMain the game's regions reach alias +1.40 GB, within the profile's 1.50 GB alias region (what it takes later in play is not measured here) (rewrite a3c790c419d0)
