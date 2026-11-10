@@ -1,0 +1,9 @@
+# Android benchmark routes for scripts/bench_android.py: name <TAB> DM_KEYS or - <TAB> save or - <TAB> window start s <TAB> window length s <TAB> ready pattern or - <TAB> description [<TAB> KEY=VALUE;KEY=VALUE]
+# A fresh save shows the Brightness screen first (A at 25 s), then the title (A at 28 s: the menu, New Game / Options), whose background cycles through 3D scenes.
+# New Game asks for a difficulty, then "Start with Normal difficulty?" with the cursor on No: Up, then A, starts the game. Times worked out on a OnePlus Pad 3.
+boot	-	-	20	30	-	The Lancarse logo, then the first-run Brightness screen idling: no input, a fresh save
+title	25:A,28:A	-	40	60	-	A fresh save: past the Brightness screen to the title menu, idling while its background cycles through 3D scenes (castle, world map, airship, town)
+opening	25:A,28:A,31:A,34:A,35.5:Up,37:A	-	125	60	-	A fresh save: New Game on Normal difficulty, then the real-time opening after the crystal legend (the burning forest, the monster, the heroine)
+explore	25:A*40/3	-	20	130	-	A fresh save with A every 3 s from 25 s, for working out a route (screenshots with --shot-every)
+tofield	f600:A,f1500:A,f1700:A,f1850:Up,f1950:A,f2400:A*36/150,f7900:R*12/120,f7960:B*12/120	-	340	120	-	A fresh save at 30 fps: New Game, Normal, Yes, the opening, then R and B in turn through the two-page tutorials (B closes one on its last page) into the first field and its autosave, for --keep-save	DM_FPS_TARGET=30
+field	52:A,58:A,62:A,75:LUp~4	saves/battlefield	60	40	-	The first field from its autosave (saves/battlefield, made by tofield): Continue, then a walk north (the README's Mac route)
