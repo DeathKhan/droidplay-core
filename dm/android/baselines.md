@@ -107,8 +107,9 @@ pipelines cached, made 398 graphics pipelines in 9.5 s and measured 57.1 fps, wi
     their source lane at run time. Found by reading the translated SPIR-V; neither game has run on the Pixel.
   - **Not examined:** Animal Crossing's 499 fragment shaders with a ballot.
 - **No `VK_EXT_vertex_attribute_divisor`, but `VK_KHR_vertex_attribute_divisor`** (core in Vulkan 1.4, `supportsNonZeroFirstInstance` false). The replay looks only for the EXT, so
-  a vertex stream that steps once every N > 1 instances steps every instance, with red line 87. Odyssey has none on these routes. Open: enable the KHR (the same structures),
-  and give a draw at a non-zero first instance the instance offset in its vertex buffers instead, since this driver does not support it.
+  a vertex stream that stepped once every N > 1 instances stepped every instance, with red line 87. Fixed: the KHR one is enabled, and a draw with such a stream at a
+  non-zero base instance starts at instance 0 with the base instance in its stream offsets, since this driver reads element `instance / N` there, base instance and all
+  (`dm/android/tests/t_divisor.c`: 101 102 102 102 … at base instance 5, against NVN's 105 105 105 106 …). Neither Odyssey nor Final Fantasy Resonance has such a stream.
 - **No `VK_EXT_shader_stencil_export`:** depth-stencil copies that a blit cannot make are drawn a stencil bit at a time, as on the Adreno 650. Odyssey made none on these routes.
 - **"draws not made: pipeline N"** in the stats line counts the draws left out while pipelines met for the first time are built in the background (`DM_VK_ASYNC_PIPE`:
   [rendering.md](../../docs/reference/rendering.md#pipelines-met-for-the-first-time-built-in-the-background)), not pipelines that failed (`0 failed`, no red line). It was 718 in

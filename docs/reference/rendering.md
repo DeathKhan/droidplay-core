@@ -1776,6 +1776,13 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** `view_format` maps a decoded image's BC view format through `bc_target` first: the image's own BC format is the image itself, its sRGB twin is the decoded format's twin. A decoded colour image lists its format and that twin, as an uncompressed one does ([Colour images keep Adreno's framebuffer compression](#colour-images-keep-adrenos-framebuffer-compression)). A GPU with BC textures is unchanged: its images are never decoded.
 - **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) on a Pixel 9 Pro XL (Mali-G715, driver 0xd803000, Vulkan 1.4.343): the red line at the Start menu, gone with the fix; the Start menu and the opening cutscene draw right at 60 fps with or without it.
 
+### Vertex streams stepping per N instances with the KHR divisor (Android)
+
+- **Symptom:** Android, on a GPU without `VK_EXT_vertex_attribute_divisor` (the Pixel 9 Pro XL's Mali-G715): `[RED] [vk] vertex stream divisor N > 1 on a GPU without VK_EXT_vertex_attribute_divisor: read as 1`, the stream's elements stepping every instance instead of every N.
+- **Cause:** the replay enabled only the EXT extension. A Vulkan 1.4 device can offer only `VK_KHR_vertex_attribute_divisor` (core there), with the same structures and type values. Its `supportsNonZeroFirstInstance` can be false too: the Mali-G715 then reads element `instance / N`, base instance and all, where NVN reads `base instance + (instance - base instance) / N` (`dm/android/tests/t_divisor.c`, divisor 3 at base instance 5: 101 102 102 102 … instead of 105 105 105 106 …).
+- **Fix:** `vk_create` enables the KHR extension where the EXT is missing and reads that property. Where it is false, a draw with a stream stepping per N > 1 instances starts at instance 0 and its instance-rate streams at the base instance's element (`inst_shift` in `bind_vbufs` and the draws). Translated shaders read their instance as `InstanceIndex - BaseInstance` and NVN's base instance from c0, so they see the same numbers. A device with the EXT is unchanged.
+- **Found on:** the Pixel 9 Pro XL ([Android baselines](../../dm/android/baselines.md#mali-super-mario-odyssey-on-a-pixel-9-pro-xl)) from its device features; `t_divisor` passes there with the fix's way and fails with the first instance. Neither [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) nor Final Fantasy Resonance draws such a stream.
+
 ### Replay syncs limited to what is read
 
 - **Symptom:** low frame rate with the GPU and the CPU both mostly idle; the render thread waiting in `view_` / `submit_wait`.
