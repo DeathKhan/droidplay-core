@@ -979,7 +979,7 @@ def main(argv):
               {'title_id': g.id, 'name': label, 'version': pkg_ver, 'display': nacp.version(game / 'control.nacp'),
                'romfs_bytes': Path(rom).stat().st_size if bi.rfs.is_image(rom) else None})
     bi.PROG.end(f'{REMOTE}/games/{g.id}')
-    say(f'done: open DroidPlay on the phone and pick "{label}". Log: {REMOTE}/log.txt (adb logcat -s nxnative)')
+    say(f'done: open DroidPlay on the phone and pick "{label}". Log: {REMOTE}/log.txt (adb logcat -s DroidPlay)')
 
 
 if __name__ == '__main__':

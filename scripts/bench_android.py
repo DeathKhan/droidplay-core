@@ -196,7 +196,7 @@ def run_one(serial, folder, gid, route, n, out, args):
     adb(serial, 'push', str(write_tmp(d / 'env.txt', '\n'.join(env) + '\n')), f'{EXT}/env.txt')
     adb(serial, 'logcat', '-c')
     with open(d / 'logcat.txt', 'wb') as lf:
-        lc = subprocess.Popen([ADB, '-s', serial, 'logcat', '-v', 'epoch', 'nxnative:V', 'ActivityManager:I', 'Zygote:I', 'DEBUG:V', 'libc:F', 'lmkd:I', '*:S'], stdout=lf)
+        lc = subprocess.Popen([ADB, '-s', serial, 'logcat', '-v', 'epoch', 'DroidPlay:V', 'nxnative:V', 'ActivityManager:I', 'Zygote:I', 'DEBUG:V', 'libc:F', 'lmkd:I', '*:S'], stdout=lf)
         sh(serial, 'input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard')
         t0 = time.time()
         sh(serial, f'am start -n {PKG}/.Launcher --es game {gid} --ez play true')

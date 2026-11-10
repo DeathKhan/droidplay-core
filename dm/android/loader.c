@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "nxnative", __VA_ARGS__)
+#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "DroidPlay", __VA_ARGS__)   // the host's tag (front_android.c)
 
 // the intent's extras (getIntent().getStringExtra / getBooleanExtra) on the activity object
 static int intent_extras(ANativeActivity *a, char *game, size_t cap, int *selftest) {

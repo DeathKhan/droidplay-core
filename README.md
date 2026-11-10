@@ -7,8 +7,8 @@ graphics are replayed on the GPU through Vulkan. Pokémon Brilliant Diamond play
 - **Native, not emulated.** A Switch and an Android device both run ARM64 code: the game's code is rewritten only where the host needs it (system calls,
   thread registers), and a host answers the Switch's system calls and SDK services. There is no CPU emulation.
 - **A game is an app of its own**, with its name, icon and saves, installable on any arm64 device with Vulkan, or every game in one launcher app.
-- **Packed on your computer** from your own dump: NSP / XCI files, or a Switch 2 game's `.nup` or dump folder. [DroidPlay](https://github.com/enjoyerofslop/droidplay),
-  a Mac app, does it with a click; the command line works on any computer.
+- **Packed on your computer** from your own dump: NSP / XCI files, or a Switch 2 game's `.nup` or dump folder. [DroidPlay for Windows](#the-desktop-app) and
+  [DroidPlay](https://github.com/enjoyerofslop/droidplay) on a Mac do it with a click; the command line works on any computer.
 
 DroidPlay Core is [seedds/nxnative](https://github.com/seedds/nxnative) (Switch games natively on the iPhone, the iPad and the Mac) with an Android port: the engine the
 DroidPlay apps build games with. The port began as [RogelioLB/nxnative-android](https://github.com/RogelioLB/nxnative-android) (the Vulkan replay of NVN, the Android
@@ -25,12 +25,21 @@ Linux desktop apps on Android ([#40](https://github.com/enjoyerofslop/droidplay-
 
 ## Ways to play
 
+- **DroidPlay for Windows:** download **DroidPlay-Setup-&lt;version&gt;.exe** from the [latest release](https://github.com/enjoyerofslop/droidplay-core/releases/latest)
+  and run it. DroidPlay opens on **Get started**, a checklist that installs the tools it builds with, helps you set up your phone and builds your first game
+  ([The desktop app](#the-desktop-app)). The same app runs on Linux and a Mac from source (`uv run scripts/nxnative_android.py`). It has DroidPlay's name and
+  icon, but it is a separate app from DroidPlay on a Mac.
 - **DroidPlay on a Mac:** add your games folder, then **Install on Android** (one launcher app holding every game, over adb) or **Build Game App** (an APK, or an
   XAPK for an installer app). See [DroidPlay](https://github.com/enjoyerofslop/droidplay).
 - **The command line, any computer:** [Packing from the command line](#packing-from-the-command-line). `--game-apk` makes a game app; without it the game goes into
   the launcher app on a connected device.
-- **DroidPlay for Windows and Linux**, the desktop app (`python scripts/nxnative_android.py`; it runs on a Mac too): the launcher-app flow with a window
-  ([below](#the-desktop-app)). It has DroidPlay's name and icon, but it is a separate app from DroidPlay on a Mac.
+
+<table>
+<tr>
+<td align="center" valign="top" width="50%"><img src="docs/images/windows/get-started.png" alt="DroidPlay for Windows on Get started: the keys picked, the tools for building downloading with the time left, and the phone waiting for Allow"><br><small><b>Get started</b>: your keys, the tools downloading, your phone and your first game</small></td>
+<td align="center" valign="top" width="50%"><img src="docs/images/windows/library.png" alt="DroidPlay for Windows' Library: Pokémon Brilliant Diamond with its box art, ready on a Galaxy S25 Edge, with a Play button"><br><small><b>Library</b>: a game installed on the phone, ready to play</small></td>
+</tr>
+</table>
 
 <!-- The "status" anchor keeps links made before the rename working: DroidPlay's README links to #status. -->
 ## <a id="status"></a>Game Status
@@ -83,7 +92,7 @@ Help with packing and playing, and reports of how a game runs on your device, go
 for a problem, #compatibility for a game. Its rules are this README's: no games, keys, firmware or packed APKs.
 
 Testers and contributors are welcome. Useful reports name the device and its GPU (Settings, or `adb shell getprop ro.product.model`), Android version, the game,
-its title ID and version, how it was packed (DroidPlay, the command line, game app or launcher), and attach the log: `adb logcat -s nxnative`, or `log.txt` in the
+its title ID and version, how it was packed (DroidPlay, the command line, game app or launcher), and attach the log: `adb logcat -s DroidPlay` (`-s nxnative` for an app older than 0.5.0), or `log.txt` in the
 app's folder (`Android/data/<package>/files/`). A screenshot and the first `[RED]` lines help most. Never attach game files or keys. How changes get in, and how
 DroidPlay Core stays in step with nxnative: [CONTRIBUTING.md](CONTRIBUTING.md#droidplay-core).
 
@@ -127,26 +136,49 @@ modules the script names at its top; `python scripts/nxnative_android.py` works 
 
 **On Windows**, from nothing:
 
-1. Download **Install DroidPlay.cmd** from the [latest release](https://github.com/enjoyerofslop/droidplay-core/releases/latest) and double-click it (Windows warns
-   that it is from the internet and unsigned: **More info**, then **Run anyway**). It installs [uv](https://docs.astral.sh/uv/) for you, puts the newest release
-   in `%LOCALAPPDATA%\DroidPlay` with Python and the app's modules, adds DroidPlay to the Start menu and the desktop, and opens it. The release comes from its
-   assets (about 55 MB, or 90 MB where Windows' own tar can't read xz files, then about 150 MB of Python and modules the first time), and a download that is cut
-   off carries on from where it stopped when you run the installer again. Run it again to update, with DroidPlay closed (it stops if DroidPlay is open);
-   `Install DroidPlay.cmd uninstall` removes it (`dm/android/windows/install_droidplay.cmd` is the same file). Or by hand: install uv
-   (`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`), get DroidPlay Core (`git clone https://github.com/enjoyerofslop/droidplay-core`)
-   and, in its folder, `uv run scripts\nxnative_android.py`.
-2. In **Settings**, pick your `prod.keys`, then **Install what's missing**: it downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder
-   (`%LOCALAPPDATA%\nxnative\android\tools`), and Google's Android SDK with the NDK, CMake, build-tools, platform and platform-tools into Android Studio's place,
-   `%LOCALAPPDATA%\Android\Sdk` (about 1.5 GB to download, 5 GB installed). Installing the Android SDK means accepting its
-   [license](https://developer.android.com/studio/terms), which the app asks first; its usage metrics stay off. What the computer already has is kept.
-   From a console: `build_android_from_nsp.py --setup --accept-android-licenses`.
+1. Download **DroidPlay-Setup-&lt;version&gt;.exe** from the [latest release](https://github.com/enjoyerofslop/droidplay-core/releases/latest) and run it. Windows
+   warns that it comes from the internet and isn't signed: **More info**, then **Run anyway**.
+   - It installs DroidPlay for you only, in `%LOCALAPPDATA%\Programs\DroidPlay`, with no administrator prompt and nothing more to download: its own Python with
+     the app's modules, and DroidPlay Core (Setup is about 80 MB, 600 MB installed). Each Setup has a `.sha256` beside it on the release page.
+   - DroidPlay is then in the Start menu, on the desktop, and in **Settings › Apps**, which uninstalls it. Your games and their builds, the Android SDK, the
+     tools and your settings stay.
+   - DroidPlay says when a newer release is out, and **Update** installs it: DroidPlay downloads the new Setup, checks it against the release, runs it
+     (a small Updating DroidPlay window shows its progress) and opens again. Or close DroidPlay and run the new Setup yourself.
+   - **Coming from Install DroidPlay.cmd?** Close DroidPlay and run Setup: it moves your DroidPlay over and removes the copy the .cmd installed, and keeps your
+     games, builds and settings. `Install DroidPlay.cmd uninstall` still removes such a copy by hand (`dm/android/windows/install_droidplay.cmd`).
+   - Or from source: install [uv](https://docs.astral.sh/uv/) (`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`), get
+     DroidPlay Core (`git clone https://github.com/enjoyerofslop/droidplay-core`) and, in its folder, `uv run scripts\nxnative_android.py`.
+2. DroidPlay opens on **Get started**: four steps, each saying what it needs and whether it's done. Setting up takes about half an hour the first time.
+   - **Your keys:** pick your `prod.keys`.
+   - **Tools for building:** **Install tools** downloads Microsoft's JDK 21 and the .NET SDK 10 into the app's own folder (`%LOCALAPPDATA%\nxnative\android\tools`),
+     and Google's Android SDK with the NDK, CMake, build-tools, platform and platform-tools into Android Studio's place, `%LOCALAPPDATA%\Android\Sdk` (about 1.5 GB
+     to download, 5 GB installed), with one bar and the time left. Installing the Android SDK means accepting its
+     [license](https://developer.android.com/studio/terms), which the app asks first; its usage metrics stay off. What the computer already has is kept.
+     From a console: `build_android_from_nsp.py --setup --accept-android-licenses`.
+   - **Your phone:** plug it in with USB debugging on; the step says when the phone is waiting for you to tap **Allow**.
+   - **Your first game:** add the folder with its NSP or XCI files, then **Build and install**.
+
+   Until all four are done, a launch opens on the checklist and the top bar's **Setup 2 of 4** opens it; **Settings › Show the setup checklist** does any time.
+
+<table>
+<tr>
+<td align="center" valign="top" width="36%"><img src="docs/images/windows/phone-setup.png" alt="DroidPlay for Windows' Set up your phone guide for a Samsung Galaxy: Build number, Auto Blocker, USB debugging and Allow, with the phone waiting for Allow at its foot"><br><small><b>Set up my phone</b>: the steps for your phone's brand</small></td>
+<td align="center" valign="top" width="64%"><img src="docs/images/windows/build.png" alt="DroidPlay for Windows' Builds page part-way through building Pokémon Brilliant Diamond: four stages done, the shaders for Vulkan translating, with the time left"><br><small><b>Builds</b>: a first build part-way, its stages and the time left</small></td>
+</tr>
+</table>
 
 - **Library:** the games you added (**+ Build game** picks a folder with a game's NSP files), each with its box art, version and status on the phone picked at the top.
   The big button does what comes next: **Build and install**, **Install on phone** (a game built before, without building again) or **Play**. **Manage** has the rest:
   build only, update the app on the phone, remove the game. A game with no profile gets **Experimental build**: the script surveys the game, writes a guessed
   provisional profile into the game's folder and packs it; once built it is marked *Experimental* and can be installed like any other.
 - **Builds:** the running build's stages, progress and messages (the bar at the bottom of every page follows it); a build started from a console shows here too.
-- **Phones:** adb devices over USB and Wi-Fi (pair, connect, discover), the app version and the games on each phone, saves backed up to the computer.
+  When a build fails, a banner says what went wrong in plain words, with the button that fixes it where there is one (**Install again** once the phone has room,
+  **Choose prod.keys** for keys older than the game). Otherwise it is likely a bug: **Copy report** copies a short report to paste in #help on the Discord, and
+  **Save full report** saves the whole log; both leave out your user folder, the phone's serial and anything that looks like a key.
+- **Phones:** adb devices over USB and Wi-Fi (pair, connect, discover), each one's battery and free space, the app version and the games on each phone, saves
+  backed up to the computer. **How to connect a phone** (also the checklist's **Set up my phone**) walks through turning on USB debugging for the phone's brand
+  (Samsung's Auto Blocker, Xiaomi's Install via USB, a Pixel's driver) and what to try when the phone doesn't show up; a phone below 20% battery gets a warning,
+  since a PC's USB port charges slowly and an install takes minutes.
 - **Performance:** the game's log from `adb logcat`, with the frame time, GPU and CPU figures the host prints, and a frame's GPU time per pass.
 - **Settings:** your `prod.keys`, and the requirements above with how to install what is missing (on Windows, **Install what's missing** does it).
 
@@ -159,12 +191,15 @@ copied to the phone again when the phone already holds the same one.
   host the installed app lacks is marked as needing an app update). Picking a game opens its **settings screen**, grouped into Game and Controls: console mode (handheld is lighter), game language, game timing, render
   scale where the game supports it, the frame-rate counter, rumble and its strength. **Play** starts the game. Lines like `DM_RENDER_SCALE=0.8` in
   `Android/data/org.nxnative.android/files/env.txt` win over the screen (they show greyed out).
+- **The first start** of a game builds its pipelines for the phone's GPU, and stays on the loading screen meanwhile: 80 seconds for Brilliant Diamond on a
+  Galaxy S25 Edge, 39 on a OnePlus Pad 3. Desktop DroidPlay says so the first time **Play** is pressed after an install, and the app says so when the game has no
+  pipelines saved yet. Later starts take a few seconds.
 - **In the game.** Touch controls are drawn over the picture in three layouts (2D, 3D and Tap, switched with the round button at the top); touches no control takes go
   to the game's touch screen. A physical controller works as player 1 and hides the touch controls; rumble goes to the controller or the phone, and shaking the phone
   shakes the controller. The **≡** button at the top (left of −) goes back to the launcher while the game keeps running behind it: **Play** on the same game resumes
   it, and picking another game asks before closing the running one.
 - **Saves** stay in the app's internal storage (`saves/<title ID>`), so updating the app keeps them; the desktop app backs them up to the computer. The log is
-  `Android/data/org.nxnative.android/files/log.txt` (also `adb logcat -s nxnative`).
+  `Android/data/org.nxnative.android/files/log.txt` (also `adb logcat -s DroidPlay`).
 
 ## Another Vulkan driver (Turnip)
 

@@ -180,7 +180,7 @@ public class GameStart extends Activity {
         TextView t = new TextView(this); t.setText(s); t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp); t.setTextColor(color); t.setGravity(Gravity.CENTER); return t;
     }
     void say(final String s) { ui(new Runnable() { public void run() { status.setText(s); } }); }
-    void fail(String s) { say(s); android.util.Log.e("nxnative", s); }
+    void fail(String s) { say(s); android.util.Log.e("DroidPlay", s); }
     void ui(Runnable r) { if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) r.run(); else runOnUiThread(r); }
     int px(int dp) { return Math.round(dp * getResources().getDisplayMetrics().density); }
     SharedPreferences prefs() { return getSharedPreferences("game", MODE_PRIVATE); }

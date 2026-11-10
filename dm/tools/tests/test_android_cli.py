@@ -3,6 +3,7 @@
 from all of them; a game is copied to files/games/<title ID>/ and its folders opened to the app (Android 15 kept it out of adb's drwxrws--- folders); a one-game install
 (files/game) of the same game is moved there with its legacy_save marker, one of another game is left alone. No phone, SDK or game files needed (adb is a recording stand-in)."""
 import hashlib
+import http.server
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import Any
 import unittest
 from unittest import mock
@@ -20,6 +22,9 @@ SCRIPT = REPO / 'scripts/build_android_from_nsp.py'
 spec = importlib.util.spec_from_file_location('build_android_from_nsp', SCRIPT)
 assert spec and spec.loader
 ba = importlib.util.module_from_spec(spec); spec.loader.exec_module(ba)
+spec = importlib.util.spec_from_file_location('update', REPO / 'dm/android/desktop/update.py')
+assert spec and spec.loader
+upd = importlib.util.module_from_spec(spec); spec.loader.exec_module(upd)
 GID = '010015100B514000'
 
 
@@ -383,6 +388,60 @@ class Phone(Base):
             (self.tmp / 'k.jks').write_bytes(b'k'); ba.install('S', apk, self.tmp / 'logs')
         self.assertEqual(self.cmds[-1][:2], ['install', '-r'])
         self.assertFalse(any('uninstall' in ' '.join(c) for c in self.cmds))
+
+
+
+class Update(unittest.TestCase):   # dm/android/desktop/update.py, the desktop app's updates: the newest release read, its Setup downloaded and checked; a local server is GitHub
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.tmp)
+        self.setup = b'MZ' + os.urandom(300_000); files = self.files = {'/setup.exe': self.setup}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = files.get(self.path)
+                self.send_response(200 if body is not None else 404); self.send_header('Content-Length', str(len(body or b''))); self.end_headers(); self.wfile.write(body or b'')
+            def log_message(self, *a): pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start(); self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        self.base = f'http://127.0.0.1:{server.server_address[1]}'
+
+    def release(self, digest=None, name='DroidPlay-Setup-0.5.1.exe'):
+        digest = f'sha256:{hashlib.sha256(self.setup).hexdigest()}' if digest is None else digest
+        self.files['/api'] = json.dumps({'tag_name': 'v0.5.1', 'html_url': 'https://example.invalid/v0.5.1', 'assets': [
+            {'name': 'droidplay-core-0.5.1.zip', 'size': 1, 'browser_download_url': self.base + '/x', 'digest': 'sha256:' + '0' * 64},
+            {'name': name, 'size': len(self.setup), 'browser_download_url': self.base + '/setup.exe', 'digest': digest}]}).encode()
+        return upd.latest_release(self.base + '/api')
+
+    def test_release_numbers(self):   # a checkout's git describe is no release: nothing is newer than it
+        self.assertEqual(upd.release_number('v0.5.1'), (0, 5, 1)); self.assertEqual(upd.release_number('0.10.0'), (0, 10, 0))
+        self.assertGreater(upd.release_number('0.10.0'), upd.release_number('0.9.9'))
+        for v in ('0.5.0-3-gabc1234', '', None, 'v0.5'): self.assertIsNone(upd.release_number(v))
+
+    def test_setup_only_with_the_digest_github_lists(self):
+        r = self.release(); self.assertEqual((r['tag'], r['setup']['name'], r['setup']['sha256']), ('v0.5.1', 'DroidPlay-Setup-0.5.1.exe', hashlib.sha256(self.setup).hexdigest()))
+        self.assertIsNone(self.release(digest='')['setup'])   # nothing to check the download against: the release's page instead
+        self.assertIsNone(self.release(name='Install.DroidPlay.cmd')['setup'])
+
+    def test_setup_downloaded_and_checked(self):
+        folder = self.tmp / 'updates'; folder.mkdir(); (folder / 'DroidPlay-Setup-0.5.0.exe').write_bytes(b'old')
+        seen = []; path = upd.download_setup(self.release()['setup'], folder, lambda d, t: seen.append((d, t)))
+        self.assertEqual(path.read_bytes(), self.setup); self.assertEqual(seen[-1], (len(self.setup), len(self.setup)))
+        self.assertEqual(sorted(f.name for f in folder.iterdir()), ['DroidPlay-Setup-0.5.1.exe'])   # the older download gone, no .part left
+
+    def test_a_setup_that_does_not_match_is_deleted(self):
+        folder = self.tmp / 'updates'
+        with self.assertRaisesRegex(ValueError, "doesn't match the release's checksum"): upd.download_setup(self.release(digest='sha256:' + 'a' * 64)['setup'], folder)
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_cancelled_leaves_nothing(self):
+        folder = self.tmp / 'updates'
+        with self.assertRaises(upd.Cancelled): upd.download_setup(self.release()['setup'], folder, cancelled=lambda: True)
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_a_copy_setup_installed(self):   # <app>\core with the runtime and Inno's uninstaller beside it: Update; any other copy gets the release's page
+        app = self.tmp / 'DroidPlay'; (app / 'core').mkdir(parents=True); (app / 'runtime').mkdir()
+        self.assertFalse(upd.setup_install(app / 'core'))
+        (app / 'unins000.exe').write_bytes(b''); (app / 'runtime' / 'pythonw.exe').write_bytes(b'')
+        self.assertTrue(upd.setup_install(app / 'core'))
 
 
 if __name__ == '__main__':

@@ -1,13 +1,15 @@
 # DroidPlay for Windows as one self-contained folder (dm/android/windows/stage.ps1): Python from python-build-standalone with the modules
 # scripts/nxnative_android.py.lock pins, and the tree as a release ships it. The script checks what it staged (--check's Python rows, the icon, the window opened
-# offscreen) and prints the sizes the installer will carry; the folder is kept as this run's artifact for a few days, to try on a PC. Pull requests that touch
-# what goes into it run this; release-assets.yml will call it for a release's installer.
+# offscreen) and prints the sizes the installer carries. Then its installer, DroidPlay-Setup-<version>.exe (droidplay.iss, Inno Setup 7), checked as a player
+# meets it on this clean runner (test_setup.ps1: install, update over a running DroidPlay, uninstall). The folder and Setup with its .sha256 are kept as this
+# run's artifacts for a few days, to try on a PC. Pull requests that touch what goes in run this; release-assets.yml calls it for a release's Setup.
 name: windows-package
 
 on:
   pull_request:
     paths:
       - dm/android/windows/**
+      - dm/android/desktop/**
       - scripts/nxnative_android.py
       - scripts/nxnative_android.py.lock
       - scripts/build_android_from_nsp.py
@@ -17,6 +19,10 @@ on:
     inputs:
       version:
         description: The version the staged tree's VERSION file says (default git describe)
+        type: string
+        default: ''
+      ref:
+        description: What to check out (a release's tag; default the event's commit)
         type: string
         default: ''
 
@@ -29,15 +35,16 @@ concurrency:
 
 jobs:
   stage:
-    name: DroidPlay for Windows staged and checked
+    name: DroidPlay for Windows staged, packed into Setup and checked
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           fetch-depth: 0   # git describe names the version from the newest tag
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -54,3 +61,29 @@ jobs:
           path: ${{ runner.temp }}/DroidPlay
           retention-days: 7
           compression-level: 6
+      # Inno Setup isn't reliably on the windows-2025 image (actions/runner-images#11644): a pinned release, checked against the digest GitHub lists for it
+      - name: Inno Setup 7.1.1
+        run: |
+          $exe = "$env:RUNNER_TEMP\innosetup-7.1.1-x64.exe"
+          curl.exe -sL --fail --retry 3 -o $exe https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe
+          if ((Get-FileHash $exe -Algorithm SHA256).Hash -ne '8A5A6711C3766A6E5FB74F280BA0E3551E719CE94538D901FDBD1F8F9920B3F0') { throw 'innosetup-7.1.1-x64.exe does not match its digest' }
+          $p = Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=$env:RUNNER_TEMP\inno" -PassThru -Wait
+          if ($p.ExitCode) { throw "Inno Setup's installer exited $($p.ExitCode)" }
+          "$env:RUNNER_TEMP\inno" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: DroidPlay-Setup
+        run: |
+          $stage = "$env:RUNNER_TEMP\DroidPlay"; $v = (Get-Content "$stage\core\VERSION" -Raw).Trim()
+          $n = if ($v -match '^(\d+)\.(\d+)\.(\d+)(?:-(\d+))?') { '{0}.{1}.{2}.{3}' -f $Matches[1], $Matches[2], $Matches[3], $(if ($Matches[4]) { $Matches[4] } else { 0 }) } else { '0.0.0.0' }
+          ISCC.exe /Qp "/DVersion=$v" "/DNumVersion=$n" "/DStage=$stage" "/O$env:RUNNER_TEMP\setup" dm\android\windows\droidplay.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $setup = Get-Item "$env:RUNNER_TEMP\setup\DroidPlay-Setup-$v.exe"
+          "$((Get-FileHash $setup -Algorithm SHA256).Hash.ToLower())  $($setup.Name)" | Out-File -Encoding ascii "$($setup.FullName).sha256"
+          "DroidPlay-Setup-$v.exe: {0:n1} MB" -f ($setup.Length / 1MB)
+      - name: Setup checked as a player meets it (install, update over a running DroidPlay, uninstall)
+        run: ./dm/android/windows/test_setup.ps1 -Setup (Get-Item "$env:RUNNER_TEMP\setup\DroidPlay-Setup-*.exe").FullName
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: DroidPlay-Setup
+          path: ${{ runner.temp }}/setup
+          retention-days: 7
+          compression-level: 0   # Setup is compressed already
