@@ -78,6 +78,24 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Note:** what shortens the serial chain itself, so the GPU's occupancy at a GPU-bound hold is higher and the clock rises faster: Metal encoding on its own thread (`DM_NVN_ENC_THREAD=1`, the profile's `enc_thread on`; the submit thread's translation 6.5 → about 4 ms a frame, measured on an M4 Pro and for Need for Speed), and a smaller first segment. Neither can start the GPU before the game's own work after its wait, and neither was measured on this symptom yet.
 
 
+### A longer hold that never comes back
+
+- **Symptom:** after a heavy moment (a load, a camera turn), a game under the frame step stays at the longer hold, 20 fps instead of 30, with GPU time that fits 30. Ocarina of Time on an Ayn Odin 3 stayed at 20 fps in Link's house after a load, with the chip at 50 °C. Tears of the Kingdom on a Legion Y700 made 27 probes in 66 s, each a burst of late frames down to 20 fps.
+- **Cause:** four ways the controller (`nvn_fstep.h`) missed that the shorter hold fitted again:
+  - the GPU clock falls until the work fills the longer hold: 26–31 ms a frame at hold 3 against 20–22 at hold 2, a cost that reads as not fitting hold 2;
+  - one heavier frame in a dozen ended every run of fitting frames, so a trial waited over 700 frames;
+  - a trial's first frames still came at the longer hold's pace (queued presents) and failed it in three frames;
+  - the GPU reference stayed a light scene's (the title screen's 0.1 vsyncs, or a light view after a failed probe), so a scene heavy at every hold counted as GPU-slowed and probed again and again.
+- **Fix:** taken from DeathKhan/nx2android (`784c9d4`, `2a7881e`, `74076c8`, authors kept):
+  - a hold above kmin keeps the cost the frames held at it (`kheld`), and a trial back to it starts from that cost after the hold-off, with a probe's grace; three such trials failing in a row forget it;
+  - a run tolerates `FSTEP_MISS` (3) frames that fit k but not k − 1;
+  - every trial settles for `FSTEP_SETTLE` (4) frames;
+  - no GPU-slowed probe when the GPU time at kmin doesn't fit kmin;
+  - a probe's frames after its grace move the reference half-way each.
+  - `DM_FSTEP_TRACE=1` logs the controller's inputs every 15th frame.
+- **Found on:** Ocarina of Time (Switch 2) on an Ayn Odin 3 (the fork's measurements: frame time p50 33.3 ms instead of 50, back to hold 2 within 22 frames of a heavier moment), and Tears of the Kingdom on a Legion Y700 (one probe instead of 27 in 66 s).
+- **Check:** `make -C dm/gfx/tests GAME=01007EF00011E000 t_fstep && dm/gfx/tests/t_fstep`: 83 checks. The new ones (a stretched GPU at hold 3, an odd heavier frame, a scene that got heavier, a light reference) fail on the controller before.
+
 ### A derived profile drops the frame step its build lacks
 
 - **Symptom:** a game whose profile has a frame step (`FRAME_STEP` in its `patches.py`) runs at double speed when packed from another update; the log has no `frame step in whole vsyncs` line, and the frame counter shows 60.

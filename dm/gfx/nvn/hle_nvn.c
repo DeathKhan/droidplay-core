@@ -2124,13 +2124,13 @@ static void fstep_tick(const win_t *o, int c) {
     double cpu = shown - (pw + ps) / v, cost = cpu > gpu ? cpu : gpu;
     if (shown > 0) { int b = (int)(cost * 20 + 0.5), bg = (int)(gpu * 20 + 0.5); chist[b < 0 ? 0 : b > 160 ? 160 : b]++; ghist[bg > 160 ? 160 : bg]++; cn++; cpw += pw; cps += ps; cgb += gpu > cpu; cg0 += gpu <= 0; }
     int kmin = fstep_hz() / c, kmax = fps_high() ? 2 : !fstep_hold() ? kmin : kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k,   // at 120 fps a late frame must step down whatever fps_hold says: the game steps by the target
-         kmin0 = g_fs.kmin, probe0 = g_fs.probe;
+         kmin0 = g_fs.kmin, probe0 = g_fs.probe, pphase = nvn_fstep_probe_phase(&g_fs);
     int fixed = dm_fps_state ? (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED) : 0;
     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed;
     // A screen whose rate is not a multiple of 60 (144, 165 Hz) shows the link's 1/60 s ticks on their nearest refreshes (nvn_mtl.m link_range), so a frame on time can show for one
     // refresh more than its hold: a cheap 50 ms frame shows 54.5 ms at 165 Hz, which counted as late kept the hold at 20 fps for good
     int hz = front_screen_max_fps(); g_fs.shown_slack = hz > fstep_hz() && hz % fstep_hz() && mtl_link_active() ? (double)fstep_hz() / hz : 0;
-    int cslow = fstep_cpu_slowed(o->presents), gslow = nvn_fstep_gpu_slowed(&g_fg, gpu, k0 ? k0 : kmin, kmin, probe0) && dm_thermal_now() <= 1 && !dm_low_power_now();   // same gates as the CPU's
+    int cslow = fstep_cpu_slowed(o->presents), gslow = nvn_fstep_gpu_slowed(&g_fg, gpu, k0 ? k0 : kmin, kmin, pphase) && dm_thermal_now() <= 1 && !dm_low_power_now();   // same gates as the CPU's
     // Present snapshots (nvn_mtl.m snap_take): the game runs up to a frame ahead of the screen, so a frame whose work runs long is absorbed instead of shown late, and its cost is
     // no evidence against the hold (Breath of the Wild in Zora's Domain stepped to 30 at a GPU time of 0.75 vsyncs: the frame's CPU time held its waits on its own GPU work).
     // Lateness is then what the screen shows: the on-screen interval of the frame 8 presents back against its hold (pres_expect_ms), late by a quarter or dropped
@@ -2149,6 +2149,9 @@ static void fstep_tick(const win_t *o, int c) {
     g_fs.ramp = mtl_probe_ramp_on();
     g_fs.per_vsync = fstep_hz() / 60;
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
+    { static int tr = -1; if (tr < 0) { const char *e = getenv("DM_FSTEP_TRACE"); tr = e && atoi(e) > 0; }   // DM_FSTEP_TRACE=1: the controller's inputs every 15th frame (vsyncs)
+      if (tr && o->presents % 15 == 0) LOG("[nvn] fstep trace %llu: hold %d shown %.2f wait %.2f cpu %.2f gpu %.2f cost %.2f fit_run %d since %.0f hold-off %.0f trial %d late_run %d screen %d",
+          (unsigned long long)o->presents, g_fs.k, shown, pw / v, cpu, gpu, cost, g_fs.fit_run, g_fs.since, g_fs.hold, g_fs.trial, g_fs.late_run, g_fs.screen); }
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
     atomic_store(&g_fs_k, g_fs.k);
     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
@@ -2158,7 +2161,7 @@ static void fstep_tick(const win_t *o, int c) {
     if (k0 && g_fs.k != k0 && nlog < 40) {
         char why[160], held[48] = ""; int w = snprintf(why, sizeof why, "probe");
         if (cslow) w += snprintf(why + w, sizeof why - w, ", CPU %d%% on performance cores", g_fs_pshare);
-        if (gslow) w += snprintf(why + w, sizeof why - w, ", GPU %.2f× its time at hold %d", g_fg.cur / g_fg.ref, kmin);
+        if (gslow) w += snprintf(why + w, sizeof why - w, ", GPU %.2f× its time at hold %d (%.2f)", g_fg.cur / g_fg.ref, kmin, g_fg.ref);
         if (nvn_fstep_same(&g_fs)) snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
         if (g_fs.k > k0 && g_fs.cref > 0) snprintf(held, sizeof held, "; hold %d held at %.2f", kmin, g_fs.cref);   // what a probe compares the longer hold's cost with
         LOG("[nvn] frame step: hold %d → %d %s at present %llu (%s; cost %.2f, GPU %.2f%s)%s", k0, g_fs.k, fps_high() ? "ticks of 1/120 s" : "vsyncs", (unsigned long long)o->presents,
