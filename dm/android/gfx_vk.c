@@ -90,8 +90,10 @@ static void vk_create(void) {
     if (g_vk.qf == nq) { LOG("[RED] [vk] no graphics queue"); return; }
     uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, NULL);
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
-    const char *dext[9]; uint32_t nde = 0;   // every extension below at once: swapchain, divisor, stencil export, format list, memory report, host query reset, device fault, descriptor indexing, robustness2
+    const char *dext[10]; uint32_t nde = 0;   // every extension below at once: swapchain, divisor, stencil export, format list, memory report, host query reset, device fault, descriptor indexing, robustness2
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
+    { const char *e = getenv("DM_VK_PRESENT_TIMING");   // the swapchain shows each frame at a time given with it (front_android.c pt_desired); Android's loader implements it on every driver
+      if (g_vk.has_swapchain && has_ext(de, nd, "VK_GOOGLE_display_timing") && !(e && *e == '0')) { dext[nde++] = "VK_GOOGLE_display_timing"; g_vk.has_display_timing = 1; } }
     int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
     // depth-stencil copies drawn in one pass (gfx_vk_dscopy.inc), else a draw per stencil bit; DM_VK_STENCIL_EXPORT=0 (env.txt, a diagnostic): the per-bit draws anyway
@@ -2017,6 +2019,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         pthread_mutex_unlock(&g_frame_mu);
     }
     pthread_mutex_unlock(&g_bk);
+    void front_present_period(uint64_t ns); front_present_period(period_s > 0 ? (uint64_t)(period_s * 1e9) : 0);   // the front end shows frames on this schedule
     g_pace_per = period_s > 0 ? (uint64_t)(period_s * 1e9) : 16666667ull; g_pace_due = 1;
     void front_android_present(const tex_t *t, const int crop[4]); front_android_present(t, crop);
     // DM_HITCH_DUMP (hle_thread.c) times stalls from this; only nvn_mtl.m's present set it, so on Android the dump never fired

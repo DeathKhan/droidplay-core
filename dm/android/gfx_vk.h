@@ -42,6 +42,7 @@ typedef struct {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qf;
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mp;
     int has_bc, has_astc, has_surface, has_swapchain;
+    int has_display_timing;   // VK_GOOGLE_display_timing enabled: the front end presents at the game's own times (front_android.c pt_desired)
     pthread_mutex_t qmu;   // every vkQueueSubmit / vkQueuePresentKHR / vkQueueWaitIdle on q
 } vkb_ctx;
 vkb_ctx *vkb(void);        // made at first use; NULL when the device has no usable Vulkan

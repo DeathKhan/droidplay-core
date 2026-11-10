@@ -410,6 +410,18 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (1.4.1) on an Ayn Odin 2 (Adreno 740, Android 13): the sound archives that follow the program setup opened at 3.7 s instead of 174.5 s, and the Start menu showed after about 14 s. Pacing was unchanged: 60 vsyncs a second, frame time p50 16.66 ms. `NVN submit+present` p50 went from 16.03 to 1.80 ms, since the sleep is no longer inside it.
 - **Not checked:** other games on Android, and play past the Start menu.
 
+### Android's 30 fps frames shown a vsync early or late
+
+- **Symptom:** on Android a 30 fps game looks less smooth than its frame rate says ("30 feels like 20", a tester of Divinity: Original Sin 2, issue #113). `dumpsys SurfaceFlinger --latency '<the game's layer>'` lists frames shown for 16.7 ms and 50 ms in pairs among the 33.3 ms ones: Divinity at 30 fps on a OnePlus Pad 3 at 60 Hz had 7 such intervals in about 500 frames.
+- **Cause:** the host paces the game on its own clock (`mtl_present_pace`), and each frame reaches the window after that frame's work, which varies. The front end's FIFO swapchain shows each frame at the display's first vsync after its present. A frame whose work was short came before the vsync it usually missed and was shown a vsync early, and the next one, on time, a vsync late.
+- **Fix:** `front_android.c` gives each present a desired time (`VK_GOOGLE_display_timing`, which Android's Vulkan loader provides on every driver). The times follow an absolute schedule of the game's present period, started half a refresh before a vsync the swapchain reported, so an early frame waits for its slot. A frame late by up to 1.5 periods is shown at once and the schedule keeps its phase; a later one starts it again. This applies only where a frame spans a whole number of refreshes, 2 or more (30 fps at 60 Hz, 40 or 60 fps at 120 Hz). At one refresh, FIFO already shows a frame each vsync, and a schedule made a frame that was a little late miss its vsync: 60 fps at 60 Hz showed 91 of 500 frames twice. With no whole number of refreshes, the frames fall between vsyncs whatever their times. `DM_VK_PRESENT_TIMING=0` turns it off.
+- **Found on:** [Divinity: Original Sin 2](../../dm/games/010027400CDC6000/README.md) (1.0.3.1), the hold, on a OnePlus Pad 3 (Adreno 830, Android 16, the display at 60 Hz). About 500 frames each, from `dumpsys SurfaceFlinger --latency` at four moments of a run:
+  - 30 fps: 2 vsyncs for 501 of 503 frames (one 1 + 3 pair), against 495 of 502 without it, and 504 of 504 in a run of the version that also timed 60 fps.
+  - 60 fps: 500 of 500 at 1 vsync either way.
+  - 40 fps (`DM_PRESENT_HZ=80`): 1 and 2 vsyncs in turn either way.
+  - Frame rate and frame times are unchanged.
+- **Not checked:** a 120 Hz display (the Pad 3 kept Divinity at 60 Hz), other games, a phone with a different vendor's Android.
+
 ## CPU cost and pacing
 
 ### Arena buffer ownership on allocation
