@@ -1,0 +1,7 @@
+# Android benchmark routes for scripts/bench_android.py: name <TAB> DM_KEYS or - <TAB> save or - <TAB> window start s <TAB> window length s <TAB> ready pattern or - <TAB> description [<TAB> KEY=VALUE;KEY=VALUE]
+# Worked out on an Ayn Odin 2. A fresh save shows the title at about 40 s (A at 45 s; earlier presses were missed on some launches), then the main menu, with a Steam cross-save
+# question on a fresh save (B, No). The main menu's cursor starts on Story; Continue is the next row once there is a save. Character creation's first tutorial box takes a held A.
+# saves/hold (beside the NSP folder) is the Quick Save tohold ends with: --keep-save <game folder>/saves/hold
+boot	-	-	20	30	-	The logos and the title screen idling: no input, a fresh save
+tohold	45:A,49:B,52:A,55:A,58:A,61:A,85:A~1.0,89:PLUS,92:A,195:A,198:A,202:PLUS,205:A	-	210	20	-	A fresh save: New Game (Classic), character creation, the opening cinematic, Magister Siwan's first lines, then Quick Save in the Merryweather's hold, for --keep-save
+hold	45:A,49:B,52:Down,54:A,80:A~1.0,84:LUp~1.5,87:LLeft~1.5,90:LDown~1.5,93:LRight~1.5	saves/hold	96	30	-	The Merryweather's hold from its Quick Save (saves/hold, made by tohold): Continue, the movement tutorial closed (A held), a short walk, then idling

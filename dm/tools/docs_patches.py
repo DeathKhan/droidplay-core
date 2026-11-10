@@ -104,6 +104,8 @@ SWITCH_BINDING = [
      'why': "Horizon's limit; off by default because Ace Attorney Investigations Collection maps a little more than its profile's 1 GB pool, which is the thing to fix"}),
     ('alloc_big_align', '', {'what': "StandardAllocator blocks of 64 KB and more aligned to 64 KB", 'now': 'game', 'goal': 'host', 'purpose': 'memory',
      'why': "the cause is a memory pool's GPU address, big-page aligned on hardware and the CPU address here: pool GPU addresses aligned as hardware does, or this alignment for every game"}),
+    ('net_loopback', '', {'what': "UDP between the game's own sockets on 127.0.0.1", 'now': 'game', 'goal': 'host', 'purpose': 'runtime',
+     'why': "the bsd service's loopback works on every console with no network: a default for every game once the games that open UDP sockets (Pia's LAN play) are checked"}),
     ('vconv_range', '', {'what': 'CPU vertex conversion over the vertices a draw reads', 'now': 'game', 'goal': 'host', 'purpose': 'power',
      'why': f'the same vertices as the whole range, for less work; DM_NVN_VCONV_CHECK checks it: {DEFAULT_SOON}'}),
     ('tex_flush_upload', '', {'what': 'CPU-written textures uploaded after a flush', 'now': 'game', 'goal': 'host', 'purpose': 'rendering',
