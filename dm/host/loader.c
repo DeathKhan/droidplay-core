@@ -729,6 +729,9 @@ static void jit_layout_init(void) {
 #endif
     LOG("jit layout (%s): code memory and %d modules in %#llx bytes at %p", path, g_njit_mod, (unsigned long long)g_jit_span, g_jit_base);
 }
+// The profile's modules back to back in one reservation, as Horizon maps them (DroidPlay Core: dm/android/module_pack.c); by default each where mmap puts it
+__attribute__((weak)) void dm_modules_reserve(const char *dir, module_t *mods, int n) { (void)dir; (void)mods; (void)n; }
+__attribute__((weak)) uint8_t *dm_module_slot(module_t *m, uint64_t size, uint64_t pre) { (void)m; (void)size; (void)pre; return NULL; }
 // The place of module m in the layout (its base), NULL when the layout does not name it. Its size and front patch area must be those the image was built with
 static uint8_t *jit_slot(module_t *m, uint64_t size, uint64_t pre) {
     for (int i = 0; g_jit_base && i < g_njit_mod; i++) if (!strcmp(g_jit_mod[i].name, m->name)) {
@@ -736,7 +739,7 @@ static uint8_t *jit_slot(module_t *m, uint64_t size, uint64_t pre) {
             (unsigned long long)size, (unsigned long long)pre, (unsigned long long)g_jit_mod[i].size, (unsigned long long)g_jit_mod[i].pre);
         return g_jit_base + g_jit_mod[i].off;
     }
-    return NULL;
+    return dm_module_slot(m, size, pre);
 }
 
 
@@ -874,6 +877,7 @@ void load_modules(const char *dir, const char **names, int n) {
     }
     create_keys();
     jit_layout_init();
+    if (!g_jit_base) dm_modules_reserve(dir, g_mod, n);
     for (int i = 0; i < n; i++) {
         module_t *m = &g_mod[i];
         t = now_ns(); map_image(m, dir); tm += now_ns() - t;   // On return the code area is already read-only+execute; from here on the loader only writes data

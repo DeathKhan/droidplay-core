@@ -28,7 +28,7 @@
 #      A one-game install of the same game (files/game, the layout before the launcher) is moved there instead of copied again, and its save is copied by the app
 # The picture comes from the Vulkan replay of NVN (dm/android/gfx_vk.c).
 # Needs: Python with lz4, capstone, fonttools and backports.zstd (not on Python 3.14), the .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (ANDROID_HOME or --sdk), adb, keytool (a JDK).
-import argparse, contextlib, datetime, functools, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time
+import argparse, atexit, contextlib, datetime, functools, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -403,21 +403,38 @@ def core_version():   # DroidPlay Core's version, for the launcher app's: the VE
     return (r.stdout.strip().removeprefix('v') or None) if r.returncode == 0 else None
 
 
-def make_apk(sdk, logs, env):   # the app with every host in the library → its path
+def make_apk(sdk, logs, env):   # the app with every host in the library → this run's own copy, which it installs; the library's nxnative.apk becomes the same app
     lib = data_dir(); hosts = library()
     loader, st = lib / 'loader' / 'libnxloader.so', lib / 'selftest'
     if not hosts or not loader.is_file() or not st.is_dir(): raise BuildError(f'no game host built on this computer yet ({lib}): build a game first')
     KEYSTORE.parent.mkdir(parents=True, exist_ok=True)
-    apk = lib / 'nxnative.apk'
+    # Packed under a name of this process's own: two builds in parallel (other sessions, other phones) packed and installed the one nxnative.apk, so a build's install
+    # could get the other's half-written file (apksigner failed with "offset (16777216) > source size (0)")
+    apk, own = lib / 'nxnative.apk', lib / f'nxnative.{os.getpid()}.apk'
+    atexit.register(own.unlink, missing_ok=True)
     bi.run([sys.executable, REPO / 'dm/android/tools/build_apk.py', '--sdk', sdk, '--loader', loader, *[x for so, _ in hosts.values() for x in ('--so', so)],
-            *[x for f in driver_libs(loader.parent) for x in ('--lib', f)], '--selftest', st, '--keystore', KEYSTORE, '-o', apk,
+            *[x for f in driver_libs(loader.parent) for x in ('--lib', f)], '--selftest', st, '--keystore', KEYSTORE, '-o', own,
             *(['--version-name', v] if (v := core_version()) else [])], logs / 'android_apk.log', env=env)
+    if own.is_file(): tmp = lib / f'.nxnative.{os.getpid()}.apk'; shutil.copyfile(own, tmp); os.replace(tmp, apk)   # whole or not at all, for anyone who takes it from there
     names = [m.get('name') or gid for gid, (_, m) in hosts.items()]
     say(f'app: {", ".join(names)} ({apk})')
-    return apk
+    return own
 
 
 # ---------------- The phone ----------------
+WAIT_DEVICE = 0.0   # --wait-device
+
+
+@contextlib.contextmanager
+def phone(serial, what):   # the device to this build while it installs or runs something there (dm/android/tools/device_lock.py): a bench's runs on it, or another build's
+    # install, would be force-stopped by this one, and this one's by them. Not held while it builds on the computer
+    sys.path.insert(0, str(REPO / 'dm/android/tools')); import device_lock   # pyright: ignore[reportMissingImports]
+    try: lock = device_lock.held(serial, what, WAIT_DEVICE, say); lock.__enter__()
+    except device_lock.DeviceBusy as e: raise BuildError(str(e)) from None
+    try: yield
+    finally: lock.__exit__(None, None, None)
+
+
 def pick_device():
     """The one device adb lists as ready ('device'): an offline Wi-Fi entry left from an earlier connection does not count"""
     out = subprocess.run(['adb', 'devices'], capture_output=True, text=True, errors='replace').stdout.splitlines()[1:]
@@ -848,6 +865,7 @@ def main(argv):
     ap.add_argument('--sdk', help='the Android SDK (default ANDROID_HOME)'); ap.add_argument('--serial', help='the adb device (default: the only one)')
     ap.add_argument('--no-push', action='store_true', help='build the APK only; do not install it or copy the game files to the phone')
     ap.add_argument('--push-only', action='store_true', help='install the app and copy a game built before to the phone, without building')
+    ap.add_argument('--wait-device', type=float, default=0, help='wait up to this many seconds for a phone a bench or another build holds (default: stop at once)')
     ap.add_argument('--update-shaders', action='store_true', help='pull the shaders a game compiled at run time on the phone, translate the new ones and copy them (no app build)')
     ap.add_argument('--apk-only', action='store_true', help='pack the app with every game host built on this computer and install it')
     ap.add_argument('--migrate', action='store_true', help="move a one-game install's files/game to files/games/<--title> on the phone")
@@ -862,6 +880,7 @@ def main(argv):
     ap.add_argument('--setup', action='store_true', help='install what --check finds missing (Windows: the JDK, the .NET SDK and the Android SDK)')
     ap.add_argument('--accept-android-licenses', action='store_true', help="with --setup: you accept the Android SDK License (https://developer.android.com/studio/terms)")
     a = ap.parse_args(argv)
+    global WAIT_DEVICE; WAIT_DEVICE = a.wait_device
     if a.xapk: a.game_apk = True
     if a.game_apk:
         if a.push_only or a.update_shaders or a.apk_only or a.migrate: raise BuildError('--game-apk builds the game; it goes with none of --push-only, --update-shaders, --apk-only, --migrate')
@@ -879,11 +898,14 @@ def main(argv):
         if a.migrate:
             if not a.title or not re.fullmatch(r'[0-9A-Fa-f]{16}', a.title): raise BuildError('--migrate needs --title <the game\'s 16-digit title ID>')
             bi.PROG.plan(1); bi.PROG.stage('move the one-game install')
-            if not migrate_legacy(serial, a.title.upper()): say(f'nothing to move: no game in {REMOTE}/game')
+            with phone(serial, f'build_android_from_nsp.py: moving {a.title.upper()} to the launcher'):
+                if not migrate_legacy(serial, a.title.upper()): say(f'nothing to move: no game in {REMOTE}/game')
             bi.PROG.end(); return
         bi.PROG.plan(2); env = dict(os.environ)
         bi.PROG.stage('APK'); apk = make_apk(sdk_dir(a.sdk), logs, env); bi.PROG.end(str(apk))
-        bi.PROG.stage('install'); install(serial, apk, logs); bi.PROG.end(serial)
+        bi.PROG.stage('install')
+        with phone(serial, 'build_android_from_nsp.py: installing the app'): install(serial, apk, logs)
+        bi.PROG.end(serial)
         return
     if not a.nsp_dir: raise BuildError('give the NSP folder (or the .nup file) and -k <prod.keys> (or --check / --apk-only / --migrate)')
     src, keys = Path(a.nsp_dir).expanduser().resolve(), Path(a.keys).expanduser().resolve() if a.keys else None
@@ -987,7 +1009,8 @@ def main(argv):
         dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir() or p.suffix == '.img') if aoc else []
         sdirs = {v: (game if v == pkg_ver else extract(v)) for v in sv}
         if sv and bi.pg.build_sources(game / 'ExeFS', bi.rfs.source(game), g.words('modules') or ['main'])['ue_decode'][0]:   # Unreal's Oodle-compressed shaders (ue_decode)
-            ue_decode(sdirs, pkg_ver, nsp_dir, patched, work, logs, env, g, serial, sdk, game)
+            with phone(serial, f'build_android_from_nsp.py: decoding {g.id}\'s Unreal shaders') if serial else contextlib.nullcontext():
+                ue_decode(sdirs, pkg_ver, nsp_dir, patched, work, logs, env, g, serial, sdk, game)
         spv = build_shaders(sv, sdirs, work, logs, env, g, dlc_roms)
         bi.PROG.stage('Android host'); so, loader, ndk = build_host(sdk, g.id, work, logs, env); st = build_selftest(ndk, work, logs, env)
         if not a.game_apk: library_add(g.id, so, loader, st, {'title_id': g.id, 'name': nacp.name(game / 'control.nacp') or g.get('name', ''), 'version': pkg_ver,
@@ -1012,15 +1035,16 @@ def main(argv):
         return
     bi.PROG.stage('APK'); apk = make_apk(sdk, logs, env); bi.PROG.end(str(apk))
     if a.no_push:
-        say(f'done: {apk}. On the phone: install it, then copy {patched} to {REMOTE}/games/{g.id}/code and {bi.rfs.source(game)} to {REMOTE}/games/{g.id}/'); return
+        say(f'done: {data_dir() / "nxnative.apk"}. On the phone: install it, then copy {patched} to {REMOTE}/games/{g.id}/code and {bi.rfs.source(game)} to {REMOTE}/games/{g.id}/'); return
     bi.PROG.stage('install and copy to the phone')
     serial = serial or pick_device()
-    bi.PROG.set(step='installing the app (an update keeps its data)'); install(serial, apk, logs)   # words that hold for a first install too, with no adb call to tell them apart
-    adb(serial, 'shell', 'am', 'force-stop', PKG)
-    rom = bi.rfs.source(game)
-    push_game(serial, g.id, game, patched, spv, font, work / 'aoc', defaults, work, logs,
-              {'title_id': g.id, 'name': label, 'version': pkg_ver, 'display': nacp.version(game / 'control.nacp'),
-               'romfs_bytes': Path(rom).stat().st_size if bi.rfs.is_image(rom) else None})
+    with phone(serial, f'build_android_from_nsp.py: installing {label} ({g.id})'):
+        bi.PROG.set(step='installing the app (an update keeps its data)'); install(serial, apk, logs)   # words that hold for a first install too, with no adb call to tell them apart
+        adb(serial, 'shell', 'am', 'force-stop', PKG)
+        rom = bi.rfs.source(game)
+        push_game(serial, g.id, game, patched, spv, font, work / 'aoc', defaults, work, logs,
+                  {'title_id': g.id, 'name': label, 'version': pkg_ver, 'display': nacp.version(game / 'control.nacp'),
+                   'romfs_bytes': Path(rom).stat().st_size if bi.rfs.is_image(rom) else None})
     bi.PROG.end(f'{REMOTE}/games/{g.id}')
     say(f'done: open DroidPlay on the phone and pick "{label}". Log: {REMOTE}/log.txt (adb logcat -s DroidPlay)')
 

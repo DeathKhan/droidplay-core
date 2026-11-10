@@ -187,8 +187,9 @@ class Library(Base):
         ran = []
         with mock.patch.object(ba.bi, 'run', lambda cmd, log, env=None: ran.append([str(c) for c in cmd])):
             apk = ba.make_apk(Path('sdk'), self.tmp, {})
-        self.assertEqual(apk, self.tmp / 'data' / 'nxnative.apk')
+        self.assertEqual(apk, self.tmp / 'data' / f'nxnative.{os.getpid()}.apk')   # this run's own copy: another build packing at the same time can't swap it under the install
         cmd = ran[0]
+        self.assertEqual(cmd[cmd.index('-o') + 1], str(apk))
         self.assertEqual([cmd[i + 1] for i, c in enumerate(cmd) if c == '--so'], [str(self.tmp / 'data/hosts' / g / f'libdmhost_{g}.so') for g in sorted([GID, '0100A6301214E000'])])
         self.assertIn('--loader', cmd)
 
