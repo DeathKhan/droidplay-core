@@ -28,7 +28,7 @@
 #      A one-game install of the same game (files/game, the layout before the launcher) is moved there instead of copied again, and its save is copied by the app
 # The picture comes from the Vulkan replay of NVN (dm/android/gfx_vk.c).
 # Needs: Python with lz4, capstone, fonttools and backports.zstd (not on Python 3.14), the .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (ANDROID_HOME or --sdk), adb, keytool (a JDK).
-import argparse, contextlib, datetime, functools, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile
+import argparse, contextlib, datetime, functools, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -240,6 +240,46 @@ def build_shaders(sv, dirs, work, logs, env, g, dlc_roms=()):
     last = [l for l in (logs / 'spv_build.log').read_text(errors='replace').splitlines() if l.startswith('spv_build:')]
     bi.PROG.end(last[-1][11:] if last else str(out))
     return out
+
+
+def ue_decode(dirs, pkg_ver, nsp_dir, patched, work, logs, env, g, serial, sdk, game):
+    """Unreal's shaders, decoded into each version's <extraction>/ue_shaders before the split reads them (build_ipa_from_nsp.py decode_ue_shaders, the NSP scripts' step): they are
+    Oodle-compressed, and only the game's own decoder undoes it. The Mac build runs it in the Mac host; this computer may not run the game's arm64 code (Windows, Linux), so the
+    phone does (scripts/android_oodle.py): the game's host goes into the app, and its rewritten code to the phone, before the shaders exist (the host does not depend on them).
+    A folder whose stamp matches its paks and containers is kept, and one a Mac build made beside this NSP folder (<game>/<title ID>_build, from the same files) is taken"""
+    sys.path.insert(0, str(REPO / 'dm/gfx/tools')); import uepak, android_oodle   # noqa: E401  # pyright: ignore[reportMissingImports]
+    fresh = lambda d: (d / 'ue_shaders/stamp').is_file() and (d / 'ue_shaders/stamp').read_text() == bi.ue_stamp(d)
+    todo = {v: d for v, d in dirs.items() if not fresh(d)}
+    bi.PROG.add(1); bi.PROG.stage('UE shader decode')
+    for v, d in list(todo.items()):   # DroidPlay's Mac build of the same game (the folder above the NSP folder), its decoded archives made from the same paks
+        if os.environ.get('DM_UE_DECODE') == 'phone': break   # the phone's decode wanted even so (a test of it on a Mac with the game's Mac build)
+        mac = nsp_dir.parent / f'{g.id}_build' / 'extract' / v / 'ue_shaders'
+        if (mac / 'stamp').is_file() and (mac / 'stamp').read_text() == bi.ue_stamp(d):
+            part = d / 'ue_shaders.partial'; bi.rmtree(part); shutil.copytree(mac, part); bi.swap_in(part, d / 'ue_shaders'); del todo[v]
+            say(f'{v}: the decoded shader archives of the Mac build in {mac.parent.parent.parent}')
+    if not todo: bi.PROG.end('reused'); return
+    if not serial:
+        raise BuildError('the game\'s Unreal shaders are Oodle-compressed, and only the game\'s own decoder undoes them: it runs on the phone here, so connect one (or build once without '
+                         '--no-push, or build the game in DroidPlay for Mac first)')
+    bi.PROG.set(step='the game\'s host and code to the phone, where its own Oodle decodes the shaders')
+    so, loader, ndk = build_host(sdk, g.id, work, logs, env); st = build_selftest(ndk, work, logs, env)
+    library_add(g.id, so, loader, st, {'title_id': g.id, 'name': bi.nacp.name(game / 'control.nacp') or g.get('name', ''), 'version': pkg_ver,
+                                       'display': bi.nacp.version(game / 'control.nacp'), 'nsp_dir': str(nsp_dir)})
+    install(serial, make_apk(sdk, logs, env), logs)
+    dst = f'{REMOTE}/games/{g.id}'; adb(serial, 'shell', 'mkdir', '-p', dst); adb(serial, 'shell', 'rm', '-rf', f'{dst}/code')
+    push_dir(serial, patched, dst, 'code', logs / 'adb_push_code_oodle.log'); open_tree(serial, dst)
+    phone = android_oodle.Phone(adb, serial, g.id, REMOTE, PKG, work, logs, say)
+    t0, total = time.time(), 0
+    for v, d in todo.items():
+        bi.PROG.set(step=f'{v}: decoding the shaders with the game\'s Oodle on the phone')
+        jd, out = work / f'tmp/ue_job_{v}', d / 'ue_shaders.partial'; bi.rmtree(out)
+        try: listing, n = android_oodle.decode(uepak, bi.rfs.source(d), d / 'ExeFS/main', jd, out, phone)
+        except ValueError as e: raise BuildError(str(e)) from e   # a damaged pak or container, or the phone's job (its log named)
+        if not listing: raise BuildError(f'the RomFS has Unreal paks, but none under {bi.rfs.source(d)} holds a shader code archive: where the shaders are has to be found first')
+        say(f'{v}: ' + '; '.join(f'{x["name"]} {x["shaders"]:,} shaders' + (f' ({x["compression"]})' if x.get('compression') else '') for x in listing))
+        (out / 'stamp').write_text(bi.ue_stamp(d)); bi.swap_in(out, d / 'ue_shaders'); bi.rmtree(jd)
+        total += n + sum(x['shaders'] for x in listing if x['compression'] == 'IoStore, decoded')
+    bi.PROG.end(f'{total:,} shaders in {bi.hms(time.time() - t0)}, {phone.jobs} job(s) on the phone')
 
 
 # ---------------- The library of game hosts ----------------
@@ -945,7 +985,10 @@ def main(argv):
         aoc = bi.extract_aoc(nx, keys, REPO, work, app, fam, logs)
         if prov and serial: pull_captures(serial, g.id, capture_dir, logs)
         dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir() or p.suffix == '.img') if aoc else []
-        spv = build_shaders(sv, {v: (game if v == pkg_ver else extract(v)) for v in sv}, work, logs, env, g, dlc_roms)
+        sdirs = {v: (game if v == pkg_ver else extract(v)) for v in sv}
+        if sv and bi.pg.build_sources(game / 'ExeFS', bi.rfs.source(game), g.words('modules') or ['main'])['ue_decode'][0]:   # Unreal's Oodle-compressed shaders (ue_decode)
+            ue_decode(sdirs, pkg_ver, nsp_dir, patched, work, logs, env, g, serial, sdk, game)
+        spv = build_shaders(sv, sdirs, work, logs, env, g, dlc_roms)
         bi.PROG.stage('Android host'); so, loader, ndk = build_host(sdk, g.id, work, logs, env); st = build_selftest(ndk, work, logs, env)
         if not a.game_apk: library_add(g.id, so, loader, st, {'title_id': g.id, 'name': nacp.name(game / 'control.nacp') or g.get('name', ''), 'version': pkg_ver,
                                             'display': nacp.version(game / 'control.nacp'), 'nsp_dir': str(nsp_dir)})
