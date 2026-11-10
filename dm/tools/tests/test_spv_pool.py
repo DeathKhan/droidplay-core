@@ -2,6 +2,7 @@
 clang and run on modules assembled with its spirv-as; spirv-val checks the result. Skipped without the NDK.
 With DM_SPV_DIR=<a game's packed spv folder>, also run over every module there with pool arrays (each result must pass spirv-val); DM_SPV_POOL_MAX caps how many."""
 import ctypes
+import faulthandler
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from test_spv_readonly import NDK, HOST, EXE   # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 N = 65536
+faulthandler.enable()   # a crash in the library prints the Python stack (the Linux runner's exit 139 said nothing more)
 
 FS = '''OpCapability Shader
 %glsl = OpExtInstImport "GLSL.std.450"
@@ -171,6 +173,8 @@ class SpvPool(unittest.TestCase):
             cc = ['xcrun', 'clang'] if sys.platform == 'darwin' else [shutil.which('clang') or bin_ / 'clang']
             subprocess.run([*cc, '-shared', '-fPIC', '-O1', '-Wall', '-Wextra', '-Werror', '-I', REPO / 'dm/android', src, '-o', cls.tmp / 'p.so'], check=True)
             cls.lib = ctypes.CDLL(str(cls.tmp / 'p.so'))
+        u32p = ctypes.POINTER(ctypes.c_uint32)   # every argument typed: a size_t passed as an untyped Python int is a 32-bit int, its register's upper half garbage on x86-64 Linux
+        cls.lib.run.argtypes = [u32p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int, u32p, u32p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_int)]
         cls.lib.run.restype = ctypes.c_size_t
 
     def run_on(self, data, mark=1):
