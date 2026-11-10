@@ -38,6 +38,7 @@
 static int vk_debug(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_DEBUG") != NULL; return v; }   // DM_VK_DEBUG=1: a log line per upload and texture-to-buffer copy
 #define RED_ONCE(id, ...) do { static int once_; if (!once_) { once_ = 1; LOG("[RED] [vk] " __VA_ARGS__); } } while (0)   // a flag: a counter (!once_++) overflowed on a path taken every draw
 static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one thread's at a time: submissions, CPU reads, texture lifetimes
+static __thread int t_bk_sub;   // this thread holds g_bk for a submission (mtl_sub_begin to mtl_sub_commit): see BK_LOCK
 
 // ---------------- The device ----------------
 static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
@@ -1298,8 +1299,32 @@ void mtl_tex_release(tex_t *t) {
     if (!t->serial || tex_pinned_release(t->serial)) return;   // a queued job or the bound targets still name it: dropped at its last unpin
     pthread_mutex_lock(&g_bk); tex_drop(t->serial); pthread_mutex_unlock(&g_bk);
 }
-void mtl_tex_cpu_written(const tex_t *t) { pthread_mutex_lock(&g_bk); if (!nvn_hm_get(&g_cpuw, &t->serial)) nvn_hm_put(&g_cpuw, &t->serial, (void *)1); pthread_mutex_unlock(&g_bk); }
-int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_bk); vtex *v = nvn_hm_get(&g_tex, &serial); int r = v && !v->pkg; pthread_mutex_unlock(&g_bk); return r; }
+// nvn_queue.inc polls the CPU's texture rewrites (nvn_ft_poll, tex_dirty_upload) between mtl_sub_begin and mtl_sub_commit, on the replay thread, which holds g_bk all that
+// time: these answers take g_bk only when the calling thread does not hold it already. Taken again, it deadlocked the replay at the first rewrite the poll saw: Ocarina of
+// Time's first submission never ran, and the game waited on its fence with a black screen
+#define BK_LOCK() int bk_own_ = !t_bk_sub; if (bk_own_) pthread_mutex_lock(&g_bk)
+#define BK_UNLOCK() do { if (bk_own_) pthread_mutex_unlock(&g_bk); } while (0)
+void mtl_tex_cpu_written(const tex_t *t) { BK_LOCK(); if (!nvn_hm_get(&g_cpuw, &t->serial)) nvn_hm_put(&g_cpuw, &t->serial, (void *)1); BK_UNLOCK(); }
+int mtl_tex_gpu_owned(uint64_t serial) { BK_LOCK(); vtex *v = nvn_hm_get(&g_tex, &serial); int r = v && !v->pkg; BK_UNLOCK(); return r; }
+// nvn_ft_poll (tex_dirty_upload, hle_nvn.c): the CPU rewrote a registered texture's pages after its first use. As nvn_mtl.m's rule (nxnative PR #1558): a texture whose
+// storage can be where its content comes from is uploaded from it, unless it is an uncompressed 2D one the GPU has drawn into, whose content lives in its Vulkan image (this
+// replay writes no block-linear target back to its storage): that one stays the GPU's until the CPU rewrites it again. The rest: the GPU's if it is a GPU-only image, else
+// uploaded. Ocarina of Time rewrites its terrain tiles' height (R32F), blend and hole (RGBA8) maps as tile slots are reused; the nxnative merge (b547f1e2) moved the poll
+// to this question, which the replay did not answer yet, so a host with tex_dirty_upload did not link
+int mtl_tex_cpu_rewritten(const tex_t *t) {
+    int f = (int)t->d.format, comp = (f >= 0x41 && f <= 0x50) || (f >= 0x79 && f <= 0x94), unc = !comp && t->d.target != NVN_TEXTURE_TARGET_3D;   // nvn_mtl.m fmt_compressed, tex_unc
+    int ok = t->mem && t->pool && !t->has_layout && t->d.samples <= 1 && t->d.target != NVN_TEXTURE_TARGET_BUFFER
+          && !(unc && ((f >= 0x31 && f <= 0x36) || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE))))   // depth / stencil, display, video decode
+          && !(t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))
+          && !(t->d.flags & (NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))
+          && !((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !comp);
+    if (ok) {
+        if (unc) { BK_LOCK(); vtex *v = nvn_hm_get(&g_tex, &t->serial); int drawn = v && !v->pkg && v->rt_last; BK_UNLOCK(); if (drawn) return MTL_REWRITE_GPU_NOW; }
+        mtl_tex_cpu_written(t); return MTL_REWRITE_UPLOADED;
+    }
+    if (mtl_tex_gpu_owned(t->serial)) return MTL_REWRITE_GPU;
+    mtl_tex_cpu_written(t); return MTL_REWRITE_UPLOADED;
+}
 static void reg_tex(int id, const tex_t *t, const view_t *v); static void reg_samp(int id, const samp_par *p);   // gfx_vk_draw.inc
 void mtl_reg_tex(int id, const tex_t *t, const view_t *vw) { reg_tex(id, t, vw); }
 void mtl_reg_samp(int id, const samp_par *p) { reg_samp(id, p); }
@@ -1599,7 +1624,7 @@ static int rc_skips(void) {   // the clear or draw at hand is dropped
     return 1;
 }
 void mtl_sub_begin(void) {
-    pthread_mutex_lock(&g_bk); hint_note();
+    pthread_mutex_lock(&g_bk); t_bk_sub = 1; hint_note();
     static __thread int placed; if (!placed) { placed = 1; void dm_android_place_thread(int done); dm_android_place_thread(0); }
     if (place_log_on()) { int c = sched_getcpu(); g_place_cpu[c >= 0 && c < 16 ? c : 15]++; g_place_n++; }
 }
@@ -1717,9 +1742,9 @@ static void bound_preserve(void);   // below, with the queue scheduler's hooks
 uint64_t mtl_sub_commit(void) {
     bound_preserve();
     uint64_t f = atomic_fetch_add(&g_fence, 1) + 1;
-    if (!cur()) { pthread_mutex_unlock(&g_bk); return f; }
+    if (!cur()) { t_bk_sub = 0; pthread_mutex_unlock(&g_bk); return f; }
     chunk_submit(f);
-    pthread_mutex_unlock(&g_bk);
+    t_bk_sub = 0; pthread_mutex_unlock(&g_bk);
     return f;
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
