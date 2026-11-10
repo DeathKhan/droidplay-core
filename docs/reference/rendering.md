@@ -1897,6 +1897,46 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Check:** a test build that crashed the 40th pipeline build on purpose, Super Mario Odyssey on an Ayn Odin 2: `[dm] CRASH sig=11 … thread 12790 "vk-prewarm"`, then `[dm] pipeline being built by the crashing thread: thread 12790 "vk-prewarm", graphics, shaders 384597a04ae3928e 12bd959fa3ef29ce - - (vertex .z variant), topology 3, 6 colour targets`.
 - **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) on a Retroid Pocket 5 ([Android baselines](../../dm/android/baselines.md), problem 2): its pipeline led to [subgroup operations in a stage the Adreno 650 runs none in](#subgroup-operations-rewritten-for-stages-the-gpu-runs-none-in).
 
+### A GPU hang names the submission it was in
+
+- **Symptom:** Android only: `[RED] [vk] vkQueueSubmit failed: -4` (`VK_ERROR_DEVICE_LOST`), after which the picture stays as it was (a loading screen for good) and the GPU time reads 0, with a frame of about 3 s just before it and nothing else in the log to say where.
+- **Cause:** the GPU hung on a submission. The kernel's report of it (kgsl) needs root on a phone, and the replay noted nothing of what a submission held. On a OnePlus Pad 3 (Adreno 830) the driver's hang recovery cut a hung submission short (its fence signalled, its end timestamp never written) about 250 ms in, and gave the context up only when one ran past 3 s.
+- **Fix:** each chunk keeps breadcrumbs of what it recorded (`crumb`: its passes with their size, its draws with their shader keys, vertices and instances, its dispatches with their groups), and the completion thread logs them for a chunk that took over 200 ms on the GPU (`gpu_slow`, `GPU_SLOW_NS`; the one before it had completed, so it is the chunk the GPU was in), at most three: `[RED] [vk] submission N took T ms on the GPU, its end timestamp never written (the driver's hang recovery cut it short)`, then a line per pass, draw and dispatch. The first lost fence or submission logs what `VK_EXT_device_fault` gives where the driver has it (`gpu_fault_log`: each fault's kind and address, the vendor's records). A file `vk_mid` beside `DM_DUMP_DIR` holding 1 (`chmod 666` when the shell writes it) cuts the chunks after every draw, so the slow one names a single draw.
+- **Check:** Breath of the Wild on a OnePlus Pad 3: three submissions of 249, 277 and 281 ms, each with its end timestamp unwritten and each holding the draw of vertex shader `2decd3e894b3736a` and fragment shader `26ae1640f3448ba4`, before the device was lost; with chunks of one draw, that draw alone. `VK_EXT_device_fault` gave no address and no vendor record (a hang, not a page fault).
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) on a OnePlus Pad 3 (the hang itself is open there).
+
+### Command recording on a thread of its own (Android)
+
+- **Symptom:** a game with thousands of draws a frame is held by the replay thread's CPU time. In a profile of that thread the driver's recording calls are a large share: Breath of the Wild on a OnePlus Pad 3, `vkCmdDrawIndexed` 9.9%, `vkCmdBindDescriptorSets` 8.2%, `vkCmdBeginRenderPass` 1.4%, and binds, copies and dynamic state besides. Meanwhile the phone's other cores are idle.
+- **Cause:** the replay made every `vkCmd*` call itself, and ended and submitted each chunk, on its one thread.
+- **Fix:** `DM_VK_RECORDER=1` (off by default) (`dm/android/gfx_vk_rec.inc`).
+  - Each wrapper copies its call's arguments (arrays and structures included) into a ring, and a recorder thread (`vk-record`) makes the calls in order. It also ends each chunk's command buffer and submits it with its fence (`rec_submit`). A command buffer that fails to end is not submitted: its fence goes alone, so the chunk still completes.
+  - The replay waits for it only in `mtl_present`, before the frame goes to the front end, whose blit uses the same queue.
+  - The completion thread waits for a chunk's submission before its fence (`rec_wait_submitted`), and before it starts timing the chunk for the hang report.
+  - Every `vkCmd*` of the replay is made under `g_bk`, so the ring has one producer.
+  - The recorder joins the frame's performance hint session.
+  - The idea is nx2android's (`784c9d4`).
+- **Check:** Breath of the Wild on a OnePlus Pad 3, with descriptor set reuse, 512 draws a chunk, and one draw skipped by a local test switch (it hangs that GPU, [Android baselines](../../dm/android/baselines.md) problem 14):
+  - replay CPU 30.7 → 24.2 ms a frame;
+  - with `DM_FPS_TARGET=30`, 30.0 fps (frame p95 38.4–38.9 ms, replay 17.3–17.5 ms) against 29.2–29.6 fps without it;
+  - at the 60 fps target it stayed at 20 fps in four runs of five.
+
+### Descriptor sets bound again within a chunk (Android)
+
+- **Symptom:** a game with thousands of draws a frame spends a large part of the replay thread in `vkUpdateDescriptorSets`: about 7,300 sets a frame in Breath of the Wild. The Odin 2's profile of 2026-11-07 put it at 3.4 ms a frame.
+- **Cause:** every draw copies its constant buffers to new arena offsets, and the offsets were part of each set. So no set matched the draw before, and `stage_set` wrote every set of every stage.
+- **Fix:** `DM_VK_SET_REUSE=1` (off by default) (`gfx_vk_draw.inc` `sh_dyn`, `sr_find`, `sr_put`).
+  - Constant buffers become dynamic uniform buffers, at most `maxDescriptorSetUniformBuffersDynamic / 2` for a vertex or fragment shader, and their offsets go to the bind.
+  - A set already written with the same descriptors in the chunk being recorded is bound again. Lookup is a hash of the layout and every descriptor, compared whole.
+  - An entry holds only for its recording, because a set is one chunk's and written once per recording.
+  - It is off by default because it changes every shader's set layout, so pipeline caches and start-up lists miss once. Dynamic uniform buffers have run only on the Adreno 830 so far.
+  - The design is nx2android's, BOTWRecompAndroid's and triasbrata's nxnative-android's, written anew.
+- **Check:** Breath of the Wild on a OnePlus Pad 3, with one draw skipped by a local test switch (it hangs that GPU, [Android baselines](../../dm/android/baselines.md) problem 14):
+  - 86.9% of sets bound again (6,312 of 7,267 a frame);
+  - the replay's CPU 33.4–33.6 → 32.1–32.3 ms a frame, interleaved runs;
+  - GPU and picture unchanged.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
+
 ### Pipeline keys built from the state objects' fields
 
 - **Symptom:** new graphics pipelines made all through play, also in a level seen before (a few per frame, about 1 to 2 ms each on the Adreno); the start-up list of pipelines grew past 186,000 keys over a few sessions, and making it again took the fast cores for most of an hour.
