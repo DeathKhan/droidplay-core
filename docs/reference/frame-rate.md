@@ -435,6 +435,24 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (1.4.1) on an Ayn Odin 2 (Adreno 740, Android 13): the sound archives that follow the program setup opened at 3.7 s instead of 174.5 s, and the Start menu showed after about 14 s. Pacing was unchanged: 60 vsyncs a second, frame time p50 16.66 ms. `NVN submit+present` p50 went from 16.03 to 1.80 ms, since the sleep is no longer inside it.
 - **Not checked:** other games on Android, and play past the Start menu.
 
+### Android's 30 fps frames shown a vsync early or late
+
+- **Symptom:** on Android a 30 fps game looks less smooth than its frame rate says ("30 feels like 20", a tester of Divinity: Original Sin 2, issue #113). `dumpsys SurfaceFlinger --latency '<the game's layer>'` lists frames shown for 16.7 and 50 ms in pairs among the 33.3 ms ones, and how many changes from run to run of the same scene: 7 to 70 in about 500 frames for Divinity, 44 to 190 in about 630 for Breath of the Wild, on a OnePlus Pad 3 at 60 Hz.
+- **Cause:** the host paces the game on a grid of its present period on its own clock (`mtl_present_pace`). The FIFO swapchain shows each frame at the first vsync whose latch it makes, about a refresh before that vsync. Where the grid fell against the vsyncs in a run decided how often a frame's work crossed a latch, early or late.
+- **Fix:** `gfx_vk_vsync.inc` takes effect where a frame spans a whole number of refreshes, 2 or more (30 fps at 60 Hz, 40 or 60 fps at 120 Hz).
+  - The pacing grid starts each frame 1 ms past a vsync the swapchain reported (`VK_GOOGLE_display_timing`, which Android's Vulkan loader provides on every driver; `front_android.c` `front_vsync`).
+  - Each frame is given the time to be shown (`vkb_frame.show_at`, presented with `VkPresentTimesInfoGOOGLE`): the first vsync at least its period after its start, half a refresh early.
+  - A frame whose work and copy fit its period less one refresh is shown on that vsync, one refresh after the earliest it could have been; a later one at the next.
+  - At one refresh, FIFO already shows a frame each vsync, and with no whole number of refreshes the frames fall between vsyncs whatever their times, so neither is touched.
+  - A refresh under 8 ms is a variable-rate panel's vsync timeline, not its refresh. The Pixel 9 Pro XL reports 4.17 ms (240 Hz) and shows each frame when it is ready, at least 8.33 ms after the last, so it is left as before. Locked to that timeline, Divinity's 30 fps showed 52 off-beat frames in 496 against 46 in 495 without the schedule, and 60 fps (4 "refreshes") was locked too.
+  - `DM_VK_PRESENT_TIMING=0` turns it off.
+  - A first version (#131) gave the present times on a schedule kept apart from the grid. It stopped early frames, but its slots sat after the latch, so for some phases more frames missed it (Breath of the Wild: 132 off-beat against 44).
+- **Found on:** the OnePlus Pad 3 (Adreno 830, Android 16, display at 60 Hz), two rounds of runs in turn with and without it, frames from `dumpsys SurfaceFlinger --latency` at four or five moments of each run:
+  - [Divinity: Original Sin 2](../../dm/games/010027400CDC6000/README.md), `hold`: 4 off-beat of 1,003 frames, against 57 of 1,006 (1 + 1 and 1 + 1, against 1 + 1 and 27 + 28);
+  - [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) at its 30 fps target, `outdoors`: 44 of 1,258, against 105 of 1,257 (12 + 12 and 10 + 10, against 33 + 32 and 21 + 19). What is left are frames over its budget (frame p95 39 ms); 2 to 3 presents in 1,800 came after their time;
+  - frame rate and frame time p50 / p95 unchanged.
+- **Not checked yet:** the Adreno 740 and the Xclipse; a fixed 120 Hz display; Animal Crossing; Super Mario Odyssey at 60 fps (untouched by design). On the Pixel 9 Pro XL (Mali-G715, variable rate) it now stays off: 17 off-beat of 248 at 30 fps, as without it.
+
 ## CPU cost and pacing
 
 ### Arena buffer ownership on allocation
