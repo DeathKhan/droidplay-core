@@ -29,6 +29,7 @@ static VkResult g_rq_end;   // the last vkEndCommandBuffer's result (the recorde
 static uint64_t g_rq_records, g_rq_drains, g_rq_direct; static _Atomic uint64_t g_rq_waits_ns;   // records queued, drains, calls made directly (pNext); the replay's time waiting for the recorder
 static void *rq_thread(void *arg);
 static void hint_note(void);   // gfx_vk.c: the recorder is in the frame's performance hint session, with the threads it records for
+static void gpu_fault_log(VkResult r);   // gfx_vk.c: what VK_EXT_device_fault says of a lost device, once
 static int rec_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("DM_VK_RECORDER"); v = e && *e == '1';
@@ -295,10 +296,12 @@ static void rq_make(const uint8_t *rec) {   // one record's call
         case R_TS: { const a_ts *a = (const void *)s; vkCmdWriteTimestamp(cb, a->st, a->p, a->q); break; }
         case R_BEGINCB: vkBeginCommandBuffer(cb, (const VkCommandBufferBeginInfo *)(const void *)s); break;
         case R_ENDCB: g_rq_end = vkEndCommandBuffer(cb); break;
-        case R_SUBMIT: { const a_submit *a = (const void *)s; if (cb) { VkResult e = vkEndCommandBuffer(cb); if (e != VK_SUCCESS) RED_ONCE(150, "vkEndCommandBuffer failed on the recorder: %d", e); }
+        case R_SUBMIT: { const a_submit *a = (const void *)s;
+                         // a command buffer that did not end is not submitted: its fence goes alone, so the chunk still completes (its work dropped) and no wait hangs on it
+                         if (cb) { VkResult e = vkEndCommandBuffer(cb); if (e != VK_SUCCESS) { RED_ONCE(150, "vkEndCommandBuffer failed on the recorder: %d (the chunk's work dropped)", e); if (e == VK_ERROR_DEVICE_LOST) gpu_fault_log(e); cb = VK_NULL_HANDLE; } }
                          VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = cb ? 1u : 0u, .pCommandBuffers = &cb};
                          pthread_mutex_lock(&g_vk.qmu); VkResult q = vkQueueSubmit(g_vk.q, 1, &si, a->f); pthread_mutex_unlock(&g_vk.qmu);
-                         if (q != VK_SUCCESS) RED_ONCE(151, "vkQueueSubmit failed on the recorder: %d", q);
+                         if (q != VK_SUCCESS) { RED_ONCE(151, "vkQueueSubmit failed on the recorder: %d", q); if (q == VK_ERROR_DEVICE_LOST) gpu_fault_log(q); }
                          atomic_fetch_add(&g_rq_subs_done, 1);
                          if (atomic_load(&g_rq_swait)) { pthread_mutex_lock(&g_rq_mu); pthread_cond_broadcast(&g_rq_csub); pthread_mutex_unlock(&g_rq_mu); }
                          break; }
