@@ -112,8 +112,9 @@ class Journaled(bi.Progress):   # the console's progress, and the same build's e
     def exit(self, code): self.close(ok=code == 0); self.write({'ev': 'exit', 'code': code}); self.f.close()
 
 
-def sdk_dir(arg):
-    for c in (arg, os.environ.get('ANDROID_HOME'), os.environ.get('ANDROID_SDK_ROOT'), os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk'), os.path.expanduser('~/Android/Sdk')):
+def sdk_dir(arg):   # --sdk, the environment, then where Android Studio puts it: Windows, Linux, macOS
+    for c in (arg, os.environ.get('ANDROID_HOME'), os.environ.get('ANDROID_SDK_ROOT'), os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk'), os.path.expanduser('~/Android/Sdk'),
+              os.path.expanduser('~/Library/Android/sdk')):
         if c and (Path(c) / 'platform-tools').is_dir(): return Path(c)
     raise BuildError('Android SDK not found: give --sdk or set ANDROID_HOME')
 
@@ -129,8 +130,8 @@ def sdk_packages(sdk):   # check()'s rows for the SDK's parts → (sdkmanager's 
             'CMake': (f'cmake;{CMAKE}', sdk / 'cmake' / CMAKE)}
 
 
-def tool_paths():   # the JDK and .NET SDK --setup installed, and the SDK's adb, on PATH for this run and what it starts (the desktop app imports this script for it too)
-    try: sdk = sdk_dir(None)
+def tool_paths(sdk_arg=None):   # the JDK and .NET SDK --setup installed, and the SDK's adb, on PATH for this run and what it starts (the desktop app imports this script for it too)
+    try: sdk = sdk_dir(sdk_arg)
     except BuildError: sdk = None
     host_setup.add_tool_paths(data_dir() / 'tools', sdk)
 
@@ -893,6 +894,9 @@ def main(argv):
     ap.add_argument('--setup', action='store_true', help='install what --check finds missing (Windows: the JDK, the .NET SDK and the Android SDK)')
     ap.add_argument('--accept-android-licenses', action='store_true', help="with --setup: you accept the Android SDK License (https://developer.android.com/studio/terms)")
     a = ap.parse_args(argv)
+    # adb is run by name: --sdk's platform-tools go on PATH too. The import-time tool_paths() only knew the SDK found without the options, so on a Mac with no
+    # ANDROID_HOME and no adb on PATH, --sdk built the app and then stopped at its install with "No such file or directory: 'adb'"
+    if a.sdk: tool_paths(a.sdk)
     global WAIT_DEVICE; WAIT_DEVICE = a.wait_device
     if a.xapk: a.game_apk = True
     if a.game_apk:
