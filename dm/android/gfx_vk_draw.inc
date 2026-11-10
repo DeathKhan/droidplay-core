@@ -1758,21 +1758,57 @@ static VkBufferView dummy_tbuf(void) {
     vkCreateBufferView(g_vk.dev, &vc, NULL, &g_dbv);
     return g_dbv;
 }
-static VkBufferView tbuf_view(const tex_t *t, int write) {
+// ---- Buffers a dispatch wrote, read on the GPU (buf_fwd) ----
+// A storage buffer, buffer texture or buffer image a shader reads, written earlier by a compute dispatch whose write-back has not landed: bound from the dispatch's own
+// arena copy, as a vertex stream is (fwd_find), when that write-back alone covers it and the offset keeps the GPU's alignment for the binding (a buffer read at the address it
+// was written at always does: the arena aligns to 256). A dispatch begins and ends with a full memory barrier (vk_dispatch cb_barrier), so any later draw or dispatch sees its
+// writes. One a dispatch reads and writes (a read-write storage buffer, a buffer image) is bound in place, on the arena copy of a write-back of the chunk being recorded: it
+// adds no write-back of its own, and the one it writes into lands what both wrote when the chunk completes (a chunk in flight may land before this dispatch runs: synced).
+// Only a dispatch writes in place: draws in a render pass have no barrier between them, so a draw's write keeps its own write-back, which later readers sync on.
+// Synced instead (draw_view: the chunk submitted and waited for), a chain of dispatches each reading the one before's output was a GPU round trip apiece: Final Fantasy
+// Resonance's opening, ~100 a frame (compute shaders with image atomics on 8 KB and 32 KB buffer images, each dispatch on what the one before wrote, and one reading a 64 KB storage buffer the
+// dispatch before wrote). draw_view and stage_set ask the same question: between them only a sync that lands everything can close the chunk, so where stage_set no longer
+// finds the write-back pending, guest memory holds it. DM_VK_BUF_FWD=0 (env.txt): such reads sync, as before (the A/B of this alone)
+static int fwd_find(uintptr_t lo, uintptr_t hi, VkBuffer *b, VkDeviceSize *o);
+static int fwd_hit(chunk *c, int nwb, uintptr_t lo, uintptr_t hi, VkBuffer *b, VkDeviceSize *o, int *res);
+static int g_fwd_nwb = -1; static uint64_t g_fwd;   // the chunk's write-backs counted when the draw began (its own come after); streams bound so
+static int buf_fwd_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_BUF_FWD"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_BUF_FWD=0: a buffer a dispatch wrote syncs before a later shader reads it"); } return v; }
+static uint64_t g_buf_fwd[2];   // bindings read on the GPU from a pending write-back / written in place
+// al: the binding's offset alignment; write: the shader writes it too (a dispatch's only, in place on the current chunk's write-back)
+static int buf_fwd(uint64_t addr, uint64_t n, int write, VkDeviceSize al, VkBuffer *b, VkDeviceSize *o) {
+    if (vk_safe() || !addr || !n || !buf_fwd_on() || !C || (!C->nfwd && (write || !atomic_load(&g_inflight_fwd)))) return 0;
+    uintptr_t lo = (uintptr_t)addr, hi = (uintptr_t)(addr + n); VkBuffer fb; VkDeviceSize fo; int r = 0;
+    if (write) { int nw = g_fwd_nwb >= 0 && g_fwd_nwb <= C->nwb ? g_fwd_nwb : C->nwb; if (!fwd_hit(C, nw, lo, hi, &fb, &fo, &r) || !r) return 0; }
+    else if (!fwd_find(lo, hi, &fb, &fo)) return 0;
+    if (al && fo % al) return 0;
+    *b = fb; *o = fo; return 1;
+}
+static int sb_fwd(uint64_t addr, uint64_t n, int write, VkBuffer *b, VkDeviceSize *o) { return buf_fwd(addr, n, write, g_vk.props.limits.minStorageBufferOffsetAlignment, b, o); }
+static int tb_fwd(uint64_t addr, uint64_t n, int write, VkBuffer *b, VkDeviceSize *o) { return buf_fwd(addr, n, write, g_vk.props.limits.minTexelBufferOffsetAlignment, b, o); }
+// the guest bytes tbuf_view copies of a buffer texture: its width in texels, cut to the GPU's limit, times the texel size; 0 when it copies none (the dummy is bound).
+// draw_view asks it for the range a draw reads, so it must cover at least what tbuf_view reads
+static size_t tbuf_bytes(const tex_t *t) {
+    int bw, bh, bpb = t && t->d.target == NVN_TEXTURE_TARGET_BUFFER && t->mem ? nvn_fmt_bpb(t->d.format, &bw, &bh) : 0;
+    if (bpb <= 0) return 0;
+    uint64_t n = (uint64_t)(t->d.width ? t->d.width : 1);
+    if (n > g_vk.props.limits.maxTexelBufferElements) n = g_vk.props.limits.maxTexelBufferElements;
+    return (size_t)n * (size_t)bpb;
+}
+static VkBufferView tbuf_view(const tex_t *t, int write, int cs) {   // cs: a dispatch binds it (a buffer image it writes may be bound in place, and its write-back is forwardable: buf_fwd)
     uint32_t m = 0; uint8_t swz[4];
     if (!t || t->d.target != NVN_TEXTURE_TARGET_BUFFER || !t->mem || !nvn_fmt_to_mtl(t->d.format, &m, swz) || !m) return VK_NULL_HANDLE;
-    VkFormat f = vk_of_mtl(m); int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    if (!f || bpb <= 0) return VK_NULL_HANDLE;
+    VkFormat f = vk_of_mtl(m); size_t bytes = tbuf_bytes(t);
+    if (!f || !bytes) return VK_NULL_HANDLE;
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, f, &fp);
     if (!(fp.bufferFeatures & (write ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT))) { RED_ONCE(101, "buffer texture format %d (NVN %#x) not usable as a %s texel buffer here", f, t->d.format, write ? "storage" : "uniform"); return VK_NULL_HANDLE; }
-    uint64_t n = (uint64_t)(t->d.width ? t->d.width : 1);
-    if (n > g_vk.props.limits.maxTexelBufferElements) { RED_ONCE(102, "buffer texture of %llu elements over the GPU's %u: cut", (unsigned long long)n, g_vk.props.limits.maxTexelBufferElements); n = g_vk.props.limits.maxTexelBufferElements; }
-    size_t bytes = (size_t)n * (size_t)bpb;
-    VkBuffer b; VkDeviceSize off; uint8_t *d = ar_alloc(bytes, &b, &off); if (!d) return VK_NULL_HANDLE;
-    int inpool = mtl_addr((uint64_t)(uintptr_t)t->mem, bytes, NULL, NULL);
-    if (inpool) memcpy(d, t->mem, bytes); else { memset(d, 0, bytes); RED_ONCE(103, "buffer texture outside every memory pool: reads 0"); }
-    if (write) { wb_t *w = wb_add(); uint8_t *snap = malloc(bytes); if (snap) { if (inpool) memcpy(snap, t->mem, bytes); else memset(snap, 0, bytes); }   // from guest memory: the arena may be write-combined (slow to read: ar_mem_type)
-        if (w) *w = (wb_t){-1 - C->ar_last, (size_t)off, bytes, 1, bytes, bytes, t->mem, snap}; }
+    if (t->d.width > g_vk.props.limits.maxTexelBufferElements) RED_ONCE(102, "buffer texture of %u elements over the GPU's %u: cut", (unsigned)t->d.width, g_vk.props.limits.maxTexelBufferElements);
+    VkBuffer b; VkDeviceSize off;
+    if ((!write || cs) && tb_fwd((uint64_t)(uintptr_t)t->mem, bytes, write, &b, &off)) g_buf_fwd[write]++;   // on the GPU from a dispatch's pending write (buf_fwd)
+    else { uint8_t *d = ar_alloc(bytes, &b, &off); if (!d) return VK_NULL_HANDLE;
+        int inpool = mtl_addr((uint64_t)(uintptr_t)t->mem, bytes, NULL, NULL);
+        if (inpool) memcpy(d, t->mem, bytes); else { memset(d, 0, bytes); RED_ONCE(103, "buffer texture outside every memory pool: reads 0"); }
+        if (write) { wb_t *w = wb_add(); uint8_t *snap = malloc(bytes); if (snap) { if (inpool) memcpy(snap, t->mem, bytes); else memset(snap, 0, bytes); }   // from guest memory: the arena may be write-combined (slow to read: ar_mem_type)
+            if (w) { *w = (wb_t){-1 - C->ar_last, (size_t)off, bytes, 1, bytes, bytes, t->mem, snap}; w->fwd = cs; if (cs) C->nfwd++; } } }
     VkBufferViewCreateInfo vc = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = bytes};
     VkBufferView v; if (vkCreateBufferView(g_vk.dev, &vc, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
     if (C->nbv == C->cbv) { C->cbv = C->cbv ? 2 * C->cbv : 64; C->bv = realloc(C->bv, C->cbv * sizeof *C->bv); }
@@ -2028,7 +2064,9 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
         if (u && u->addr && !mtl_addr(u->addr, n, NULL, NULL)) { RED_ONCE(118, "storage buffer of shader %s at %#llx (%zu bytes) is in no memory pool: it reads 0", s->key, (unsigned long long)u->addr, n); u = NULL; n = 16; }
         if (!u || !u->addr) RED_ONCE(91, "storage buffer of shader %s (c%d +%#x) is not a bound buffer: it reads 0", s->key, sb->cb_slot, off);
         VkDeviceSize ao;   // ao: the arena offset (off above is the c0 / uniform buffer word)
-        if (u && u->addr && !(sb->flags & 1)) { if (!ucopy((const void *)(uintptr_t)u->addr, n, (n + 15) & ~(size_t)15, &b, &ao)) return 0; }   // read only: shared as uniforms are
+        int wr_ = (sb->flags & 1) != 0;   // written by the shader
+        if (u && u->addr && (!wr_ || s->stage == SH_CS) && sb_fwd(u->addr, n, wr_, &b, &ao)) g_buf_fwd[wr_]++;   // on the GPU from a dispatch's pending write (buf_fwd)
+        else if (u && u->addr && !wr_) { if (!ucopy((const void *)(uintptr_t)u->addr, n, (n + 15) & ~(size_t)15, &b, &ao)) return 0; }   // read only: shared as uniforms are
         else if (u && u->addr) { uint8_t *d = ar_alloc((n + 15) & ~(size_t)15, &b, &ao); if (!d) return 0; memcpy(d, (const void *)(uintptr_t)u->addr, n);
             if (sb->flags & 1) {   // written by the shader: what it changed is copied back when the chunk completes
                 wb_t *w = wb_add(); uint8_t *snap = malloc(n); if (snap) memcpy(snap, (const void *)(uintptr_t)u->addr, n);   // from guest memory, as d was: the arena may be write-combined (ar_mem_type)
@@ -2059,7 +2097,7 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
         if (tbuf) {   // a buffer texture: a uniform texel buffer
             for (int e = 0; e < cnt; e++) {
                 uint32_t hw = bank_word(nst, c2, t->cbuf_slot, (w0 + 2u * e) * 4); int tid = (int)(hw & 0xfffff); if (tid && t->cbuf_slot >= 3) tid += D.tex_base;
-                VkBufferView v = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? tbuf_view(&g_treg[tid].t, 0) : VK_NULL_HANDLE;
+                VkBufferView v = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? tbuf_view(&g_treg[tid].t, 0, s->stage == SH_CS) : VK_NULL_HANDLE;
                 bvs[nbv + e] = v ? v : dummy_tbuf();
             }
             wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)t->binding, 0, (uint32_t)cnt, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, NULL, NULL, &bvs[nbv]};
@@ -2107,7 +2145,7 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
         for (int e = 0; e < cnt; e++) {
             uint32_t hw = bank_word(nst, c2, t->cbuf_slot, (w0 + 2u * e) * 4); int tid = (int)(hw & 0xfffff); if (tid && t->cbuf_slot >= 3) tid += D.tex_base;
             treg_t *rg = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid] : NULL;
-            if (tbuf) { VkBufferView v = rg ? tbuf_view(&rg->t, 1) : VK_NULL_HANDLE; bvs[nbv + e] = v ? v : dummy_tbuf(); continue; }
+            if (tbuf) { VkBufferView v = rg ? tbuf_view(&rg->t, 1, s->stage == SH_CS) : VK_NULL_HANDLE; bvs[nbv + e] = v ? v : dummy_tbuf(); continue; }
             const tc_ent *ce = tex_once() ? tc_el(tc, ci++, tid) : NULL; const treg_t *ri = ce ? (ce->r.ok ? &ce->r : NULL) : rg;   // as the textures above
             VkImageView iv = VK_NULL_HANDLE; vtex *v = !ri ? NULL : ce ? ce->v : vt_get(&ri->t);
             if (v) { iv = storage_view(v, ri->has_v ? &ri->v : NULL, vt, t->fmt); if (!iv) g_bind_bad = 1; }
@@ -2134,7 +2172,6 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
 // vertices made by a compute shader, about once a frame): the draw binds the dispatch's own arena copy instead of waiting for the chunk to complete and copying it
 // back (that sync emptied the GPU queue every frame). The dispatch ends with a full memory barrier (vk_dispatch cb_barrier). Only when the write-back alone covers the
 // stream's bytes, no queued copy writes them, and every attribute of the stream is read as it is (a converted one needs the bytes on the CPU)
-static int g_fwd_nwb = -1; static uint64_t g_fwd;   // the chunk's write-backs counted when the draw began (its own come after); streams bound so
 // chunk c's newest write to [lo, hi): 1 when one decides (*res: whether it can be read on the GPU, *b / *o where), 0 when the chunk does not write the range
 static int fwd_hit(chunk *c, int nwb, uintptr_t lo, uintptr_t hi, VkBuffer *b, VkDeviceSize *o, int *res) {
     for (int k = 0; k < c->ncop; k++) if (c->cop[k].dst < hi && lo < c->cop[k].dst + c->cop[k].n) { *res = 0; return 1; }
@@ -2328,37 +2365,62 @@ static int ind_read(uint64_t addr, void *out, size_t n) {   // indirect argument
     memcpy(out, (const void *)(uintptr_t)addr, n); return 1;
 }
 static int vk_draw__(const p_draw *dw, const p_draw_idx *di) { int r = vk_draw_(dw, di); g_drawing = 0; g_fwd_nwb = -1; g_c1d_on = 0; tc_clear(); return r; }
+// DM_VK_TBUF_RANGE=0 (env.txt): a shader with a buffer texture or image syncs its draw on anything pending, as before draw_view looked their memory up (the A/B of that alone)
+static int tbuf_range_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_TBUF_RANGE"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_TBUF_RANGE=0: a buffer texture or image syncs on anything pending"); } return v; }
+// DM_VK_DEP_LOG=<n> (env.txt; a diagnostic): one in every n reads that met a pending write-back is logged, the whole run long, instead of the first 40
+static int dep_every(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DEP_LOG"); v = e && atoi(e) > 0 ? atoi(e) : 0; } return v; }
+static void dep_log(vshader *const sh[4], const rd_rng *r, const char *kd, const signed char *ks, int n) {   // reads that met a pending write-back, with what wrote it
+    static int nlog; static uint64_t nhit; int every = dep_every(); if (!C || (!every && nlog >= 40)) return;
+    for (int q = 0; q < n; q++) for (int w = 0; w < C->nwb; w++) if (wb_hits(&C->wb[w], r[q].lo, r[q].hi)) {
+        if (every ? (nhit++ % (uint64_t)every) != 0 : nlog++ >= 40) continue;
+        const wb_t *b = &C->wb[w]; const vshader *rs = ks[q] >= 0 && sh[ks[q]] ? sh[ks[q]] : sh[0];
+        LOG("[vk] draw dependency: shader %s (stage %d) reads %c %#lx+%#lx, pending write-back %d of %d: %s%s dst %p rows %zu x %zu", rs ? rs->key : "-", rs ? rs->stage : -1, kd[q], (unsigned long)r[q].lo,
+            (unsigned long)(r[q].hi - r[q].lo), w, C->nwb, b->st >= 0 ? "staging (texture copy)" : b->snap ? "arena with snapshot (storage buffer)" : "arena (feedback / buffer image)", b->fwd ? " of a dispatch" : "",
+            (void *)b->dst, b->rows, b->row_bytes); }
+}
 // What a draw copies from guest memory lands first when an earlier draw, dispatch or copy wrote it and that write is still pending (gfx_vk.c ranges_view):
-// the vertex streams, the index buffer, each stage's uniform slots and storage buffers. A buffer texture or image reads memory found only in the texture
-// pool, so a shader with one syncs on anything pending (cpu_view). Called before anything of the draw is recorded
+// the vertex streams, the index buffer, each stage's uniform slots and storage buffers, and its buffer textures and images. Called before anything of the draw is recorded.
+// A buffer texture's memory is the texture pool entry its handle names, looked up as stage_set's tbuf_view does. Synced on anything pending instead (cpu_view), it made every
+// such draw after one GPU write-back a round trip: Final Fantasy Resonance's opening reads buffer textures in most draws, ~100 syncs a frame, 15.5 fps on the Odin 2 and 10 on the Pad 3
 static void draw_view(vshader *const sh[4], const p_draw_idx *di, int vtx) {   // vtx: the vertex streams too (a draw; 0 for a dispatch)
     if (vk_safe()) { g_fwd_nwb = 0; cpu_view(); return; }
-    rd_rng r[16 + 1 + 4 * 32 + 4 * 32]; char kd[16 + 1 + 4 * 32 + 4 * 32]; char K = 'v'; int n = 0;
-    #define RNG(a, s) do { uintptr_t a_ = (uintptr_t)(a); uint64_t s_ = (s); if (a_ && s_ && n < (int)(sizeof r / sizeof *r)) { kd[n] = K; r[n++] = (rd_rng){a_, a_ + (uintptr_t)s_}; } } while (0)
-    g_fwd_nwb = C ? C->nwb : 0;
+    rd_rng r[16 + 1 + 4 * 32 + 4 * 32]; char kd[16 + 1 + 4 * 32 + 4 * 32], K = 'v'; signed char ks[16 + 1 + 4 * 32 + 4 * 32], KS = -1; int n = 0, over = 0;
+    #define RNG(a, s) do { uintptr_t a_ = (uintptr_t)(a); uint64_t s_ = (s); if (a_ && s_) { if (n < (int)(sizeof r / sizeof *r)) { kd[n] = K; ks[n] = KS; r[n++] = (rd_rng){a_, a_ + (uintptr_t)s_}; } else over = 1; } } while (0)
+    #define FWD(f, a, s, w) do { VkBuffer fb_; VkDeviceSize fo_; int w_ = (w); if ((w_ && !cs) || !f((a), (s), w_, &fb_, &fo_)) RNG(a, s); } while (0)   // a dispatch's pending write: read on the GPU (buf_fwd)
+    g_fwd_nwb = C ? C->nwb : 0; const int cs = sh[0] && sh[0]->stage == SH_CS;   // a dispatch (its stage alone)
     if (vtx) { uint32_t seen = 0; for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &D.attr[i], 4); VkBuffer fb; VkDeviceSize fo;
         if (a.fmt && fwd_early()) { if (seen >> a.stream & 1) continue; seen |= 1u << a.stream; }   // each stream once (stream_fwd)
         if (a.fmt && !stream_fwd(sh[0], a.stream, &fb, &fo)) RNG(D.vbuf[a.stream].address, D.vbuf[a.stream].size); } }
     K = 'i'; if (di && di->ibuf) RNG(di->ibuf, (uint64_t)(di->count > 0 ? di->count : 0) * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4) + 4);
-    for (int k = 0; k < 4; k++) { const vshader *s = sh[k]; if (!s) continue; int nst = nvn_stage_of(s->stage);
-        for (int i = 0; i < s->ntx; i++) if ((s->tx[i].type & 0xff) == 2) { g_vs = 5; cpu_view(); return; }
-        for (int i = 0; i < s->nim; i++) if ((s->im[i].type & 0xff) == 2) { g_vs = 6; cpu_view(); return; }
+    for (int k = 0; k < 4; k++) { const vshader *s = sh[k]; if (!s) continue; int nst = nvn_stage_of(s->stage); KS = (signed char)k;
+        if (!tbuf_range_on()) { for (int i = 0; i < s->ntx; i++) if ((s->tx[i].type & 0xff) == 2) { g_vs = 5; cpu_view(); return; }
+                                for (int i = 0; i < s->nim; i++) if ((s->im[i].type & 0xff) == 2) { g_vs = 6; cpu_view(); return; } }
         K = 'u'; for (int i = 0; i < s->ncb; i++) { int sl = s->cb[i].slot; if (sl >= 3 && sl - 3 < 16) RNG(D.ubo[nst][sl - 3].addr, D.ubo[nst][sl - 3].size); }
         K = 's'; for (int i = 0; i < s->nsb; i++) { const rb_sbuf *sb = &s->sb[i]; uint32_t off = 4u * (uint32_t)sb->cb_off, base = (uint32_t)c_bases[nst] << 4;
-            if (sb->cb_slot == 0 && nst == 5 && off >= 0x210 && off < 0x310 && !((off - 0x210) % 16)) { const p_bind_buf *u = &D.ubo[5][(off - 0x210) / 16]; RNG(u->addr, u->size); }   // compute: its uniform buffer table (stage_set)
-            else if (sb->cb_slot == 0 && base && off >= base && off - base < 0x100 && !((off - base) % 16)) { const p_bind_buf *u = &D.ssbo[nst][(off - base) / 16]; RNG(u->addr, u->size); } } }
-    { static int nlog; if (C && nlog < 40) for (int q = 0; q < n; q++) for (int w = 0; w < C->nwb; w++) if (wb_hits(&C->wb[w], r[q].lo, r[q].hi) && nlog++ < 40) {
-        const wb_t *b = &C->wb[w]; LOG("[vk] draw dependency: shader %s reads %c %#lx+%#lx, pending write-back %d of %d: %s dst %p rows %zu x %zu", sh[0] ? sh[0]->key : "-", kd[q], (unsigned long)r[q].lo,
-            (unsigned long)(r[q].hi - r[q].lo), w, C->nwb, b->st >= 0 ? "staging (texture copy)" : b->snap ? "arena with snapshot (storage buffer)" : "arena (feedback / buffer image)", (void *)b->dst, b->rows, b->row_bytes); } }
+            if (sb->cb_slot == 0 && nst == 5 && off >= 0x210 && off < 0x310 && !((off - 0x210) % 16)) { const p_bind_buf *u = &D.ubo[5][(off - 0x210) / 16]; FWD(sb_fwd, u->addr, u->size, sb->flags & 1); }   // compute: its uniform buffer table (stage_set)
+            else if (sb->cb_slot == 0 && base && off >= base && off - base < 0x100 && !((off - base) % 16)) { const p_bind_buf *u = &D.ssbo[nst][(off - base) / 16]; FWD(sb_fwd, u->addr, u->size, sb->flags & 1); } } }
+    if (over) { cpu_view(); g_fwd_nwb = 0; return; }   // more ranges than r holds: anything pending lands
+    dep_log(sh, r, kd, ks, n);
     int before = (int)(g_view_cur + g_view_fly); ranges_view(r, n);
     if ((int)(g_view_cur + g_view_fly) != before) { g_fwd_nwb = 0; return; }   // synced: everything landed (nothing to read on the GPU)
-    n = 0;   // storage buffers named by the game's own uniform buffers: their addresses are read from them (landed, as checked above)
-    for (int k = 0; k < 4; k++) { const vshader *s = sh[k]; if (!s) continue; int nst = nvn_stage_of(s->stage);
+    n = 0; over = 0;   // storage buffers named by the game's own uniform buffers: their addresses are read from them (landed, as checked above)
+    K = 's'; for (int k = 0; k < 4; k++) { const vshader *s = sh[k]; if (!s) continue; int nst = nvn_stage_of(s->stage); KS = (signed char)k;
         for (int i = 0; i < s->nsb; i++) { const rb_sbuf *sb = &s->sb[i]; uint32_t off = 4u * (uint32_t)sb->cb_off;
             if (sb->cb_slot < 3 || sb->cb_slot - 3 >= 16) continue;
             const p_bind_buf *g = &D.ubo[nst][sb->cb_slot - 3]; uint64_t ad; uint32_t sz;
-            if (g->addr && off + 12 <= g->size) { memcpy(&ad, (const void *)(uintptr_t)(g->addr + off), 8); memcpy(&sz, (const void *)(uintptr_t)(g->addr + off + 8), 4); RNG(ad, sz); } } }
+            if (g->addr && off + 12 <= g->size) { memcpy(&ad, (const void *)(uintptr_t)(g->addr + off), 8); memcpy(&sz, (const void *)(uintptr_t)(g->addr + off + 8), 4); FWD(sb_fwd, ad, sz, sb->flags & 1); } } }
+    // buffer textures (t) and images (m): their handles may sit in the game's uniform buffers too (landed above), and their memory is the registry entry each names
+    if (tbuf_range_on()) { pthread_mutex_lock(&g_reg_mu);
+        for (int k = 0; k < 4; k++) { const vshader *s = sh[k]; if (!s) continue; int nst = nvn_stage_of(s->stage); KS = (signed char)k;
+            for (int pass = 0; pass < 2; pass++) for (int i = 0; i < (pass ? s->nim : s->ntx); i++) { const rb_tex *t = pass ? &s->im[i] : &s->tx[i]; if ((t->type & 0xff) != 2) continue;
+                int cnt = t->array > 1 ? (t->array > 1024 ? 1024 : t->array) : 1; uint32_t w0 = (uint32_t)t->handle & 0x3fff; K = pass ? 'm' : 't';
+                for (int e = 0; e < cnt; e++) { int tid = (int)(bank_word(nst, NULL, t->cbuf_slot, (w0 + 2u * e) * 4) & 0xfffff); if (tid && t->cbuf_slot >= 3) tid += D.tex_base;
+                    if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) FWD(tb_fwd, (uint64_t)(uintptr_t)g_treg[tid].t.mem, tbuf_bytes(&g_treg[tid].t), pass); } } }
+        pthread_mutex_unlock(&g_reg_mu); }
     #undef RNG
+    #undef FWD
+    if (over) { g_vs = 5; cpu_view(); g_fwd_nwb = 0; return; }   // more than r holds (a long array): anything pending lands
+    dep_log(sh, r, kd, ks, n);
     if (n) { g_view_free--; before = (int)(g_view_cur + g_view_fly); ranges_view(r, n); if ((int)(g_view_cur + g_view_fly) != before) g_fwd_nwb = 0; }   // counted once
 }
 static int vk_draw(const p_draw *dw, const p_draw_idx *di) {

@@ -1650,6 +1650,22 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** `draw_view` / `mem_view` compare the ranges a draw, dispatch or CPU write touches (vertex streams, indices, uniform slots, storage buffers, indirect arguments) with the pending write-backs and queued copies, and sync only on an overlap. Vertex streams a dispatch of the same chunk wrote are bound from the dispatch's own arena copy (`fwd_find`) instead of waiting for them. The `[vk] guest reads of draws` and `syncs by site` lines count what still waits.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): about one sync per draw after the first storage-buffer write of a frame; a compute shader writes a few hundred bytes of vertices once a frame.
 
+### Buffer textures synced by their range, and dispatch outputs read on the GPU
+
+- **Symptom:** Android only: a 3D scene far below the GPU's rate, the submission's wall time about twice its CPU time (`@sub_wall_ms` against `@sub_cpu_ms` in a bench's `frames.tsv`), and the `[vk] syncs by site` line counting `buffer texture` and `buffer image` syncs by the hundred thousand, or `[vk] guest reads of draws` counting as many waits for the current submission.
+- **Cause:** two kinds of syncs that [Replay syncs limited to what is read](#replay-syncs-limited-to-what-is-read) left:
+  - a draw or dispatch whose shader had a buffer texture or buffer image synced on anything pending (`cpu_view`), since its memory is found only through the texture pool;
+  - a storage buffer, buffer texture or buffer image that an earlier dispatch of the same submission wrote was copied from guest memory, so the read waited for the GPU to finish and the write-back to land first. A chain of dispatches, each reading or updating what the one before wrote, was a GPU round trip per dispatch.
+- **Fix:**
+  - `draw_view` looks each buffer texture's and image's memory up in the texture registry, as `stage_set`'s `tbuf_view` does (`tbuf_bytes`), and syncs only when that range overlaps a pending write.
+  - `buf_fwd` binds such a read from the dispatch's own arena copy instead, when that write-back alone covers it and the offset keeps the binding's alignment, as vertex streams already were (`fwd_find`). A dispatch begins and ends with a full memory barrier, so any later draw or dispatch sees its writes.
+  - A dispatch that reads and writes the buffer (a read-write storage buffer, a buffer image) is bound in place on the current submission's write-back. It adds no write-back of its own, and that one lands what both wrote. Draws never write in place: a render pass has no barrier between them.
+  - The `[vk] read on the GPU from a dispatch's pending write` line counts both kinds. `DM_VK_TBUF_RANGE=0` and `DM_VK_BUF_FWD=0` turn each part off, for an A/B. `DM_VK_DEP_LOG=<n>` logs one in every n reads that still meet a pending write-back, with the shader, the binding kind and what wrote it.
+- **Found on:** [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md)'s real-time opening: 713 draws a frame and about 100 syncs.
+  - Most came from a compute shader (`f3c5ced35cb619d0`) whose dispatches run image atomics on 8 KB and 32 KB buffer images the dispatch before wrote.
+  - The rest came from one (`f632c6a1bc76cd19`) reading a 64 KB storage buffer the dispatch before wrote, then writing a 3D image.
+  - The opening ran at 15.9 fps on an Ayn Odin 2 and 10.3 on a OnePlus Pad 3; it now runs at 40.6 and 41.0 (frame p50 24 ms). The Pad 3's GPU time per frame went from 28.7 to 15.5 ms.
+
 ### Render passes kept over CPU-side commands
 
 - **Symptom:** hundreds of render passes a frame on the same targets; on a tiler GPU each loads and stores its attachments.
