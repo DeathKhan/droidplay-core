@@ -81,6 +81,8 @@ Screen captures from the test runs, taken on the device. The round button at the
 
 † Tested before DroidPlay Core merged nxnative's `main` (2026-11-08); not run since.
 
+Only games that draw with NVN, Nintendo's own graphics API, run on Android so far. A game that calls Vulkan or OpenGL itself, such as Hades, Super Mario Galaxy or Balatro, can't be built for Android yet: the build stops and says so. The [games table](dm/games/README.md#games) lists each game's graphics API.
+
 The first six rows are from the [Android baselines](dm/android/baselines.md) of 2026-11-08: the same scripted runs on each device, with frame times, the devices'
 drivers, and the known problems with what is known of their causes.
 
