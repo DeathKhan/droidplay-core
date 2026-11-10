@@ -15,8 +15,10 @@ added 2026-11-10, measured the same way on `main` at `cf42941d` (Brilliant Diamo
 | OnePlus Pad 3 | SM8750P (Snapdragon 8 Elite) | Adreno 830, V@0800.74, 1.3.284 | 16 | 12 GB |
 | Retroid Pocket 5 | SM8250 (Snapdragon 865) | Adreno 650, V@0746.0, 1.1.128 | 13 | 8 GB |
 | Samsung Galaxy S25 Edge | SM8750 (Snapdragon 8 Elite for Galaxy) | Adreno 830, V@0800.40.1, 1.3.284 | 16 | 12 GB |
+| Google Pixel 9 Pro XL ([Mali](#mali-super-mario-odyssey-on-a-pixel-9-pro-xl)) | Tensor G4 | Mali-G715, Arm's driver 0xd803000, 1.4.343 | 17 | 16 GB |
 
-All four use 4 KB pages. The Odin 2 and the Retroid Pocket 5 have built-in controls; the Pad 3 and the S25 Edge show the on-screen controls over the game.
+All five use 4 KB pages. The Odin 2 and the Retroid Pocket 5 have built-in controls; the Pad 3, the S25 Edge and the Pixel 9 Pro XL show the on-screen controls over the game.
+The Pixel 9 Pro XL, the first GPU outside Adreno, is not in the Results table: it has [a section of its own](#mali-super-mario-odyssey-on-a-pixel-9-pro-xl).
 
 The RAM column is the device's installed capacity, not a measurement of how much memory a game uses. These baselines report frame rates and frame
 times, not per-game peak memory use or a matched memory-use comparison with an emulator. A result on the 8 GB Retroid Pocket 5 does not establish
@@ -68,6 +70,46 @@ two runs without a warm-up (the pipeline cache warm from earlier runs; Kokiri Fo
 
 The title's GPU frame is nn::ndve's last convolution (36.8 ms in a `prof_now` frame). Kokiri Forest's memory (`DM_VK_MEMREPORT`, #95), its black picture and what is open: the game's note,
 [Android](../games/0400486024DEC000/README.md#android).
+
+## Mali: Super Mario Odyssey on a Pixel 9 Pro XL
+
+The first GPU outside Adreno (2026-11-10): a Google Pixel 9 Pro XL (Tensor G4, Mali-G715, Arm's driver 0xd803000, Vulkan 1.4.343, Android 17, 16 GB of RAM). Odyssey was
+packed from `main` at 648a3758 by `build_android_from_nsp.py`, then run from Odyssey-only APKs with #133 (`build_apk.py`). `scripts/bench_android.py`, two runs each, the
+pipeline cache warm from earlier runs:
+
+| Game, scene | Pixel 9 Pro XL |
+|---|---|
+| **Super Mario Odyssey 1.4.1**, Start menu (a fresh save) | 59.6–60.0 · 16.6–16.7 / 18.1–18.3 · GPU 0.9 |
+| Super Mario Odyssey, the opening cutscene (Start pressed on a fresh save) | 59.8 · 16.6–16.7 / 19.0–19.6 · GPU 9.4–9.5 |
+
+The picture is as on the Adreno (the Start menu, Bowser's airship). The first frame comes at 1.4–1.5 s, the Start menu at 11.4–11.5 s. The cutscene's first run, with none of its
+pipelines cached, made 398 graphics pipelines in 9.5 s and measured 57.1 fps, with one 5.1 s frame as its scene loaded. Where this GPU differs from every Adreno above:
+
+- **No BC textures** (`textureCompressionBC` false; the device line says `BC decoded on the CPU`). The replay has decoded BC on the CPU since the port began (`bcdec`, as for the
+  original port's Adreno 619), and Odyssey draws right with it. #133 fixes its one red line, a BC view of a decoded texture (its entry in `docs/reference/rendering.md`: "BC textures decoded on the CPU, viewed in their BC formats").
+  - **Time:** the cutscene's scene load decoded 265 textures (233 MB of texels) in 211 ms.
+  - **Memory:** 2.2 GB resident in the cutscene, against 1.64 GB on the Odin 2 and the S25 Edge, where BC stays compressed. Re-encoding into formats of the same size that the
+    GPU has (BC1, BC4 and BC5 to ETC2 and EAC; BC3 and BC7 to ASTC 4×4) would win that back. Open.
+  - **Open:** a GPU block encoder writing into a decoded BC texture (Breath of the Wild's BC4 encoder: [Compressed render targets through an uncompressed shadow on
+    Vulkan](../../docs/reference/rendering.md#compressed-render-targets-through-an-uncompressed-shadow-on-vulkan)) has no path. `bcrt_shadow` skips decoded images, so the
+    pass draws into the decoded image in the image's own format, with a red line. Its blocks would have to be decoded on the GPU.
+- **16-lane subgroups** in fragment and compute shaders (`minSubgroupSize` = `maxSubgroupSize` = 16, so `VK_EXT_subgroup_size_control` cannot ask for a 32-lane warp).
+  - **Odyssey** uses no subgroup operations.
+  - **Quad shuffles** (Maxwell's fwidth, `c = 0x1c03`) read the right lanes: `t_quad_shuffle` passes on the Pixel as translated and as `spv_wide` and `spv_limits` rewrite them (#134). Those are all the
+    shuffles in Brilliant Diamond (23 fragment shaders), Link's Awakening (5) and Animal Crossing (1).
+  - **Warp-aggregated atomics** stay right in 16-lane groups: a ballot, a leader lane, one atomic, then a shuffle from the leader (most of Final Fantasy Resonance's compute
+    shaders). The lane ID, the masks, the ballot and the shuffle's source all stay within one subgroup.
+  - **Open: a shuffle from 16 or more lanes away has no lane to read.** Final Fantasy Resonance reduces over the whole warp with shuffles of 1, 2, 4, 8 and 16 lanes (clamp 31)
+    in 309 compute shaders, and the last step reads an undefined value on this GPU. Mario Kart World's reductions go no further than 4 lanes, but 1,333 of its shuffles take
+    their source lane at run time. Found by reading the translated SPIR-V; neither game has run on the Pixel.
+  - **Not examined:** Animal Crossing's 499 fragment shaders with a ballot.
+- **No `VK_EXT_vertex_attribute_divisor`, but `VK_KHR_vertex_attribute_divisor`** (core in Vulkan 1.4, `supportsNonZeroFirstInstance` false). The replay looks only for the EXT, so
+  a vertex stream that steps once every N > 1 instances steps every instance, with red line 87. Odyssey has none on these routes. Open: enable the KHR (the same structures),
+  and give a draw at a non-zero first instance the instance offset in its vertex buffers instead, since this driver does not support it.
+- **No `VK_EXT_shader_stencil_export`:** depth-stencil copies that a blit cannot make are drawn a stencil bit at a time, as on the Adreno 650. Odyssey made none on these routes.
+- **"draws not made: pipeline N"** in the stats line counts the draws left out while pipelines met for the first time are built in the background (`DM_VK_ASYNC_PIPE`:
+  [rendering.md](../../docs/reference/rendering.md#pipelines-met-for-the-first-time-built-in-the-background)), not pipelines that failed (`0 failed`, no red line). It was 718 in
+  the cutscene's first run, and 9 and 0 in the warm ones.
 
 ## Known problems
 
