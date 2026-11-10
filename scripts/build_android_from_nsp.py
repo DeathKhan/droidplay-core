@@ -1003,13 +1003,22 @@ def main(argv):
             say(f'derived game profile for {pkg_ver} ({disp}): {g.dir}')
         g = bi.rewrite(sys.executable, REPO, game / 'ExeFS', patched, env, logs, g, bool(prov))
         if prov or derived: bi.provisional_prep(sys.executable, REPO, env, logs, g); g = bi.refine_after_rewrite(g, game, patched, reg if derived else None)
+        # The graphics API, as build_ipa_from_nsp.py picks it (profile_guess.py build_sources). The Android host replays NVN only (gfx_vk.c): the OpenGL and Vulkan layers
+        # (dm/gfx/gl/hle_gl.m, dm/gfx/vk/hle_vk.m) are the Mac's, on Metal, so such a game's EGL / GL or Vulkan imports go to unimplemented stubs. Street Fighter 30th
+        # Anniversary Collection (OpenGL) died 0.1 s into nnMain on a Retroid Pocket 5 (UNIMPL eglGetDisplay, then its own Break), and the launcher came back with nothing
+        # said; the build had only said its shader split found no shaders. Said here, before the game files go to the phone; it is still packed, to look into
+        src = bi.pg.build_sources(game / 'ExeFS', bi.rfs.source(game), g.words('modules') or ['main'])
+        if src['graphics'][0] != 'nvn':
+            api = {'gl': ('an OpenGL', 'EGL and GL'), 'vulkan': ('a Vulkan', 'Vulkan')}[src['graphics'][0]]
+            say(f'[RED] {api[0]} game ({src["graphics"][1].partition(":")[0]}): DroidPlay on Android draws NVN only, so its {api[1]} calls go to unimplemented stubs (UNIMPL lines '
+                'in the log) and it cannot draw; packed anyway')
         # the DLC in the folder, as for iOS: <id>_build/aoc/<index>.img, which push_game copies to the game's aoc/ and the host mounts and reports as owned (DM_AOC_DIR).
         # It was not extracted for Android: The Binding of Isaac's Repentance (DLC 010021C000B6B001) started as Afterbirth+
         aoc = bi.extract_aoc(nx, keys, REPO, work, app, fam, logs)
         if prov and serial: pull_captures(serial, g.id, capture_dir, logs)
         dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir() or p.suffix == '.img') if aoc else []
         sdirs = {v: (game if v == pkg_ver else extract(v)) for v in sv}
-        if sv and bi.pg.build_sources(game / 'ExeFS', bi.rfs.source(game), g.words('modules') or ['main'])['ue_decode'][0]:   # Unreal's Oodle-compressed shaders (ue_decode)
+        if sv and src['ue_decode'][0]:   # Unreal's Oodle-compressed shaders (ue_decode)
             with phone(serial, f'build_android_from_nsp.py: decoding {g.id}\'s Unreal shaders') if serial else contextlib.nullcontext():
                 ue_decode(sdirs, pkg_ver, nsp_dir, patched, work, logs, env, g, serial, sdk, game)
         spv = build_shaders(sv, sdirs, work, logs, env, g, dlc_roms)
