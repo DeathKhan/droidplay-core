@@ -451,10 +451,29 @@ static void ft_add(const tex_t *t) {
     g_ft[g_nft++] = f;
     pthread_mutex_unlock(&g_ft_mu);
 }
+// The queue scheduler replays a submission after the game's call returns (nvn_queue.inc), so a texture Finalized (or initialized again) after its submission is still drawn
+// by it, and its first use there (nvn_ft_written) needs the entry. The deletion waits until every job made before it has ended (ft_del_drain, at each submission the replay
+// starts); with no job in flight it is at once. shirai91/nx2android e6947362 defers it until the next job for that fork's replay thread, which takes jobs in order
+typedef struct { uint64_t serial, seq; } ft_rel;
+static ft_rel *g_ftrel; static size_t g_nftrel, g_cftrel;   // under g_ft_mu
+static uint64_t nvn_jobs_newest(void), nvn_jobs_oldest(void);   // nvn_queue.inc
+static void ft_del_now(uint64_t serial) {   // g_ft_mu held
+    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
+}
 static void ft_del(uint64_t serial) {
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return;
+    uint64_t seq = nvn_jobs_newest();
     pthread_mutex_lock(&g_ft_mu);
-    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
+    if (!seq) ft_del_now(serial);
+    else { if (g_nftrel == g_cftrel && !(g_ftrel = realloc(g_ftrel, (g_cftrel = g_cftrel ? 2 * g_cftrel : 256) * sizeof *g_ftrel))) die("flush_tex allocation failed"); g_ftrel[g_nftrel++] = (ft_rel){serial, seq}; }
+    pthread_mutex_unlock(&g_ft_mu);
+}
+static void ft_del_drain(void) {   // the replay thread, as a submission starts
+    if (!DM_GAME_TEX_FLUSH_UPLOAD) return;
+    uint64_t oldest = nvn_jobs_oldest();
+    pthread_mutex_lock(&g_ft_mu);
+    size_t o = 0; for (size_t i = 0; i < g_nftrel; i++) { if (g_ftrel[i].seq < oldest) ft_del_now(g_ftrel[i].serial); else g_ftrel[o++] = g_ftrel[i]; }
+    g_nftrel = o;
     pthread_mutex_unlock(&g_ft_mu);
 }
 static void ft_drop(const uint8_t *a, uint64_t n) {   // a pool goes: the textures over it that were never Finalized leave the list (their entries pointed at dead memory and stayed for good)
