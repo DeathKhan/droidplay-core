@@ -1844,7 +1844,8 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   game files: 24.0, 24.6 and 24.6 fps on `main` (frame p50 40.4–41.3 ms, GPU 16.8–17.0 ms), 60.0, 54.6, 60.0 and 60.0 with the fix (frame p50 16.6–18.2 ms, GPU
   13.5–15.0 ms; the 54.6 run GPU-bound at 15.0 ms), the same 1,068 draws and the same picture. In the fix's own build the six write-backs a frame (494 KB) took the
   completion thread 26.2 ms a frame with `DM_VK_WB_READBACK=0` (25.2 fps), 1.7 ms through the copy. The probe read 1.5–1.6 GB/s from the arena's type and 28–34 GB/s
-  from type 2. The `boot` route held 60.0 fps.
+  from type 2. The `boot` route held 60.0 fps. On a OnePlus Pad 3 (Adreno 830, V@0800.74) the probe read 49.3 GB/s from the arena's type 6 and 48.9 GB/s from type 3
+  and kept reading the arena: 60.0 fps on `main` and with the change, two runs each (GPU 10.1–10.4 ms), and with `DM_VK_WB_READBACK=0`.
 - **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 13).
 
 ### Linear render targets written back to guest memory
