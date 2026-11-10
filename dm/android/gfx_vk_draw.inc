@@ -465,7 +465,7 @@ static const struct { const char *n; VkFormat f; int bytes; } DECL_FMT[] = {
     {"R10G10B10A2Unorm", VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4}, {"R10G10B10A2Uint", VK_FORMAT_A2B10G10R10_UINT_PACK32, 4}, {"R11G11B10Float", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4}};
 static int fmt_bytes(VkFormat f) {   // the texel size of an uncompressed colour format the views below meet (0: not known here)
     for (size_t i = 0; i < sizeof DECL_FMT / sizeof *DECL_FMT; i++) if (DECL_FMT[i].f == f) return DECL_FMT[i].bytes;
-    switch (f) { case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return 4; default: return 0; }
+    switch (f) { case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return 4; default: return 0; }
 }
 static void rb_tex_read(const jv *a, rb_tex *out, int *n, int cap) {
     for (int i = 0; a && i < a->n && *n < cap; i++) {
@@ -856,6 +856,15 @@ make:
     if (swz) { cm.r = swz[0] < 6 ? S_[swz[0]] : cm.r; cm.g = swz[1] < 6 ? S_[swz[1]] : cm.g; cm.b = swz[2] < 6 ? S_[swz[2]] : cm.b; cm.a = swz[3] < 6 ? S_[swz[3]] : cm.a; }
     VkImageViewCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = v->img, .viewType = type, .format = k.fmt, .components = cm,
                                 .subresourceRange = {aspect, level, nlevels, layer, nlayers}};
+    // an image with STORAGE for views of another format (vt_create ext_store): a view would otherwise take the image's usage, and one in its own format would claim a
+    // storage use that format does not have. Each takes what its format supports, so the format (in the key) decides the usage
+    VkImageViewUsageCreateInfo vu = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    if (v->ext_store) {
+        VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, k.fmt, &fp); VkFormatFeatureFlags ff = fp.optimalTilingFeatures;
+        vu.usage = v->usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ? VK_IMAGE_USAGE_SAMPLED_BIT : 0) |
+                               (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0));
+        if (vu.usage) ic.pNext = &vu;
+    }
     if (vkCreateImageView(g_vk.dev, &ic, NULL, &iv) != VK_SUCCESS) { RED_ONCE(81, "image view of format %d type %d failed", v->fmt, type); return VK_NULL_HANDLE; }
     nvn_hm_put(&g_views, &k, iv);
     return iv;
@@ -2004,6 +2013,9 @@ static VkImageView storage_view(vtex *v, const view_t *vv, VkImageViewType vt, V
     if (f != v->fmt && (v->conv || !fmt_bytes(v->fmt) || fmt_bytes(v->fmt) != fmt_bytes(f))) { RED_ONCE(110, "image of format %d bound where the shader declares format %d: skipped", v->fmt, f); return VK_NULL_HANDLE; }
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, f, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) || v->conv) { RED_ONCE(104, "image format %d is not storage-capable here: skipped", f); return VK_NULL_HANDLE; }
+    // Not skipped: a game can bind a texture without NVN's image flag to an image slot, and the Mac makes such a texture writable (nvn_mtl.m's usage upgrade), which this
+    // replay does not do yet. An image texture the GPU refused STORAGE (vt_create store_word) comes here too
+    if (!(v->usage & VK_IMAGE_USAGE_STORAGE_BIT)) RED_ONCE(122, "image of format %d bound to an image slot (format %d) without storage use: not an NVN image texture, or no storage view of its texel size here", v->fmt, f);
     g_view_fmt = f == v->fmt ? VK_FORMAT_UNDEFINED : f;
     VkImageView iv = view_get(v, vt, vv && vv->set_levels ? vv->base_level : 0, 1, vv && vv->set_layers ? vv->min_layer : 0, vv && vv->set_layers ? vv->nlayers : 0, VK_IMAGE_ASPECT_COLOR_BIT, NULL);
     g_view_fmt = VK_FORMAT_UNDEFINED;

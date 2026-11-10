@@ -1029,6 +1029,7 @@ typedef struct {
     int pkg; uint64_t stamp, seen; const void *span; uint8_t *edge[2]; uint32_t edge_n[2];
     uint64_t rt_last; uint32_t rt_runs;   // the last present (+1) that drew into it as a pass's target, and in how many presents in a row up to it (gfx_vk_draw.inc rt_note)
     int refs, shared, mutable_, fixed_fmt; uint64_t used;   // mutable_: views in another format of the same texel size (a texture view's format); fixed_fmt: only its format and its sRGB twin (vt_create)   // texture objects (serials) resolving to it; in the sharing table; g_fence at its last lookup
+    VkImageUsageFlags usage; int ext_store;   // its usage; ext_store: STORAGE for views of another format only (EXTENDED_USAGE, vt_create), so each view takes the usage its format has (view_get)
 } vtex;
 static nvn_hmap g_tex = {.klen = 8}, g_cpuw = {.klen = 8};   // serial → vtex; serials the CPU wrote (WriteTexels). Keyed by the 8-byte serial
 static uint64_t g_pkg_uploads, g_pkg_reuploads, g_pkg_edge_skips, g_up_bytes, g_draws_skipped;
@@ -1088,6 +1089,19 @@ static VkFormat srgb_twin(VkFormat f) {
 }
 // DM_VK_UBWC=0 (env.txt): colour images MUTABLE_FORMAT with no format list, as before (vt_create)
 static int ubwc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = !(e && *e == '0') && g_fmt_list; LOG("[vk] colour images %s", v ? "list their format and its sRGB twin, so Adreno keeps their framebuffer compression (DM_VK_UBWC=0: MUTABLE_FORMAT, any format of the texel size)" : g_fmt_list ? "MUTABLE_FORMAT with no format list (DM_VK_UBWC=0)" : "MUTABLE_FORMAT with no format list (no VK_KHR_image_format_list)"); } return v; }
+// For an image whose own format the GPU cannot store to (vt_create): 1 when an integer format of its texel size can be, and the GPU takes the image with STORAGE for such
+// views (EXTENDED_USAGE, Vulkan 1.1's like the view usages view_get gives them)
+static int store_word(VkFormat f, const vtex *v, VkImageUsageFlags u, VkImageCreateFlags cf) {
+    static const VkFormat word[17] = {[1] = VK_FORMAT_R8_UINT, [2] = VK_FORMAT_R16_UINT, [4] = VK_FORMAT_R32_UINT, [8] = VK_FORMAT_R32G32_UINT, [16] = VK_FORMAT_R32G32B32A32_UINT};
+    int b = fmt_bytes(f); VkFormat w = b > 0 && b <= 16 ? word[b] : VK_FORMAT_UNDEFINED;
+    if (!w || v->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (VK_API_VERSION_MAJOR(g_vk.props.apiVersion) == 1 && VK_API_VERSION_MINOR(g_vk.props.apiVersion) < 1)) return 0;
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, w, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return 0;
+    VkImageFormatProperties ip;
+    if (vkGetPhysicalDeviceImageFormatProperties(g_vk.pd, f, v->type, VK_IMAGE_TILING_OPTIMAL, u | VK_IMAGE_USAGE_STORAGE_BIT,
+                                                 cf | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, &ip) != VK_SUCCESS) return 0;
+    return ip.maxExtent.width >= v->w && ip.maxExtent.height >= v->h && ip.maxExtent.depth >= v->d && ip.maxMipLevels >= v->levels && ip.maxArrayLayers >= v->layers && (ip.sampleCounts & v->samples);
+}
 static vtex *vt_create(const tex_t *t) {
     uint32_t m = 0; uint8_t swz[4];
     if (nvn_hm_get(&g_img_refused, &t->serial)) return NULL;
@@ -1117,6 +1131,14 @@ static vtex *vt_create(const tex_t *t) {
     if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
+    VkImageCreateFlags cf = ((t->d.target == 8 || t->d.target == 9) && v->layers % 6 == 0 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
+                            (v->type == VK_IMAGE_TYPE_3D && (u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0);   // a 3D target is drawn a slice at a time through 2D views (gfx_vk_draw.inc rp_start)
+    // A format the GPU cannot store to (E5B9G9R9, sRGB and some packed ones on Adreno) is still written by shaders that pack its texels themselves, through an integer image of its
+    // texel size: Ocarina of Time packs RGB9E5 into an R32_UINT image store. Such an image takes STORAGE for those views alone (EXTENDED_USAGE; each view gets only its format's
+    // usage, view_get), with MUTABLE_FORMAT as every storage image has. Before, storage_view made an R32_UINT storage view of an image created with neither, which is invalid.
+    // The same fix as nx2android's (github.com/DeathKhan/nx2android, 8569eeb), written anew here
+    if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(u & VK_IMAGE_USAGE_STORAGE_BIT) && !conv && store_word(f, v, u, cf)) { u |= VK_IMAGE_USAGE_STORAGE_BIT; cf |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; v->ext_store = 1; }
+    v->usage = u;
     // an uncompressed colour image may be viewed in another format of its texel size (NVN texture views: sRGB over UNORM and the like): mutable. So may a BC image
     // decoded on the CPU, which holds uncompressed texels: a BC7_SRGB view of a BC7 texture is its RGBA8 image viewed as RGBA8_SRGB (gfx_vk_draw.inc view_format)
     int mut = v->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !(f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
@@ -1130,9 +1152,7 @@ static vtex *vt_create(const tex_t *t) {
     v->mutable_ = mut || (u & VK_IMAGE_USAGE_STORAGE_BIT);
     VkImageCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = v->type, .format = f, .extent = {v->w, v->h, v->d}, .mipLevels = v->levels,
         .arrayLayers = v->layers, .samples = v->samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .flags = ((t->d.target == 8 || t->d.target == 9) && v->layers % 6 == 0 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
-                                                           (u & VK_IMAGE_USAGE_STORAGE_BIT || mut ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0) |   // storage: viewed in the format a shader declares (gfx_vk_draw.inc storage_view); colour: a texture view's format
-                                                           (v->type == VK_IMAGE_TYPE_3D && (u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0)};   // a 3D target is drawn a slice at a time through 2D views (gfx_vk_draw.inc rp_start)
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .flags = cf | (u & VK_IMAGE_USAGE_STORAGE_BIT || mut ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0)};   // storage: viewed in the format a shader declares (gfx_vk_draw.inc storage_view); colour: a texture view's format
     if (v->samples > 1) ic.mipLevels = 1;
     if (v->fixed_fmt && mut) ic.pNext = &fli;
     if (vkCreateImage(g_vk.dev, &ic, NULL, &v->img) != VK_SUCCESS) { RED_ONCE(15, "vkCreateImage %ux%ux%u ×%u levels %u format %d failed", v->w, v->h, v->d, v->layers, v->levels, f); free(v); return NULL; }
