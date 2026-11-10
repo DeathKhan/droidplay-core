@@ -1970,6 +1970,21 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   - GPU and picture unchanged.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
 
+### Raw global memory is not on the Vulkan replay (Android)
+
+- **Symptom:** Android, a game whose shaders load from addresses they read from memory: `[RED] [vk] storage buffer of shader … (c255 +0) is not a bound buffer: it reads 0`, printed once, for the first such shader only. Whatever those loads feed is wrong: zeros, or NaN that later passes spread.
+  - In Ocarina of Time, NaN fills the volumetric fog's volumes, then the whole scene target, and Kokiri Forest is black.
+- **Cause:** the translator sends a global memory access it can't trace to a storage buffer through the raw pool table ([Global memory at an address loaded from memory](shaders.md#global-memory-at-an-address-loaded-from-memory)). That's a storage buffer under the sentinel slot 0xFF (`DMSH_GMEM_MAP_CB_SLOT`), listing each memory pool's start, end and delta, and the Mac fills it (`nvn_mtl.m` `gmem_map`). `stage_set` doesn't know the slot and binds 16 zero bytes, so each such load finds no pool and reads 0, and stores go nowhere.
+- **Fix:** open. It needs:
+  - the table;
+  - `VK_KHR_buffer_device_address`;
+  - the guest memory pools readable by the GPU at a device address and kept in step with the CPU;
+  - the write log for raw stores (`DMSH_KIND_GMEM_LOG`).
+  The replay copies what each draw reads into its arena, so the pools have no GPU home yet. Without `VK_EXT_external_memory_host` (the Galaxy Z Fold 8's Adreno 840 has none) a host pointer can't be imported, which leaves pool mirrors kept in sync, or guest memory allocated as Vulkan or dma-buf memory from the start.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#android): 2,247 of its shaders bind the table.
+  - Found from a frame dump: the fog compute `9e6b00b050e30801` carries the translator's "traced to no storage buffer: it goes through the memory pool table" notes and writes NaN only.
+  - The Mac's fog volumes, under the same serials, have none.
+
 ### The texture pool read by ID on Vulkan (Android)
 
 - **Symptom:** Android, an NVN2 game: `[RED] [vk] shader …: one descriptor set of its layout is larger than a whole pool (an array of 1048576 elements): its draws are dropped`, and what those shaders draw is missing.

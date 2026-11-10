@@ -64,9 +64,9 @@ two runs without a warm-up (the pipeline cache warm from earlier runs; Kokiri Fo
 | Game, scene | Galaxy Z Fold 8 |
 |---|---|
 | **Ocarina of Time v131072**, the title and its menu (a fresh save) | 29.6-31.1 · 33.2-33.3 / 35.1-48.2 · GPU 26.7 |
-| Ocarina of Time, Kokiri Forest (a Mac save, route `kokiri`) | 1.7 fps · frame p50 593-611 / p95 683-691 · GPU 119.4-128.2, PSS 8.5 GB; the forest black (not the texture pool, whose draws run now; 1.6 fps and GPU 138.7 with `DM_VK_POOL=0`) |
+| Ocarina of Time, Kokiri Forest (a Mac save, route `kokiri`) | 1.7 fps · frame p50 593-611 / p95 683-691 · GPU 119.4-128.2, PSS 8.5 GB; the forest black: the replay has no raw global memory (the pool table in slot 0xFF that 2,247 of the game's shaders read through); 1.6 fps and GPU 138.7 with `DM_VK_POOL=0` |
 
-The title's GPU frame is nn::ndve's last convolution (36.8 ms in a `prof_now` frame). Kokiri Forest's memory (`DM_VK_MEMREPORT`, #95), its black picture and what is open: the game's note,
+The title's GPU frame is nn::ndve's last convolution (36.8 ms in a `prof_now` frame). Kokiri Forest's memory (`DM_VK_MEMREPORT`, #95), its black picture (no raw global memory on Vulkan) and what is open: the game's note,
 [Android](../games/0400486024DEC000/README.md#android).
 
 ## Known problems
