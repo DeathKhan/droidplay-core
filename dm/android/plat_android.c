@@ -1,6 +1,7 @@
 // Android implementations of the Darwin stand-ins declared in compat/dm_android.h, and the x18 thread-slot block (dm.h dm_slot_get).
 #include "dm.h"
 #include <dirent.h>
+#include <ftw.h>
 #include <dispatch/dispatch.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <stdarg.h>
@@ -373,9 +374,43 @@ int dm_android_clonefile(const char *src, const char *dst, int flags) {
     struct stat st; if (!lstat(dst, &st)) { errno = EEXIST; return -1; }
     return copy_tree(src, dst);
 }
+// RENAME_SWAP is renameat2's RENAME_EXCHANGE, which f2fs and ext4 have. sdcardfs refuses every rename flag with EINVAL; it holds external storage's
+// Android/data on devices with a 4.x kernel (the Retroid Pocket 5 on Android 13), where scripts/bench_android.py keeps each run's save, so there every
+// Commit failed ("atomic swap failed errno=22": Skyward Sword HD then crashed, Animal Crossing stopped). There the swap is three plain renames through
+// <to>.swap: to → to.swap, from → to, to.swap → from. A kill after the first leaves no <to>, and dm_android_swap_recover, at the next mount, moves to.swap
+// back: the version from before the swap, as if it had not begun. A kill after the second leaves to.swap beside the new <to>, and it is deleted. So a
+// save still mounts whole, the old version or the new one, never a mix
+static int rm_one(const char *p, const struct stat *st, int flag, struct FTW *f) { (void)st; (void)f; return flag == FTW_DP || flag == FTW_DNR ? rmdir(p) : unlink(p); }
+static int remove_tree(const char *p) { return nftw(p, rm_one, 16, FTW_DEPTH | FTW_PHYS); }   // a symbolic link is removed, never followed
+static int swap_side(const char *to, char *side, size_t n) {
+    if (snprintf(side, n, "%s.swap", to) < (int)n) return 0;
+    errno = ENAMETOOLONG; return -1;
+}
+int dm_android_swap_by_renames(const char *from, const char *to) {
+    char side[PATH_MAX]; struct stat st;
+    if (swap_side(to, side, sizeof side) || lstat(from, &st) || lstat(to, &st)) return -1;   // both must exist, as for RENAME_EXCHANGE (ENOENT)
+    if (!lstat(side, &st) && remove_tree(side)) return -1;   // a swap that a kill cut short after its second rename left it: <to> is already the newer version
+    if (rename(to, side)) return -1;
+    if (rename(from, to)) { int e = errno; rename(side, to); errno = e; return -1; }   // put back as it was
+    if (rename(side, from)) LOG("[RED] swap: %s holds the new version, but the old one stays in %s (errno=%d) until the next mount deletes it", to, side, errno);
+    return 0;
+}
+void dm_android_swap_recover(const char *p) {
+    char side[PATH_MAX]; struct stat st;
+    if (swap_side(p, side, sizeof side) || lstat(side, &st)) return;
+    if (lstat(p, &st)) {
+        if (rename(side, p)) LOG("[RED] swap: %s is missing and moving %s back failed errno=%d", p, side, errno);
+        else LOG("swap: %s was cut short by a kill before its second rename: the version from before it is back", p);
+    } else if (remove_tree(side)) LOG("[RED] swap: cannot delete %s, which a swap cut short by a kill left (errno=%d)", side, errno);
+    else LOG("swap: deleted %s, the version that a swap cut short by a kill had already replaced", side);
+}
 int dm_android_renamex_np(const char *from, const char *to, unsigned flags) {
-    if (flags & RENAME_SWAP) return (int)syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, RENAME_EXCHANGE);
-    return rename(from, to);
+    if (!(flags & RENAME_SWAP)) return rename(from, to);
+    if (!syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, RENAME_EXCHANGE)) return 0;
+    if (errno != EINVAL) return -1;
+    static _Atomic int told;
+    if (!atomic_exchange(&told, 1)) LOG("renameat2 RENAME_EXCHANGE: EINVAL for %s (sdcardfs has no rename flags): folders are swapped by plain renames through <folder>.swap", to);
+    return dm_android_swap_by_renames(from, to);
 }
 // Darwin xattr names are free-form; Linux needs a namespace: the guest-name attribute (hle_fs.c FS_GUEST_NAME) goes in user.
 static const char *xname(const char *n, char *buf, size_t sz) { if (!strncmp(n, "user.", 5)) return n; snprintf(buf, sz, "user.%s", n); return buf; }
@@ -387,9 +422,13 @@ int dm_android_setxattr(const char *p, const char *n, const void *v, size_t s, u
     (void)pos; char b[256]; n = xname(n, b, sizeof b);
     return opt & XATTR_NOFOLLOW ? lsetxattr(p, n, v, s, 0) : setxattr(p, n, v, s, 0);
 }
+// sdcardfs has no extended attributes at all (EOPNOTSUPP), so no name there has one: the same answer as ENOATTR. hle_fs.c's set_guest_name removes the
+// guest name from every entry a game creates or renames in its save, and took EOPNOTSUPP as a failure of the create itself
 int dm_android_removexattr(const char *p, const char *n, int opt) {
     char b[256]; n = xname(n, b, sizeof b);
-    return opt & XATTR_NOFOLLOW ? lremovexattr(p, n) : removexattr(p, n);
+    int r = opt & XATTR_NOFOLLOW ? lremovexattr(p, n) : removexattr(p, n);
+    if (r && errno == EOPNOTSUPP) errno = ENOATTR;
+    return r;
 }
 #undef fcntl
 int dm_android_fcntl(int fd, int cmd, ...) {

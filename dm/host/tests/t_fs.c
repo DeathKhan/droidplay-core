@@ -7,7 +7,8 @@
 //      the next transaction commits normally, and the final save = the content of the next transaction;
 //   (5) remounting discards uncommitted content;
 //   (8) a save folder that cannot clone (ENOTSUP: HFS+, exFAT) mounts read-only and tells the front end; recursive deletes unlink symlinks and never empty their targets;
-//   (9) a save whose names hold backslashes (a host from before backslash paths) moves to today's names at mount, a taken name kept as it is.
+//   (9) a save whose names hold backslashes (a host from before backslash paths) moves to today's names at mount, a taken name kept as it is;
+//   (10) Android only: the swap of plain renames used where RENAME_EXCHANGE is refused (sdcardfs), and the mount after a kill between its renames.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,10 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <sys/clonefile.h>                // declared before the define, so only hle_fs.c's calls go to the fake
+#ifdef __ANDROID__
+#include <sys/syscall.h>
+#include <linux/fs.h>                     // RENAME_EXCHANGE, for ⑩'s probe of the folder the test runs in
+#endif
 static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off);
 static int fake_clonefile(const char *src, const char *dst, uint32_t flags);
 #define pwrite fake_pwrite
@@ -345,6 +350,34 @@ int main(void) {
 #undef OLD
         g_nmnt = 0;
     }
+
+#ifdef __ANDROID__
+    printf("⑩ Android: the swap of plain renames where RENAME_EXCHANGE is refused (sdcardfs), and its recovery at mount\n");
+    {   char a[1100], b[1100], side[1200], k[1100], ks[1200], kn[1200], q[1300];
+#define IN(dir, f) (snprintf(q, sizeof q, "%s/%s", dir, f), q)
+        snprintf(a, sizeof a, "%s/swa", root); snprintf(b, sizeof b, "%s/swb", root); snprintf(side, sizeof side, "%s.swap", b);
+        mkdir(a, 0755); mkdir(b, 0755); put(IN(a, "f"), "A"); put(IN(b, "f"), "B");
+        CHECK(dm_android_swap_by_renames(a, b) == 0 && same(IN(a, "f"), "B") && same(IN(b, "f"), "A") && access(side, F_OK), "two folders trade places, and no .swap is left");
+        mkdir(side, 0755); put(IN(side, "f"), "stale");
+        CHECK(dm_android_swap_by_renames(a, b) == 0 && same(IN(a, "f"), "A") && same(IN(b, "f"), "B") && access(side, F_OK), "a .swap left beside the folder is deleted, and the swap made");
+        snprintf(k, sizeof k, "%s/missing", root); errno = 0;
+        CHECK(dm_android_swap_by_renames(k, b) == -1 && errno == ENOENT && same(IN(b, "f"), "B") && access(side, F_OK), "a missing folder fails as RENAME_EXCHANGE does (ENOENT), and the other stays");
+        snprintf(k, sizeof k, "%s/killed", root); snprintf(ks, sizeof ks, "%s.swap", k); snprintf(kn, sizeof kn, "%s.new", k);
+        mkdir(ks, 0755); put(IN(ks, "a"), "old"); mkdir(kn, 0755); put(IN(kn, "a"), "new");   // killed after to → to.swap: no committed folder
+        setenv("DM_SAVE", k, 1); g_nmnt = 0;
+        CHECK(h_fs_MountSave("save", NULL) == RES_OK && !g_mnt[0].ro && read_fs("save:/a", got, sizeof got) && !strcmp(got, "old") && access(ks, F_OK) && access(kn, F_OK),
+              "killed after the first rename: the mount brings back the version from before the swap (a = %s), no .swap or .new left", got);
+        put(IN(k, "a"), "new2"); mkdir(ks, 0755); put(IN(ks, "a"), "old2");   // killed after from → to: the new version committed, the old one in to.swap
+        g_nmnt = 0;
+        CHECK(h_fs_MountSave("save", NULL) == RES_OK && read_fs("save:/a", got, sizeof got) && !strcmp(got, "new2") && access(ks, F_OK), "killed after the second rename: the new version stays (a = %s), its .swap is deleted", got);
+        mkdir(a, 0755); mkdir(side, 0755);   // which swap this folder takes: run with TMPDIR in an sdcardfs Android/data (a Retroid Pocket 5), every Commit above was a swap of plain renames
+        int plain = syscall(SYS_renameat2, AT_FDCWD, a, AT_FDCWD, side, RENAME_EXCHANGE) && errno == EINVAL; rmdir(a); rmdir(side);
+        CHECK(write_save("save:/a", "c3") == RES_OK && h_fs_Commit("save") == RES_OK && same(IN(k, "a"), "c3") && access(kn, F_OK) && access(ks, F_OK),
+              "a Commit here (%s) leaves the new version and no .new or .swap", plain ? "RENAME_EXCHANGE refused: plain renames" : "RENAME_EXCHANGE");
+#undef IN
+        g_nmnt = 0;
+    }
+#endif
 
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); system(cmd);
     printf("== %d checks, %d failed ==\n", checks, fails);

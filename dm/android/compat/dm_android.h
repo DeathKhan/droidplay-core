@@ -222,7 +222,9 @@ static inline const uint8_t *getsectiondata(const struct mach_header_64 *mh, con
 #endif
 #define RENAME_SWAP 2
 int dm_android_clonefile(const char *src, const char *dst, int flags);   // plat_android.c: a recursive copy (no copy-on-write clone on Android's file systems)
-int dm_android_renamex_np(const char *from, const char *to, unsigned flags);   // plat_android.c: RENAME_SWAP = renameat2 RENAME_EXCHANGE
+int dm_android_renamex_np(const char *from, const char *to, unsigned flags);   // plat_android.c: RENAME_SWAP = renameat2 RENAME_EXCHANGE, or plain renames where it is refused (sdcardfs)
+int dm_android_swap_by_renames(const char *from, const char *to);   // plat_android.c: that swap of plain renames through <to>.swap
+void dm_android_swap_recover(const char *path);   // plat_android.c: at a save's mount, undoes or finishes a swap of plain renames that a kill cut short
 #define clonefile dm_android_clonefile
 #define renamex_np dm_android_renamex_np
 // Darwin xattr calls take position / options arguments; the guest-name xattr lives in the user namespace. <sys/xattr.h> is included first so
