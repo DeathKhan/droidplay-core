@@ -45,7 +45,7 @@ median GPU time per frame. Animal Crossing runs at 30 fps on the Switch too.
 | Skyward Sword HD, Skyloft's plaza (a save) | 30.0–30.5 · 33.3 / 36.6–46.8 · GPU 4.8–4.9 | 30.0–34.0 · 30.6–32.9 / 44.4–46.5 · GPU 12.6–12.8 | Not measured: the game stops at its first save (see below) | 60 · 16.6–16.7 / 20.6–20.7 · GPU 9.8–9.9 |
 | **Final Fantasy Resonance 1.0.1**, the Lancarse logo and the Brightness screen (a fresh save) | 59.6–59.7 · 16.8 / 18.7 · GPU 1.8 | not measured here | not run | 59.6 · 16.8 / 21.3–21.5 · GPU 5.8 |
 | Final Fantasy Resonance, the first field (a save made by its `tofield` route) | 42.2–42.6 · 23.3–23.6 / 27.1–27.4 · GPU 12.5–12.7 | not measured here | not run | 30.1–33.3 · 29.7–33.0 / 40.9–42.8 · GPU 20.2–22.7 |
-| **The Legend of Zelda: Breath of the Wild 1.9.0**, the Shrine of Resurrection (the `outdoors` save, a 40 s window) | no GPU hang: 30.0–30.5 · 33.0–33.3 / 37.5–38.2 · GPU 13.2–15.3 on main (the frame step tries 60 and fails), **29.9 · 33.2 / 36.2–36.6 · GPU 14.3** with droidplay-core#108 | **GPU lost** at the first frame in the field (problem 14); with the hanging draw skipped: 20.0 · 48.6–49.2 / 68–71 · GPU 22.3 on main, **30.0 · 33.1–33.4 / 38.2–38.9 · GPU 15.5–16.6** with droidplay-core#91, #93, #97 and #108 (BotW's defaults) | not run | not run |
+| **The Legend of Zelda: Breath of the Wild 1.9.0**, the Shrine of Resurrection (the `outdoors` save, a 40 s window) | no GPU hang: 30.0–30.5 · 33.0–33.3 / 37.5–38.2 · GPU 13.2–15.3 on main (the frame step tries 60 and fails), **29.9 · 33.2 / 36.2–36.6 · GPU 14.3** with droidplay-core#108 | **30.0 · 33.2–33.3 / 37.9–38.4 · GPU 16.5–16.7** on main with BotW's defaults and the empty slot 0 filled (problem 14, fixed; the picture is still dark, problem 15). Before that fix the GPU was lost at the first frame in the field; with the hanging draw skipped: 20.0 · 48.6–49.2 / 68–71 · GPU 22.3 on main | not run | not run |
 
 Link's Awakening's numbers are for a wrong picture (problem 8): the 3D world never reaches the screen, so the overworld's frame rate leaves out part of
 its real work. Skyward Sword HD's Skyloft is drawn with grey terrain (problem 10); on the Galaxy S25 Edge its terrain has its colours.
@@ -165,7 +165,7 @@ Numbered in the order they were found, so links to a number stay right:
     though here the arena already takes the cached coherent type (type 4, flags `0xf`, of the types `0x11`): on this driver the CPU reads GPU-written memory slowly
     anyway. Not worked on yet.
 
-14. **Open: Breath of the Wild loses the GPU on the Pad 3** at its first frame in the field. Then `vkQueueSubmit` gives -4 (`VK_ERROR_DEVICE_LOST`), the loading screen stays up for good, and the GPU time reads 0.
+14. **Fixed: Breath of the Wild lost the GPU on the Pad 3** at its first frame in the field. Then `vkQueueSubmit` gave -4 (`VK_ERROR_DEVICE_LOST`), the loading screen stayed up for good, and the GPU time read 0.
     - **What hangs.** One draw a frame hangs the GPU: vertex `2decd3e894b3736a`, fragment `26ae1640f3448ba4`, a fullscreen triangle sampling one 640×360 RGBA8 texture into another, the vertical pass of a blur whose horizontal pass runs fine just before it. The driver recovers each hang about 250 ms in (the chunk's fence signals, its end timestamp never written) until one runs past 3 s. `VK_EXT_device_fault` gives no address and no vendor record.
     - **How it was found.** droidplay-core#90 logs such chunks with their draws, and a `vk_mid` file holding 1 cuts the chunks after every draw.
     - **Still hangs with:**
@@ -177,11 +177,18 @@ Numbered in the order they were found, so links to a number stay right:
       - `VK_EXT_depth_clip_control` instead of the `.z` vertex variant;
       - its target cleared before the pass;
       - draws that sample an attachment of their own pass skipped;
-      - duplicate colour attachments left unused.
+      - duplicate colour attachments left unused;
+      - the earlier pass that binds the target alone (below) with its draws skipped: its clear still begins it.
     - **What differs.** Its pipeline key is the horizontal pass's byte for byte but for the write mask, with the same D16 depth image. Only the target image differs: it is also the sixth colour target of the G-buffer passes.
-    - **Workaround for measuring.** Skipping the draw (a local test switch) keeps the GPU alive, and the game runs.
     - **Not on the Odin 2.** Its Adreno 740 (driver 0x802a4000) runs the same draw without a hang: seven launches of the same save on main 1e4dd802 with droidplay-core#108, nothing skipped, no slow submission reported.
-    - **Not tried:** Turnip (needs a driver build for the Adreno 830); rendering that pass into another image and copying it over.
+    - **Cause.** An earlier pass of the frame binds that target alone in colour slot 5, with slots 0–4 empty (`VK_ATTACHMENT_UNUSED`). That pass runs; the later one drawing into the target as slot 0 hangs. A scratch target in every empty slot below a used one stops it, and so does one in slot 0 alone. Filling only a G-buffer pass's empty slot 6 below slot 7, or zeroing the write masks of empty slots, doesn't.
+    - **Fix.** On Adreno 8xx a render pass with colour slot 0 empty below a used slot gets a scratch RGBA8 target there (`DM_VK_SLOT0_FILL`, [rendering.md](../../docs/reference/rendering.md#a-render-pass-with-colour-slot-0-empty-hangs-a-later-pass-on-the-adreno-830-android)). About one pass a frame gets it in BotW.
+    - **Check** (main 4743c9da with the fix, BotW's defaults from droidplay-core#108): 30.0 fps in three runs, no hang report. With `DM_VK_SLOT0_FILL=0` the GPU is lost as before. The picture is still wrong there (problem 15).
+
+15. **Open: Breath of the Wild's Shrine of Resurrection is drawn dark and blurred on the Pad 3**: Link unlit, the walls a blur, where the Odin 2 draws them right.
+    - The 1280×720 G-buffer passes bind one image in two colour slots (1 and 2, 3 and 4) and write only the first of each pair (mask 0xf0f0ff).
+    - A local test leaving the second slot of each pair unused draws the room as the Odin 2 does. So the Adreno 830 probably stores the unwritten copy over the written one.
+    - Not fixed yet.
 
 ## Reading the numbers
 
