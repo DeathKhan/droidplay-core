@@ -122,6 +122,7 @@ typedef struct {
     uint32_t io_in, io_out;   // the locations of its user-defined inputs and outputs (bit n: location n)
     struct { uint32_t miss; VkShaderModule m; } var[4]; int nvar;   // fragment shaders: variants with unwritten inputs made constants (ps_variant)
     int b0;   // a module of its set (.spv, .z.spv, .tf.spv; ps_variant only makes inputs private) reads binding 0, the support buffer (spv_b0_used): stage_set writes it only then
+    int wlayer;   // a vertex, tessellation or geometry shader that writes the layer (spv_layer_out): its draws get every layer of their targets (rp_prepare)
     ds_list *dsf;   // its descriptor sets kept by each chunk, [2 chunk + tf] (dsl, dsl_tf): made at its first set (ds_get), never freed (as the shader)
     uint32_t ndesc;   // descriptors in dsl, an array's counted up to 1024 (what stage_set writes of it): DM_VK_SET_STATS=1 checks each stage_set writes them all
     uint8_t dsbig;   // bit tf: one set of its layout (dsl, dsl_tf) did not fit an empty pool (ds_alloc_n, RED 93): ds_get gives none for it, without making another pool
@@ -201,6 +202,14 @@ static int spv_b0_used(const uint32_t *w, size_t n) {
         else if (op == 59 && len >= 5 && w[i + 4] < bound && b0[w[i + 4]]) used = 1;   // OpVariable type result class initializer
         i += len; }
     free(b0); return used;
+}
+// whether the module decorates a variable or a block member BuiltIn Layer (OpDecorate id BuiltIn Layer, OpMemberDecorate type member BuiltIn Layer): in a vertex,
+// tessellation or geometry shader, a layer output
+static int spv_layer_out(const uint32_t *w, size_t n) {
+    for (size_t i = 5; i < n; ) { uint32_t len = w[i] >> 16, op = w[i] & 0xffff; if (!len || i + len > n) return 0;
+        if ((op == 71 && len >= 4 && w[i + 2] == 11 && w[i + 3] == 9) || (op == 72 && len >= 5 && w[i + 3] == 11 && w[i + 4] == 9)) return 1;
+        i += len; }
+    return 0;
 }
 // How many bytes of each constant buffer the shader reads (ext[i] for binding bind[i]; 0 = all of it): the translator declares every one as 4096 vec4, and the replay copied
 // the bound buffer whole for every draw (up to 64 KB, six or seven a shader) where Super Mario Bros. Wonder's scene shaders read 64 bytes to 2.3 KB of each. The extent is the
@@ -440,7 +449,7 @@ static vshader *sh_get(const char *key) {
     js_free(&r);
     snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key); s->mod = sh_module(p, &s->b0);
     { size_t nw = 0; uint32_t *w = spv_read(p, &nw);
-      if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); uint32_t ext[18]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
+      if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); s->wlayer = s->stage != SH_PS && s->stage != SH_CS && spv_layer_out(w, nw); uint32_t ext[18]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
     if (s->stage == SH_VS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p, &s->b0); }
     if (s->tf_stride[0] | s->tf_stride[1] | s->tf_stride[2] | s->tf_stride[3]) { snprintf(p, sizeof p, "%s/%s.tf.spv", g_spv_dir, s->key); s->modtf = sh_module(p, &s->b0); }
     if (!s->mod) return NULL;
@@ -726,9 +735,10 @@ static VkFormat view_format(const vtex *v, const view_t *vv);   // below: a text
 static VkImageView view_get(const vtex *v, VkImageViewType type, uint32_t level, uint32_t nlevels, uint32_t layer, uint32_t nlayers, VkImageAspectFlags aspect, const uint8_t swz[4]) {
     view_key k; memset(&k, 0, sizeof k);
     if (level >= v->levels) level = v->levels - 1;
-    if (g_view_slice && v->type == VK_IMAGE_TYPE_3D) {   // a render target's slice of a 3D image (layer = the depth slice): a 2D view of it, which the image is 2D_ARRAY_COMPATIBLE for (gfx_vk.c vt_new)
-        uint32_t dz = v->d >> level ? v->d >> level : 1; if (layer >= dz) layer = 0;
-        type = VK_IMAGE_VIEW_TYPE_2D; nlevels = 1; nlayers = 1; goto make;
+    if (g_view_slice && v->type == VK_IMAGE_TYPE_3D) {   // a render target's slice of a 3D image (layer = the depth slice): a 2D view of it, which the image is 2D_ARRAY_COMPATIBLE for (gfx_vk.c vt_new);
+        uint32_t dz = v->d >> level ? v->d >> level : 1; if (layer >= dz) layer = 0;   // nlayers > 1 (a layered pass, rp_prepare): those slices as a 2D array
+        if (!nlayers || layer + nlayers > dz) nlayers = dz - layer;
+        type = nlayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; nlevels = 1; goto make;
     }
     if (!nlevels || level + nlevels > v->levels) nlevels = v->levels - level;
     if (layer >= v->layers) layer = 0;
@@ -840,7 +850,7 @@ static VkRenderPass rp_get(const rp_key *k) {
     nvn_hm_put(&g_rps, k, rp);
     return rp;
 }
-static struct { int active; VkRenderPass rp; rp_key key; uint32_t w, h; VkFramebuffer fb; vtex *cv[8], *dv; uint32_t clv[8], cly[8];
+static struct { int active, layered; VkRenderPass rp; rp_key key; uint32_t w, h; VkFramebuffer fb; vtex *cv[8], *dv; uint32_t clv[8], cly[8];
                 uint8_t *snap[8]; size_t snap_cap[8], snap_n[8]; uint8_t *snap_dst[8]; VkImage snap_img[8]; } P;   // snap: a linear target's guest bytes at rp_prepare (lsnap_take), until its write-back takes them
 static uint64_t g_passes;
 // DM_VK_DUMP=<frame>: every render pass of that frame (counted in presents from 1) has its colour targets copied out when it ends, written to
@@ -1057,13 +1067,29 @@ static void rp_end(void) {
 }
 // a pass's target: drawn into in this present, and in how many presents in a row (apipe_ok)
 static void rt_note(vtex *v) { uint64_t p = atomic_load(&g_presents) + 1; if (v->rt_last != p) { v->rt_runs = v->rt_last + 1 == p ? v->rt_runs + 1 : 1; v->rt_last = p; } }
-// the render pass of the bound render targets (R.rt): images, views and framebuffer, made before the draw's textures are resolved (that may record uploads, outside a pass)
-static int rp_prepare(void) {
-    if (P.active) return 1;
+// the render pass of the bound render targets (R.rt): images, views and framebuffer, made before the draw's textures are resolved (that may record uploads, outside a pass).
+// layered: the draw's pipeline writes the layer (vshader wlayer), so a 3D or array target is attached whole, each slice or layer its view covers a layer of the framebuffer.
+// Attached a slice at a time (layer 0 of the view, a framebuffer of one layer), the draws of a volume texture's slices, one instance per slice with a geometry shader
+// picking the layer, wrote slice 0 alone: Final Fantasy Resonance's 32x32x32 colour-grading LUT kept its other 31 slices as whatever its memory held, and the tone
+// mapper drew the field as white specks on black. A layered pass serves the draws that write no layer too (layer 0, as before), so only a layered draw meeting a pass
+// of one layer ends it; a view of one layer (Bowser's Fury draws its LUT a slice at a time) stays that layer. DM_VK_LAYERED=0 (env.txt): one layer, as before
+static int layered_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_LAYERED"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_LAYERED=0: render targets are attached a layer at a time"); } return v; }
+static uint64_t g_layered_passes;
+// the layers of target v a layered pass attaches from layer (or depth slice) ly of level lv: what its view covers, else every one from ly on
+static uint32_t rt_layers(const vtex *v, const view_t *cv, uint32_t lv, uint32_t ly) {
+    uint32_t tot = v->type == VK_IMAGE_TYPE_3D ? (v->d >> lv ? v->d >> lv : 1) : v->layers, n;
+    if (ly >= tot) return 1;
+    n = cv && cv->set_layers && cv->nlayers ? cv->nlayers : tot - ly;
+    return n > tot - ly ? tot - ly : n ? n : 1;
+}
+static int rp_prepare_(int layered) {
+    layered = layered && layered_on();
+    if (P.active && (P.layered || !layered)) return 1;
+    if (P.active) rp_end();   // a draw that writes the layer, in a pass of one layer: the pass again, layered
     lsnap_drop_all();   // an earlier rp_prepare's that no pass used
     if (!R.has_rt) { RED_ONCE(83, "draw with no render target set"); return 0; }
     memset(P.cv, 0, sizeof P.cv); P.dv = NULL; memset(g_bcrt_pend, 0, sizeof g_bcrt_pend);
-    rp_key k; memset(&k, 0, sizeof k); VkImageView views[9]; memset(views, 0, sizeof views); uint32_t nv = 0, w = UINT32_MAX, h = UINT32_MAX, layers = 1; k.samples = 1;
+    rp_key k; memset(&k, 0, sizeof k); VkImageView views[9]; memset(views, 0, sizeof views); uint32_t nv = 0, w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX; k.samples = 1;
     k.ncolor = (uint32_t)(R.rt.n > 8 ? 8 : R.rt.n);
     for (uint32_t i = 0; i < k.ncolor; i++) {
         if (!R.rt.color[i]) continue;
@@ -1083,7 +1109,9 @@ static int rp_prepare(void) {
         // in the format of the target's view: Super Mario Bros. Wonder's last pass writes its RGBA8 window texture through an RGBA8_SRGB view, and in the image's
         // format the linear values were stored unencoded (the whole picture darker and more saturated; nvn_mtl.m found the same)
         g_view_fmt = cv ? view_format(v, cv) : VK_FORMAT_UNDEFINED; VkFormat af = g_view_fmt ? g_view_fmt : v->fmt;
-        g_view_slice = 1; VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, 1, VK_IMAGE_ASPECT_COLOR_BIT, NULL); g_view_slice = 0; g_view_fmt = VK_FORMAT_UNDEFINED; if (!iv) continue;
+        uint32_t nl = layered ? rt_layers(v, cv, lv, ly) : 1;
+        g_view_slice = 1; VkImageView iv = view_get(v, nl > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, nl, VK_IMAGE_ASPECT_COLOR_BIT, NULL); g_view_slice = 0; g_view_fmt = VK_FORMAT_UNDEFINED; if (!iv) continue;
+        if (nl < layers) layers = nl;
         k.color[i] = af; k.samples = v->samples; views[nv++] = iv; P.cv[i] = v; P.clv[i] = lv; P.cly[i] = ly; rt_note(v);
         lsnap_take((int)i, v, lv, ly);   // a linear target: its guest bytes now, which its write-back diffs against
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh;
@@ -1093,11 +1121,14 @@ static int rp_prepare(void) {
         if (v && v->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
             const view_t *dv = R.rt.has_dview ? &R.rt.dview : NULL;
             uint32_t lv = dv && dv->set_levels ? dv->base_level : 0, ly = dv && dv->set_layers ? dv->min_layer : 0;
-            g_view_slice = 1; VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, 1, v->aspect, NULL); g_view_slice = 0;
+            uint32_t nl = layered ? rt_layers(v, dv, lv, ly) : 1;
+            g_view_slice = 1; VkImageView iv = view_get(v, nl > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, nl, v->aspect, NULL); g_view_slice = 0;
+            if (iv && nl < layers) layers = nl;
             if (iv) { k.depth = v->fmt; k.samples = v->samples; views[nv++] = iv; P.dv = v; rt_note(v); uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh; }
         }
     }
     if (!nv || w == UINT32_MAX) { RED_ONCE(84, "render targets without an image"); lsnap_drop_all(); return 0; }
+    if (layers == UINT32_MAX) layers = 1;   // only BC shadows: one layer
     VkRenderPass rp = rp_get(&k); if (!rp) { lsnap_drop_all(); return 0; }
     struct { VkImageView v[9]; uint32_t w, h, l; } fk; memset(&fk, 0, sizeof fk); memcpy(fk.v, views, sizeof views); fk.w = w; fk.h = h; fk.l = layers;
     VkFramebuffer fb = nvn_hm_get(&g_fbs, &fk);
@@ -1106,9 +1137,10 @@ static int rp_prepare(void) {
         if (vkCreateFramebuffer(g_vk.dev, &fc, NULL, &fb) != VK_SUCCESS) { RED_ONCE(85, "framebuffer %ux%u failed", w, h); lsnap_drop_all(); return 0; }
         nvn_hm_put(&g_fbs, &fk, fb);
     }
-    P.rp = rp; P.key = k; P.w = w; P.h = h; P.fb = fb;
+    P.rp = rp; P.key = k; P.w = w; P.h = h; P.fb = fb; P.layered = layered; if (layers > 1) g_layered_passes++;
     return 1;
 }
+static int rp_prepare(void) { return rp_prepare_(0); }
 static int rp_start(void) {
     if (P.active) return 1;
     VkCommandBuffer c = cb(); if (!c) return 0;
@@ -2445,7 +2477,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     draw_view(k.sh, di, 1);   // what this draw reads of guest memory: pending GPU writes to it land first
     if (D.rast_discard) return tf_capture(k.sh[0], pprog[0], pst[0], dw, di);   // the vertex stage only: a capture, or nothing
     for (int i = 0; i < 4; i++) if (k.sh[i]) stage_textures(k.sh[i]);
-    if (!rp_prepare()) { g_drop[1]++; return 0; }
+    if (!rp_prepare_((k.sh[0] && k.sh[0]->wlayer) || (k.sh[2] && k.sh[2]->wlayer) || (k.sh[3] && k.sh[3]->wlayer))) { g_drop[1]++; return 0; }
     g_drawing = 1;   // from here no chunk is closed (chunk_submit reports one)
     int prim = dw ? dw->prim : di->prim;
     pipe_t *pm = pso_memo_find(k.sh, prim), *pp = pm;   // the draw before's pipeline when nothing its key takes has changed (pso_memo_find); NULL: the key is built

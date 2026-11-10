@@ -69,6 +69,7 @@ General host changes first needed here; each applies to every game:
 - **Rewriter:** text before the first FDE as one function (`func_of`) and long functions analysed in pieces (`pieces`): [Code before the first unwind entry is one function](../../../docs/reference/rewriter.md#code-before-the-first-unwind-entry-is-one-function), [Long functions analysed in pieces](../../../docs/reference/rewriter.md#long-functions-analysed-in-pieces).
 - **Bindless reads through a phi that also carries non-handle values** (the vendored translator's `TryTableHandle`): [Bindless reads whose handle phi also carries other values](../../../docs/reference/shaders.md#bindless-reads-whose-handle-phi-also-carries-other-values).
 - **Buffer texture views below the 16-byte alignment read through an aligned copy** (`tbuf_shadow`): [Buffer textures at offsets below 16 bytes](../../../docs/reference/rendering.md#buffer-textures-at-offsets-below-16-bytes).
+- **Android Vulkan replay:** a draw whose geometry shader writes the layer gets every slice of its 3D target (`rp_prepare_`): [Layered draws get every layer of their targets](../../../docs/reference/rendering.md#layered-draws-get-every-layer-of-their-targets). Without it the colour-grading LUT kept 31 of its 32 slices unwritten, and the first field was white specks on black.
 
 ## Open
 
