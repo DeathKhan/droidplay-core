@@ -2468,8 +2468,19 @@ static void bf_vbuf(VkCommandBuffer c, uint32_t i, VkBuffer b, VkDeviceSize o) {
 // vertex data: each stream's bytes from vertex lo to the last vertex (or instance) the draw reads; the bindings start at vertex lo, so the draw numbers its vertices
 // from lo (firstVertex / vertexOffset less lo). Copying from vertex 0 instead made a draw late in a large vertex buffer copy (and convert) all of it before its
 // vertices: Hades II draws its sprites from one growing buffer, and its render thread spent 61% of its time here (bind_vbufs and memcpy) at about 3 fps
+// The instances a draw's instance-rate streams are moved by, in place of its first instance: its base instance where the divisor needs a draw with a stream stepping per
+// N > 1 instances to start at instance 0 (g_div_first0, the KHR divisor without supportsNonZeroFirstInstance), else 0. The streams then start at the base instance's
+// element and the draw at instance 0. Translated shaders read their instance as InstanceIndex - BaseInstance, which does not move, and NVN's base instance is in c0
+static uint32_t inst_shift(uint32_t base_inst) {
+    if (!g_div_first0 || !g_divisor || !base_inst) return 0;
+    for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &D.attr[i], 4); if (!a.fmt || D.stream[a.stream].divisor <= 1) continue;
+        static int once; if (!once) { once = 1; LOG("[vk] first draw with a stream stepping per %u instances at base instance %u: drawn from instance 0, the base instance in its instance streams' offsets", D.stream[a.stream].divisor, base_inst); }
+        return base_inst; }
+    return 0;
+}
 static int bind_vbufs(VkCommandBuffer c, const vshader *vs, int64_t lo, int64_t vhi, uint32_t base_inst, uint32_t inst) {
     if (lo < 0) lo = 0;
+    uint32_t ish = inst_shift(base_inst);
     uint32_t used = 0; for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &D.attr[i], 4); if (a.fmt) used |= 1u << a.stream; }
     if (dump_on()) for (int i = 0; i < 16; i++) { va_st a; memcpy(&a, &D.attr[i], 4); if (!a.fmt) continue;
         const NVNbufferRange *r = &D.vbuf[a.stream]; uint32_t st = D.stream[a.stream].stride; char hx[200] = "";
@@ -2480,7 +2491,7 @@ static int bind_vbufs(VkCommandBuffer c, const vshader *vs, int64_t lo, int64_t 
     for (int s = 0; s < 16; s++) if (used >> s & 1) {
         const NVNbufferRange *r = &D.vbuf[s]; uint32_t stride = D.stream[s].stride; uint64_t need = r->size;
         if (stride) { uint32_t dv = D.stream[s].divisor; int64_t last = dv ? (int64_t)base_inst + (dv > 1 && g_divisor ? (inst + dv - 1) / dv : inst) : vhi; uint64_t want = (uint64_t)(last > 0 ? last : 0) * stride + 64; if (want < need) need = want; }
-        uint64_t from = D.stream[s].divisor ? 0 : (uint64_t)lo * stride; if (from > need) from = need;   // instanced streams count from base_inst, not lo
+        uint64_t from = (uint64_t)(D.stream[s].divisor ? ish : lo) * stride; if (from > need) from = need;   // instanced streams count from base_inst (from ish when the draw starts there: inst_shift), not lo
         VkBuffer vb; VkDeviceSize vo;
         if (stream_fwd(vs, s, &vb, &vo)) { g_fwd++; vo += from; bf_vbuf(c, (uint32_t)s, vb, vo); continue; }   // on the GPU: fwd_find
         uint8_t *fill = NULL; gc_ent *ge = r->address ? gc_get((uintptr_t)r->address, r->size, 0, r->size, &fill) : NULL;   // the whole buffer kept, bound at the draw's first vertex
@@ -2500,7 +2511,7 @@ static int bind_vbufs(VkCommandBuffer c, const vshader *vs, int64_t lo, int64_t 
         int64_t last = dv ? (int64_t)base_inst + (dv > 1 && g_divisor ? (inst + dv - 1) / dv : inst) : vhi; if (last < 1) last = 1;
         if (!stride) last = 1;
         int bytes = kind >= 7 ? 4 : cn * bits / 8;
-        int64_t v0 = dv || !stride ? 0 : lo < last ? lo : last - 1;   // the first vertex converted: the binding's vertex 0
+        int64_t v0 = !stride ? 0 : dv ? ((int64_t)ish < last ? (int64_t)ish : last - 1) : lo < last ? lo : last - 1;   // the first vertex (or instance: inst_shift) converted: the binding's element 0
         VkBuffer vb; VkDeviceSize vo;
         // the whole buffer converted once and kept (gc_get): every element the buffer holds, bound at v0
         uint64_t nall = !r->address ? 0 : !stride ? 1 : r->size >= (uint64_t)a.offset + (uint64_t)bytes ? (r->size - a.offset - bytes) / stride + 1 : 0;
@@ -2570,7 +2581,7 @@ static int tf_capture(vshader *vs, const prog_t *pr, int pst, const p_draw *dw, 
     if (vs->pool && !pool_bind(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl)) { vkCmdEndRenderPass(c); cb_barrier(); bf_reset(); g_drawing = 0; return 0; }
     VkViewport v = {0, 0, 1, 1, 0, 1}; VkRect2D sc = {{0, 0}, {1, 1}}; vkCmdSetViewport(c, 0, 1, &v); vkCmdSetScissor(c, 0, 1, &sc);
     int ok = bind_vbufs(c, vs, dw->first, (int64_t)dw->first + dw->count, (uint32_t)dw->base_instance, 1);
-    if (ok) vkCmdDraw(c, (uint32_t)dw->count, 1, 0, (uint32_t)dw->base_instance);   // gl_VertexIndex counts from 0: the vertex buffers start at the first vertex
+    if (ok) vkCmdDraw(c, (uint32_t)dw->count, 1, 0, (uint32_t)dw->base_instance - inst_shift((uint32_t)dw->base_instance));   // gl_VertexIndex counts from 0: the vertex buffers start at the first vertex
     vkCmdEndRenderPass(c); cb_barrier(); bf_reset();
     g_drawing = 0;
     { static int once; if (!once) { once = 1; LOG("[vk] transform feedback: first capture (vertex %s, %d vertices)", vs->key, dw->count); } }
@@ -2857,8 +2868,8 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (prim == 2 || prim == 9) RED_ONCE(99, "line loop / polygon drawn as a strip / fan");
     int64_t lo = k.sh[0]->vid || vlo < 0 ? 0 : vlo;   // the bindings start at vertex lo, and the draw counts from there; a shader reading gl_VertexIndex sees its own numbers
     if (!bind_vbufs(c, k.sh[0], lo, vhi, base_inst, inst)) { g_drop[6]++; return 0; }
-    if (ib) { bf_ibuf(c, ib, ioff, i32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16); vkCmdDrawIndexed(c, icount, inst, 0, (int32_t)((di ? di->base_vertex : 0) - lo), base_inst); }
-    else vkCmdDraw(c, count, inst, (uint32_t)(dw->first - lo), base_inst);
+    if (ib) { bf_ibuf(c, ib, ioff, i32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16); vkCmdDrawIndexed(c, icount, inst, 0, (int32_t)((di ? di->base_vertex : 0) - lo), base_inst - inst_shift(base_inst)); }
+    else vkCmdDraw(c, count, inst, (uint32_t)(dw->first - lo), base_inst - inst_shift(base_inst));   // inst_shift: the base instance in the streams' offsets instead
     g_draws++; C->ndraw++; crumb((dw ? dw->ind : di->ind) ? 'D' : 'd', k.sh[0]->key, k.sh[1] ? k.sh[1]->key : NULL, ib ? icount : count, inst);
     if (g_prof_cur >= 0) { prof_rec *pr = &g_prof[g_prof_cur]; uint64_t nv = (uint64_t)(ib ? icount : count) * inst; pr->draws++; pr->verts += nv;
         if (nv > pr->big) { pr->big = nv; pr->bigvs = k.sh[0]->key; pr->bigfs = k.sh[1] ? k.sh[1]->key : NULL; } }

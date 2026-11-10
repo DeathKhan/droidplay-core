@@ -46,7 +46,10 @@ static __thread int t_bk_sub;   // this thread holds g_bk for a submission (mtl_
 // ---------------- The device ----------------
 static uint32_t g_sg_stages = VK_SHADER_STAGE_ALL;   // the stages that run subgroup operations (subgroupSupportedStages; spv_limits.h); all when not known
 static uint32_t g_sg_size = 32;   // the subgroup size (subgroupSize): over 32, Maxwell's warps are 32-lane parts of a subgroup (spv_wide.h)
-static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
+static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor or the KHR one   // what the device was created with
+// The KHR divisor without supportsNonZeroFirstInstance (the Pixel 9 Pro XL's Mali-G715): a draw with a stream stepping per N > 1 instances must start at instance 0, so its
+// base instance moves into the instance-rate streams' offsets instead (gfx_vk_draw.inc inst_shift)
+static int g_div_first0;
 static int g_fmt_list;   // VK_KHR_image_format_list enabled (vt_create)
 static void pb_dump(void);   // gfx_vk_draw.inc: the pipelines being built, for a crash dump
 static int g_stencil_export;   // VK_EXT_shader_stencil_export enabled: a fragment shader writes the stencil test's value (gfx_vk_dscopy.inc)
@@ -92,8 +95,14 @@ static void vk_create(void) {
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
     const char *dext[9]; uint32_t nde = 0;   // every extension below at once: swapchain, divisor, stencil export, format list, memory report, host query reset, device fault, descriptor indexing, robustness2
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
-    int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
+    // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get). The KHR extension (core in Vulkan 1.4) has the EXT's structures and type values: a device that
+    // offers only it (the Mali-G715) read every such stream per instance before. Its property supportsNonZeroFirstInstance says whether a draw may start past instance 0
+    int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor"), div_khr = !divisor && has_ext(de, nd, "VK_KHR_vertex_attribute_divisor");
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
+    else if (div_khr) { dext[nde++] = "VK_KHR_vertex_attribute_divisor"; divisor = 1;
+        VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR dvp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dvp}; vkGetPhysicalDeviceProperties2(g_vk.pd, &p2);
+        g_div_first0 = !dvp.supportsNonZeroFirstInstance; }
     // depth-stencil copies drawn in one pass (gfx_vk_dscopy.inc), else a draw per stencil bit; DM_VK_STENCIL_EXPORT=0 (env.txt, a diagnostic): the per-bit draws anyway
     { const char *e = getenv("DM_VK_STENCIL_EXPORT"); g_stencil_export = has_ext(de, nd, "VK_EXT_shader_stencil_export") && !(e && *e == '0'); }
     if (g_stencil_export) dext[nde++] = "VK_EXT_shader_stencil_export";
@@ -137,6 +146,8 @@ static void vk_create(void) {
     VkPhysicalDeviceHostQueryResetFeaturesEXT hqe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, .pNext = divisor ? &dve : NULL, .hostQueryReset = VK_TRUE};
     VkPhysicalDeviceShaderDrawParametersFeatures dpe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hqe : divisor ? (void *)&dve : NULL, .shaderDrawParameters = dp.shaderDrawParameters};
     g_divisor = divisor && dv.vertexAttributeInstanceRateDivisor;
+    if (div_khr) LOG("[vk] vertex streams stepping per N instances: VK_KHR_vertex_attribute_divisor (%s)%s", g_div_first0 ? "a draw that has one starts at instance 0, its base instance in the stream offsets"
+                                                                                                                  : "any first instance", g_divisor ? "" : ", but without vertexAttributeInstanceRateDivisor: read per instance");
     if (!dp.shaderDrawParameters) LOG("[RED] [vk] no shaderDrawParameters: translated vertex shaders declare DrawParameters");
     if (memreport) dpe.pNext = mr_chain(dpe.pNext);
     VkPhysicalDeviceFaultFeaturesEXT ffe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .pNext = &dpe, .deviceFault = VK_TRUE};
