@@ -338,6 +338,7 @@ DM_SPIN	switch	`0` makes the rewriter's spin gate return at once, so guest poll 
 DM_SPIN_LIST	diagnostic	`=1` makes `patch_nso.py` print every guest poll loop it found and sends through a spin gate
 DM_SPIN_POLL	switch	`=<µs>`: how long a spin-gate wait polls before it sleeps with the yield back-off (default 2000; `0` yields on every pass)
 DM_SPV_DIR	path	Android: folder of the game's shaders translated to SPIR-V for the Vulkan replay (`game/spv`, from `dm/android/tools/spv_build.py`)
+DM_SPV_LIMITS	diagnostic	Android: `0` makes every shader module as translated; by default a module that uses subgroup operations in a stage where the GPU runs none (`subgroupSupportedStages`: fragment shaders on the Adreno 650) is rewritten without them (`dm/android/spv_limits.h`)
 DM_SVC	diagnostic	`=1` logs memory SVCs (`SetHeapSize`, `MapMemory`, `Map`/`UnmapPhysicalMemory`) with their addresses and sizes
 DM_SYMCHECK	diagnostic	`=1` checks every hashed module symbol lookup against a linear search and logs a red line for each mismatch
 DM_TARGET	switch	`android` makes `patch_nso.py` rewrite the thread-slot reads for Android (`mov xN, x18`) instead of Apple's; the Android packing script sets it
