@@ -1978,6 +1978,19 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Check:** Breath of the Wild on the Pad 3, the `outdoors` save. With the fix it runs into the field with no hang report. With `DM_VK_SLOT0_FILL=0` it hangs and loses the GPU as before. Filling every empty slot below a used one also stops it; filling only the slot 7 pass's slot 6, or zeroing the write masks of empty slots, doesn't.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
 
+### One image in two colour slots of a pass is drawn wrong on the Adreno 830 (Android)
+
+- **Symptom:** Breath of the Wild's Shrine of Resurrection is drawn dark and blurred on a OnePlus Pad 3 (Adreno 830): Link unlit, the walls a blur. The Odin 2's Adreno 740 draws the same frames right.
+- **Cause:** the game's 1280×720 G-buffer passes bind one image in colour slots 1 and 2 and another in slots 3 and 4, and write only the first slot of each pair (channel mask 0xf0f0ff).
+  - Each slot was its own attachment of the same image view. Vulkan leaves attachments that alias in one subpass undefined.
+  - Every attachment loads and stores, so the unwritten copy is stored too. The Adreno 830 apparently stores it after the written one, so the pass's writes to that image are lost.
+- **Fix:** a pass attaches each image once (`gfx_vk_draw.inc` `dup_slots`), on every GPU.
+  - It is kept at the first of its slots that the draw beginning the pass writes, else at the first. Its other slots are `VK_ATTACHMENT_UNUSED`.
+  - A clear of a slot left unused clears the kept slot (`dup_slot`).
+  - A later draw of the pass that writes a slot left unused and not the kept one loses that write. It is counted in the stats line, with a red line.
+  - `DM_VK_DUP_SLOTS=0` attaches the image at every slot, as before.
+- **Check:** Breath of the Wild's `outdoors` save on a Galaxy S25 Edge (Adreno 830, Samsung's driver 0x80320001): the Shrine is drawn as on the Odin 2, with no write lost, and the GPU time drops from 21.4 to 20.5 ms. With `DM_VK_DUP_SLOTS=0` it is dark as before. On the Pad 3 a local test leaving the later slot of each pair unused drew it right too.
+
 ### Pipeline keys built from the state objects' fields
 
 - **Symptom:** new graphics pipelines made all through play, also in a level seen before (a few per frame, about 1 to 2 ms each on the Adreno); the start-up list of pipelines grew past 186,000 keys over a few sessions, and making it again took the fast cores for most of an hour.

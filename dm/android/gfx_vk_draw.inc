@@ -1150,13 +1150,48 @@ static vtex *slot0_scratch(uint32_t w, uint32_t h) {
     LOG("[vk] scratch target for an empty colour slot 0: %ux%u", v->w, v->h);
     return sv[n++] = v;
 }
+// One image in two colour slots of a pass: Breath of the Wild's 1280x720 G-buffer passes bind one target at slots 1 and 2 and another at 3 and 4, and write only the
+// first of each (channel mask 0xf0f0ff). Vulkan leaves attachments that alias in one subpass undefined: the OnePlus Pad 3's Adreno 830 stored the unwritten copy over
+// the written one, and the Shrine of Resurrection was drawn dark (Link unlit) and blurred (dm/android/baselines.md problem 15), where the Odin 2's Adreno 740 drew it
+// right. So on every GPU a pass attaches each image once: at the first of its slots the draw beginning the pass writes, else at the first; its other slots are
+// VK_ATTACHMENT_UNUSED, and a clear of one of them clears the kept slot. A later draw of the pass writing a slot left unused and not the kept one loses that write: counted
+// (g_dup_lost), with a red line. DM_VK_DUP_SLOTS=0: the image attached at each of its slots, as before
+static uint8_t g_dup_mask; static int8_t g_dup_of[8];   // the pass's colour slots left unused as copies, and the slot each one's image is kept at
+static uint64_t g_dup_passes, g_dup_lost;
+static int dup_slots_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_VK_DUP_SLOTS"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_DUP_SLOTS=0: an image in two colour slots of a pass is attached at both"); }
+    return v;
+}
+static void dup_slots(rp_key *k, VkImageView *cvw) {
+    uint32_t m = D.chmask.mask;
+    for (uint32_t i = 1; i < k->ncolor; i++) {
+        if (!cvw[i] || !P.cv[i]) continue;
+        uint32_t j = 0; while (j < i && !(cvw[j] && P.cv[j] == P.cv[i] && P.clv[j] == P.clv[i] && P.cly[j] == P.cly[i])) j++;
+        if (j == i) continue;   // j: the slot this image is kept at so far (the only earlier one still attached)
+        uint32_t d = i, keep = j;
+        if (!(m >> 4 * j & 0xf) && (m >> 4 * i & 0xf)) { d = j; keep = i; }
+        cvw[d] = VK_NULL_HANDLE; k->color[d] = VK_FORMAT_UNDEFINED; P.cv[d] = NULL; g_bcrt_pend[d].sh = NULL;   // a BC shadow's copy back is the kept slot's
+        for (int s = 0; s < 8; s++) if (g_dup_mask >> s & 1 && (uint32_t)g_dup_of[s] == d) g_dup_of[s] = (int8_t)keep;
+        g_dup_mask |= (uint8_t)(1u << d); g_dup_of[d] = (int8_t)keep;
+    }
+    if (g_dup_mask) g_dup_passes++;
+}
+// the slot a clear of colour slot i reaches in the pass: the kept one when i is a copy left unused (dup_slots)
+static int dup_slot(int i) { return i >= 0 && i < 8 && g_dup_mask >> i & 1 ? g_dup_of[i] : i; }
+static void dup_check(void) {
+    uint32_t m = D.chmask.mask;
+    for (int d = 0; d < 8; d++) if (g_dup_mask >> d & 1 && m >> 4 * d & 0xf && !(m >> 4 * g_dup_of[d] & 0xf)) {
+        g_dup_lost++; RED_ONCE(170, "a draw writes colour slot %d and not slot %d, where the pass keeps their image: the write is lost (dup_slots; DM_VK_DUP_SLOTS=0 attaches both)", d, g_dup_of[d]); return;
+    }
+}
 static int rp_prepare_(int layered) {
     layered = layered && layered_on();
     if (P.active && (P.layered || !layered)) return 1;
     if (P.active) rp_end();   // a draw that writes the layer, in a pass of one layer: the pass again, layered
     lsnap_drop_all();   // an earlier rp_prepare's that no pass used
     if (!R.has_rt) { RED_ONCE(83, "draw with no render target set"); return 0; }
-    memset(P.cv, 0, sizeof P.cv); P.dv = NULL; memset(g_bcrt_pend, 0, sizeof g_bcrt_pend);
+    memset(P.cv, 0, sizeof P.cv); P.dv = NULL; memset(g_bcrt_pend, 0, sizeof g_bcrt_pend); g_dup_mask = 0;
     rp_key k; memset(&k, 0, sizeof k); VkImageView views[9]; memset(views, 0, sizeof views); uint32_t nv = 0, w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX; k.samples = 1;
     VkImageView cvw[8] = {0}, dvw = VK_NULL_HANDLE;   // by slot, then the depth view: views[] in attachment order once slot 0 may be filled (slot0_fill_on)
     k.ncolor = (uint32_t)(R.rt.n > 8 ? 8 : R.rt.n);
@@ -1198,6 +1233,7 @@ static int rp_prepare_(int layered) {
     }
     if (!nv || w == UINT32_MAX) { RED_ONCE(84, "render targets without an image"); lsnap_drop_all(); return 0; }
     if (layers == UINT32_MAX) layers = 1;   // only BC shadows: one layer
+    if (k.ncolor > 1 && dup_slots_on()) dup_slots(&k, cvw);   // before slot 0 is filled: a copy left unused there leaves slot 0 empty
     if (!cvw[0] && k.ncolor > 1 && slot0_fill_on()) {
         int used = 0; for (uint32_t i = 1; i < k.ncolor; i++) used |= cvw[i] != VK_NULL_HANDLE;
         if (used && (layers > 1 || k.samples > 1)) RED_ONCE(153, "a layered or multisample render pass with colour slot 0 empty below a used slot: slot 0 left empty (slot0_fill_on)");
@@ -2664,6 +2700,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (D.rast_discard) return tf_capture(k.sh[0], pprog[0], pst[0], dw, di);   // the vertex stage only: a capture, or nothing
     for (int i = 0; i < 4; i++) if (k.sh[i]) stage_textures(k.sh[i]);
     if (!rp_prepare_((k.sh[0] && k.sh[0]->wlayer) || (k.sh[2] && k.sh[2]->wlayer) || (k.sh[3] && k.sh[3]->wlayer))) { g_drop[1]++; return 0; }
+    if (g_dup_mask) dup_check();
     g_drawing = 1;   // from here no chunk is closed (chunk_submit reports one)
     int prim = dw ? dw->prim : di->prim;
     pipe_t *pm = pso_memo_find(k.sh, prim), *pp = pm;   // the draw before's pipeline when nothing its key takes has changed (pso_memo_find); NULL: the key is built
@@ -2907,13 +2944,13 @@ static void clear_color_pass(const p_clear_color *cc) {
     bf_reset();   // its pipeline and dynamic state are set behind the bind filter (bf_*)
     if (!rp_prepare() || !rp_start()) return;
     VkRect2D r = clear_rect(); if (!r.extent.width || !r.extent.height) return;
-    VkFormat f = P.key.color[cc->index];
+    int ci = dup_slot(cc->index); VkFormat f = P.key.color[ci];
     if ((cc->mask & 0xf) == 0xf) {
-        VkClearAttachment at = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)cc->index, {.color = clear_value(f, cc->rgba)}};
+        VkClearAttachment at = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)ci, {.color = clear_value(f, cc->rgba)}};
         VkClearRect cr = {r, 0, 1}; vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
     }
     if (is_int_fmt(f)) { RED_ONCE(109, "masked clear of an integer target (format %d): not done", f); return; }
-    cpk_t k; memset(&k, 0, sizeof k); k.rp = P.rp; k.ncolor = P.key.ncolor; k.idx = (uint32_t)cc->index; k.mask = (uint32_t)cc->mask & 0xf; k.samples = P.key.samples;
+    cpk_t k; memset(&k, 0, sizeof k); k.rp = P.rp; k.ncolor = P.key.ncolor; k.idx = (uint32_t)ci; k.mask = (uint32_t)cc->mask & 0xf; k.samples = P.key.samples;
     VkPipeline p = clear_pipe(&k); if (!p) return;
     float pc[5] = {cc->rgba[0], cc->rgba[1], cc->rgba[2], cc->rgba[3], 0};
     VkViewport vp = {0, 0, (float)P.w, (float)P.h, 0, 1};

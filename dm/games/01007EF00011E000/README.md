@@ -170,7 +170,8 @@ Measured 2026-11-10 on a OnePlus Pad 3 (Snapdragon 8 Elite, Adreno 830, driver 0
 
 - **Fixed: the GPU was lost at the first frame in the field.** One draw, vertex `2decd3e894b3736a` and fragment `26ae1640f3448ba4`, the vertical pass of a two-pass blur into a 640×360 RGBA8 target, hung the GPU every frame, and the driver's recovery gave up on one after 3 s (`vkQueueSubmit` -4). The cause was an earlier pass that binds that target alone in colour slot 5, with slots 0–4 empty. On Adreno 8xx such a pass now gets a scratch target in slot 0 (`DM_VK_SLOT0_FILL`, [rendering.md](../../../docs/reference/rendering.md#a-render-pass-with-colour-slot-0-empty-hangs-a-later-pass-on-the-adreno-830-android), [Android baselines](../../android/baselines.md) problem 14). The numbers below marked "draw skipped" were taken before that, with the draw skipped by a local test switch.
 - **Main with that fix and #108's defaults:** 30.0 fps in three runs, frame p50 33.2-33.3 ms / p95 37.9-38.4 ms, replay 17.4 ms, GPU 16.5-16.7 ms, no hang report.
-- **The picture is still wrong on the Pad 3 (open):** Link unlit and the room blurred, where the Odin 2 draws it right. The G-buffer passes bind one image in two colour slots (1 and 2, 3 and 4) and write only the first of each. A local test leaving the second slot unused draws the room right, so the Adreno 830 probably stores the unwritten copy over the written one (problem 15).
+- **Fixed: the picture was wrong on the Adreno 830.** On the Pad 3 and the Galaxy S25 Edge, Link was unlit and the room blurred, where the Odin 2 draws it right. The G-buffer passes bind one image in two colour slots (1 and 2, 3 and 4) and write only the first of each, and the 830 apparently stored the unwritten copy over the written one. A render pass now attaches each image once (`DM_VK_DUP_SLOTS`, [rendering.md](../../../docs/reference/rendering.md#one-image-in-two-colour-slots-of-a-pass-is-drawn-wrong-on-the-adreno-830-android), [Android baselines](../../android/baselines.md) problem 15).
+- **S25 Edge, main with that fix and BotW's defaults:** the Shrine drawn as on the Odin 2, 29.9 fps, frame p50 33.2 ms / p95 38.8-39.0 ms, GPU 20.5 ms (21.4 ms without the fix), no GPU hang. The Pad 3 has run only a local test of the same idea, which drew it right.
 - **Main, draw skipped:** 20 fps (hold 3). The replay takes 33.5 ms of CPU a frame, the GPU 22.3 ms, NVN submit+present 35.7 ms (p50).
 - **Steady 30 fps, draw skipped,** with these droidplay-core PRs:
   - descriptor sets bound again (droidplay-core#91): replay −1.3 ms, 87% of sets not written;
@@ -288,8 +289,6 @@ General host changes first needed here; each applies to every game:
 - **Resolved: type-compatible views read as not resident** (`tex_fit`): [Compatible views made from the texture under a view](../../../docs/reference/rendering.md#compatible-views-made-from-the-texture-under-a-view). Found by replaying the outdoors frame under shader validation; validation is clean after it, and the replayed digest without validation is unchanged.
 
 ## Open
-
-- **Android, OnePlus Pad 3: the Shrine of Resurrection is drawn dark and blurred** (Link unlit) where the Odin 2 draws it right: the G-buffer passes' duplicate colour slots ([Android](#android), [Android baselines](../../android/baselines.md) problem 15).
 
 - **1.6.0 (v786432): the corrupted picture of [issue #251](https://github.com/seedds/nxnative/issues/251) has another cause (current, open):** the 1.9.0 shader map lacks 178 keys that the 1.6.0 shaders use. Not retested after the crash fix.
 
