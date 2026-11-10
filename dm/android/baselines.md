@@ -190,6 +190,7 @@ Numbered in the order they were found, so links to a number stay right:
     - **Cause.** The 1280×720 G-buffer passes bind one image in two colour slots (1 and 2, 3 and 4) and write only the first of each pair (mask 0xf0f0ff). Each slot was its own attachment of the same view, loaded and stored. Vulkan leaves attachments that alias in one subpass undefined, and the 830 apparently stores the unwritten copy over the written one.
     - **Fix.** A render pass attaches each image once, on every GPU, and leaves its other slots unused (`DM_VK_DUP_SLOTS`, [rendering.md](../../docs/reference/rendering.md#one-image-in-two-colour-slots-of-a-pass-is-drawn-wrong-on-the-adreno-830-android)). About 18 passes a frame in the Shrine.
     - **Check** (S25 Edge, main 54e21235 with the fix and BotW's defaults, a warm-up and 2 runs each way): the Shrine is drawn as on the Odin 2, with no write lost. 29.9 fps, GPU 20.5 ms, against 21.4 ms without the fix. With `DM_VK_DUP_SLOTS=0` it is dark as before. On the Pad 3 only a local test of the same idea has run so far, and it drew the room right.
+    - **Not on the Adreno 840.** A Galaxy Z Fold 8 (Qualcomm's driver 0x8034a013, folded) draws the Shrine right either way: 23.7–23.9 fps, frame p95 47.8–48.1 ms, GPU 29.6 ms with the fix, against 23.1–23.3 fps, p95 48.2–48.3 ms, GPU 30.3 ms without it, no write lost.
 
 ## Reading the numbers
 

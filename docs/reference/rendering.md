@@ -1989,7 +1989,7 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   - A clear of a slot left unused clears the kept slot (`dup_slot`).
   - A later draw of the pass that writes a slot left unused and not the kept one loses that write. It is counted in the stats line, with a red line.
   - `DM_VK_DUP_SLOTS=0` attaches the image at every slot, as before.
-- **Check:** Breath of the Wild's `outdoors` save on a Galaxy S25 Edge (Adreno 830, Samsung's driver 0x80320001): the Shrine is drawn as on the Odin 2, with no write lost, and the GPU time drops from 21.4 to 20.5 ms. With `DM_VK_DUP_SLOTS=0` it is dark as before. On the Pad 3 a local test leaving the later slot of each pair unused drew it right too.
+- **Check:** Breath of the Wild's `outdoors` save on a Galaxy S25 Edge (Adreno 830, Samsung's driver 0x80320001): the Shrine is drawn as on the Odin 2, with no write lost, and the GPU time drops from 21.4 to 20.5 ms. With `DM_VK_DUP_SLOTS=0` it is dark as before. On the Pad 3 a local test leaving the later slot of each pair unused drew it right too. A Galaxy Z Fold 8 (Adreno 840) draws it right either way, and with the fix its GPU time drops from 30.3 to 29.6 ms.
 
 ### Pipeline keys built from the state objects' fields
 
