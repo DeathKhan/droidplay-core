@@ -291,6 +291,14 @@ Numbered in the order they were found, so links to a number stay right:
     - **Check** (S25 Edge, main 54e21235 with the fix and BotW's defaults, a warm-up and 2 runs each way): the Shrine is drawn as on the Odin 2, with no write lost. 29.9 fps, GPU 20.5 ms, against 21.4 ms without the fix. With `DM_VK_DUP_SLOTS=0` it is dark as before. On the Pad 3 only a local test of the same idea has run so far, and it drew the room right.
     - **Not on the Adreno 840.** A Galaxy Z Fold 8 (Qualcomm's driver 0x8034a013, folded) draws the Shrine right either way: 23.7–23.9 fps, frame p95 47.8–48.1 ms, GPU 29.6 ms with the fix, against 23.1–23.3 fps, p95 48.2–48.3 ms, GPU 30.3 ms without it, no write lost.
 
+16. **Fixed: Final Fantasy Resonance's first field had no flames on the Odin 2**: the pixel-art flames along the road were black holes, where the Pad 3 and the S25 Edge
+    drew them.
+    - Its 35 flame cards a frame (vertex shader `19274e72bf8f5d0d`) were binned nowhere. Qualcomm's Adreno 740 driver bins a pass with a position-only copy of
+      the vertex shader, and that copy read Unreal's clip matrix (c3 rows 0-3, constant indices) as garbage. Turnip (`DM_VK_DRIVER`) drew them.
+    - **Fix.** `spv_android.py` `pos_rows` (`ANDROID_CHAIN` 6) reads the rows a vertex shader's position is made of at run time ([rendering.md](../../docs/reference/rendering.md#a-vertex-shaders-position-lost-in-the-adreno-740s-binning-copy)).
+    - **Check:** FF from main `54e21235` and with the fix on the Odin 2, a warm-up and 2 runs each: the field at 42.1 / 42.2 fps on both (frame p50 23.7 ms), GPU 12.4–12.5 ms on main
+      and 13.3–13.4 ms with the fix, which shades the flames; `boot` 59.6–59.7 fps, GPU 1.82 ms on both. The flames drew in every run with the fix.
+
 ## Reading the numbers
 
 - **Cold pipelines.** Because of problem 5 (since fixed), every run here began without the driver binaries of the pipelines earlier runs made, most of all on
