@@ -71,6 +71,7 @@ file(GLOB_RECURSE VPX_C ${DM}/third_party/libvpx/*.c)
 set(DM_GFX vk CACHE STRING "NVN replay backend: vk or null")
 set(ANDROID_C
   ${CMAKE_CURRENT_SOURCE_DIR}/plat_android.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/pac_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/coreaudio_aaudio.c
   ${CMAKE_CURRENT_SOURCE_DIR}/media_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/haptics_android.c
