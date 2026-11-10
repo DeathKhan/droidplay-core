@@ -14,18 +14,18 @@ Update 1.0.1 (v65536) over the base game, SDK **20.5.19** (`nnSdk-20_5_19`, `Nin
 | `shader_groups /=romfs` | [`game.tsv`](game.tsv) | every shader is in `common.dat` at the RomFS root. See [Shaders](#shaders) |
 | `zip_store .dat:.metallib` | [`game.tsv`](game.tsv) | the archives' entries are zstd frames and Ogg streams already |
 
-The profile is the provisional one `scripts/build_ipa_from_nsp.py` made from the survey, unchanged but for its comments. Its shader tables come from the Liquid archive reader (enjoyerofslop/droidplay-core#138). `pso_manifest.tsv` is still the empty provisional list.
+The profile is the provisional one `scripts/build_ipa_from_nsp.py` made from the survey, unchanged but for its comments. Its shader tables come from the Liquid archive reader. `pso_manifest.tsv` is still the empty provisional list.
 
 ## Shaders
 
-- **Where:** 2,550 shaders in `common.dat`, found through `common.idx` and `common.str` by `shader_split.py`'s Liquid archive reader ("Shader files in Liquid Engine archives" in [docs/reference/shaders.md](../../../docs/reference/shaders.md), enjoyerofslop/droidplay-core#138). They are HLSL compiled for NVN, one stage per file (`shaders/compiled/<technique>/<hash>.<stage>_5_0`): 1,577 pixel, 833 vertex, 75 compute, 32 hull, 32 domain and 1 geometry.
+- **Where:** 2,550 shaders in `common.dat`, found through `common.idx` and `common.str` by `shader_split.py`'s Liquid archive reader ([Shader files in Liquid Engine archives](../../../docs/reference/shaders.md#shader-files-in-liquid-engine-archives)). They are HLSL compiled for NVN, one stage per file (`shaders/compiled/<technique>/<hash>.<stage>_5_0`): 1,577 pixel, 833 vertex, 75 compute, 32 hull, 32 domain and 1 geometry.
 - **Raw global memory:** all 1,108 shaders of the techniques `meshsolid` and `meshtranslucent` (539 vertex, 569 pixel; exactly those with a 0x88c-byte control section) read through raw global memory: `Global memory operation "Load" traced to no storage buffer: it goes through the memory pool table`. The Mac's `gmem_map` serves them. Android has no such table yet. See [Android](#android).
 - **Mac, current:** 2,548 of 2,550 translate. The two `meshsolid` domain shaders `1ff1e13a5d5f963b` and `529b32dc47755a08` fail Metal's compile: `'attribute' index '30' is used more than once`. At run time, 40 pixel shaders (the SMAA passes among them) log `reflection conversion failed: B binding fp_t_tcb_15A has no resolved slot number` (also `15C`, `15E`): texture handles read from c1 at 0x5A-0x68 that the translator's queries had no answer for. Nothing wrong was seen in the picture.
 - **Android, current:** 2,486 translate, none fail. The 64 hull and domain shaders are not on the Vulkan path yet (draws with them would count as `shader missing`; the city view counted none).
 
 ## Boot
 
-- **Resolved:** the game crashed on its `Renderer` thread about 7 s into loading, before its first frame, on the Mac and on Android: `CRASH sig=11 pc=main+0x1aa90ac lr=main+0x1aa8a70`. Its renderer sizes a 32-slot per-stage binding table to min(device items 0x5E, 0x5F) (`main+0x1aa68d4`) and clears that many slots every frame (`main+0x762f50`). The host answered 0x5F with 4096, so it cleared 128 slots. Fixed by answering 32 ("Separate sampler bindings per stage" in [docs/reference/nvn-objects.md](../../../docs/reference/nvn-objects.md), enjoyerofslop/droidplay-core#137).
+- **Resolved:** the game crashed on its `Renderer` thread about 7 s into loading, before its first frame, on the Mac and on Android: `CRASH sig=11 pc=main+0x1aa90ac lr=main+0x1aa8a70`. Its renderer sizes a 32-slot per-stage binding table to min(device items 0x5E, 0x5F) (`main+0x1aa68d4`) and clears that many slots every frame (`main+0x762f50`). The host answered 0x5F with 4096, so it cleared 128 slots. Fixed by answering 32 ([Separate sampler bindings per stage](../../../docs/reference/nvn-objects.md#separate-sampler-bindings-per-stage)).
 - **Loading:** about 30 s from launch to the title screen on the S25 Edge. After "A New Home", the loading screen shows the controls, then the intro movie plays (B skips it), then the scenario's story screen.
 
 ## Audio
@@ -39,7 +39,7 @@ The profile is the provisional one `scripts/build_ipa_from_nsp.py` made from the
 
 ## Android
 
-- **Tested 2026-11-10 on a Samsung Galaxy S25 Edge** (Adreno 830, Samsung's driver 0x80320001, Android 16), from DroidPlay Core main `648a3758` with #137, #138 and #139, on the touch controls with live adb input.
+- **Tested 2026-11-10 on a Samsung Galaxy S25 Edge** (Adreno 830, Samsung's driver 0x80320001, Android 16), from DroidPlay Core main `648a3758` with the fixes of enjoyerofslop/droidplay-core#137, #138 and #139 applied, on the touch controls with live adb input.
 - **Route:** the title, A New Home, the intro movie, the story screen, the first two messages, then about two minutes in the city: the camera moved with the stick, the zoom on the 3D layout's right side, the Command Hub and the build radial opened.
 - **Frame rate:** 30 fps throughout:
 
@@ -58,8 +58,8 @@ The profile is the provisional one `scripts/build_ipa_from_nsp.py` made from the
 
 ## Found on this game
 
-- The boot crash, item 0x5F of `nvnDeviceGetInteger`: enjoyerofslop/droidplay-core#137.
-- Shader files in Liquid Engine archives: enjoyerofslop/droidplay-core#138.
+- [Separate sampler bindings per stage](../../../docs/reference/nvn-objects.md#separate-sampler-bindings-per-stage): the boot crash, item 0x5F of `nvnDeviceGetInteger`.
+- [Shader files in Liquid Engine archives](../../../docs/reference/shaders.md#shader-files-in-liquid-engine-archives).
 - `cb_extents` stopped the Android shader build on a Private register's initializer (12 pixel shaders): enjoyerofslop/droidplay-core#139.
 
 ## Open
