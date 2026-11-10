@@ -180,6 +180,8 @@ def header_one(g):
     if et not in ('on', 'off'): sys.exit(f'{g.id}: enc_thread must be on or off: {et}')
     cp = g.get('core_preempt', 'off')   # same-core preemption approximation (hle_thread.c): on / off
     if cp not in ('on', 'off'): sys.exit(f'{g.id}: core_preempt must be on or off: {cp}')
+    nlb = g.get('net_loopback', 'off')   # UDP between the game's own sockets on 127.0.0.1 (hle_loopback.c; DM_NET_LOOPBACK overrides): on / off
+    if nlb not in ('on', 'off'): sys.exit(f'{g.id}: net_loopback must be on or off: {nlb}')
     aba = g.get('alloc_big_align', 'off')   # nn::mem::StandardAllocator::Allocate aligns blocks of 64 KB or more to 64 KB (hle_os.c; Vanillaware's memory pool storage): on / off
     if aba not in ('on', 'off'): sys.exit(f'{g.id}: alloc_big_align must be on or off: {aba}')
     sf = g.get('shared_font', 'bfttf')   # what the shared-font address points at (hle_sdk16.c): bfttf = 8-byte header + TTF, ttf = the TTF alone
@@ -244,6 +246,7 @@ def header_one(g):
          f'#define DM_GAME_PRESENT_DISPLAY {int(pi == "display")}',
          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
          f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
+         f'#define DM_GAME_NET_LOOPBACK {int(nlb == "on")}',
          f'#define DM_GAME_FPS_TARGET {int(ft)}',
          f'#define DM_GAME_FPS_MAX {int(fm)}',
          f'#define DM_GAME_FPS_HOLD {int(fh == "on")}',

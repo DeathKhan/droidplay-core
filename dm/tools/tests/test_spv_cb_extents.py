@@ -120,7 +120,7 @@ class CbExtents(unittest.TestCase):
         cls.tmp = Path(tempfile.mkdtemp())
         cls.lib = None
         if CC:   # the host's scans, out of gfx_vk_draw.inc
-            src = (REPO / 'dm/android/gfx_vk_draw.inc').read_text(encoding='utf-8')
+            src = (REPO / 'dm/android/gfx_vk_draw.inc').read_text(encoding='utf-8') + (REPO / 'dm/android/spv_lit.h').read_text(encoding='utf-8')   # spv_lit moved to its own header (#92)
 
             def fn(sig, one_line=False):
                 a = src.index(sig); return src[a:src.index('\n', a) + 1] if one_line else src[a:src.index('\n}\n', a) + 3]

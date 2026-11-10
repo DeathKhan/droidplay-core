@@ -35,19 +35,21 @@ static int vk_mesh_draw_(const p_draw *dw) {
     g_drawing = 1;
     pipe_key_build(&k, DM_PRIM_MESH_TASKS);   // the mesh shader reads no vertex attribute (io_in 0): the key has none
     pipe_t *pp = pipe_get(&k); if (!pp) { g_drop[2]++; g_mesh_nopipe++; return 0; }
-    VkDescriptorSet sets[4] = {0};
+    VkDescriptorSet sets[4] = {0}; uint32_t dyn[4][18];   // dyn: each stage's dynamic offsets (stage_set, set reuse)
     for (int t = 0;; t++) {   // as vk_draw_: every stage again from the chunk recorded now when a sync inside stage_set closed the one the sets came from
-        uint64_t dseq = 0; int i = 0; g_bind_bad = 0;
-        for (; i < 4; i++) if (k.sh[i]) { if (!(sets[i] = ds_get(k.sh[i], 0))) break; if (!dseq) dseq = C->seq; if (!stage_set(k.sh[i], sets[i], pprog[i], pst[i], 0, dseq)) break; }
+        int i = 0; g_bind_bad = 0;
+        if (!cur()) { g_drop[3]++; return 0; }
+        uint64_t dseq = C->seq;
+        for (; i < 4; i++) if (k.sh[i] && !stage_set(k.sh[i], 0, &sets[i], dyn[i], pprog[i], pst[i], 0, dseq)) break;
         if (i == 4) break;
-        if (!sets[i] || !ds_moved(dseq) || ds_again(t, 0)) { g_drop[3]++; return 0; }
+        if (!ds_moved(dseq) || ds_again(t, 0)) { g_drop[3]++; return 0; }
     }
     if (g_bind_bad) { g_drop[4]++; static int nb; if (nb < 10) { nb++; LOG("[RED] [vk] task / mesh draw skipped: a binding has no valid descriptor (task %s mesh %s fragment %s)", k.sh[2] ? k.sh[2]->key : "-", k.sh[0]->key, k.sh[1] ? k.sh[1]->key : "-"); } return 0; }
     if (!rp_start()) { g_drop[5]++; return 0; }
     VkCommandBuffer c = C->cb;
     occl_begin();
     bf_pipeline(c, pp->p);
-    for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], 0, NULL);
+    for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], k.sh[i]->ndyn, dyn[i]);
     VkViewport v; VkRect2D sc; draw_dyn_state(c, &v, &sc); (void)v; (void)sc;
     // a task shader's workgroups are the draw's; with none, the mesh shader's. Past the device's X limit (65,535 on the Adreno 840) the draw goes in parts, each with its own first
     uint32_t first = (uint32_t)dw->first, left = (uint32_t)dw->count, mx = g_mesh_max[k.sh[2] ? 0 : 1];
