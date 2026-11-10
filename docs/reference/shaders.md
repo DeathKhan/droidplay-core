@@ -846,6 +846,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - Integer textures and images read and written through float declarations (an `RGBA8_UINT` texture read by `texture3d<float>` and bit-cast, `R16_UINT` / `R32_UINT` buffers through `texture_buffer<float>`, integer stores into a float-declared `texture3d` image) were checked on an Apple GPU: all keep the integer bits, so they need no facts.
 - **Found on:** [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (the volumetric lightmap's indirection texture, the light grid buffers).
 
+### Texture array layers keep integer locals
+
+- **Symptom:** a material's array layers all return layer 0's sample, although the bound image view has every layer. On an Adreno, Ocarina of Time's three lightmap layers read the first, and its lighting came out much brighter before bloom.
+- **Cause:** `StructuredProgram.GetVarTypeFromUses` types a copied or selected local by the instruction table's type for its first use, and the table gives FP32 for every `TextureSample` source, the integer array layer too. A layer picked by `MOV 1` or `MOV 2` on two paths went through float locals as the bit patterns 1 and 2 (denormals), bit-cast back to an integer before the sample converts it. The SPIR-V has no relaxed precision on that path and every step keeps the bits, but Adreno's large fragment pipelines read the converted layer as 0 (a compute shader with the same steps did not), so this is a driver's path, not a general rule.
+- **Fix:** `GetSourceVarType` types the layer source of a `TextureSample` on an array texture S32, at the index `GenerateSampledImageLoad` and `GenerateTextureSample` read it from: after the texture's and a separate sampler's descriptor-array indices, the texture's coordinates. The locals keep the integer up to the conversion at the sample; other sources keep the table's types. A chain change: `StructuredProgram.cs` is in the chain's fingerprint (`dmsh_chain.py`), and Android's `ANDROID_CHAIN` 6 translates its older outputs again.
+- **Check:** `DMSH_TEST_XLATE=<translator> python3 -m unittest dm/tools/tests/test_texture_layer_type.py`: the old translator writes the two layers as the floats `2.8e-45` and `1.4e-45`.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on Android, by DeathKhan's nx2android fork ([5164b63](https://github.com/DeathKhan/nx2android/commit/5164b63d07bc3613c2fba4beb4d4817ddd11a476)). Not seen on the Mac.
+
 ### Integer-typed vertex inputs fed normalized formats
 
 - **Symptom:** `failed to create render pipeline … Cannot convert attribute …`; draws missing (a pipeline that fails to build).
