@@ -179,7 +179,8 @@ typedef struct { int kind; uint64_t h; } dead_t;
 typedef struct { uint64_t src, dst, n; uint32_t value; int fill; } cop_t;   // a large buffer copy or fill, done by the completion thread in its place in the queue   // kind 1 image view, 2 framebuffer, 3 image, 4 device memory
 // One chunk's descriptor sets of one set layout (a shader's dsl or dsl_tf; gfx_vk_draw.inc ds_get): s[0, used) handed out while the chunk records, s[used, n) free again
 typedef struct ds_list { VkDescriptorSet *s; int n, used, cap; } ds_list;
-enum { CR_MAX = 160 };   // a chunk's breadcrumbs (crumb): its passes, draws (at most MID_DRAWS) and dispatches, the last 160 kept
+enum { CR_MAX = 1280 };   // a chunk's breadcrumbs (crumb): its passes, draws and dispatches, the last 1280 kept: a chunk of DM_VK_MID_DRAWS=512 (Breath of the Wild) with a pass each, and its
+                         // dispatches (160 kept only the last 160 of such a chunk, which could leave out the draw that hung). About 40 KB a chunk
 typedef struct chunk {
     VkCommandPool pool; VkCommandBuffer cb; VkFence fence; int open, busy, ts, ndraw, held; uint64_t seq, nvn_fence, hold;
     int qd, td, pd, sd;   // queries of qp / tq / pq written since their last reset, [0, n): reset in the command buffer when the chunk next begins; sd: its two g_tsq slots (Query resets below)
@@ -454,7 +455,7 @@ static uint64_t g_flushes;
 // had nothing to say there (no address, no vendor record: a hang, not a page fault), so the log names what the chunk recorded instead (crumb): the GPU runs the chunks in
 // order, the one before had completed, and the chunk it was in is the first that took over GPU_SLOW_NS. Breath of the Wild's named one draw every time, once the
 // chunks were cut after every draw (a file vk_mid holding 1, mid_poll). At most 3 such chunks are logged, and the first lost fence or submission says what VK_EXT_device_fault gives
-enum { GPU_SLOW_NS = 200000000 };   // a chunk this long on the GPU (64 draws at most) is a hang or as good as one
+enum { GPU_SLOW_NS = 200000000 };   // a chunk this long on the GPU (64 draws by default, 512 with DM_VK_MID_DRAWS=512) is a hang or as good as one
 static void gpu_fault_log(VkResult r) {   // once, from whichever thread sees the loss first
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
     if (!g_fault_info) { LOG("[RED] [vk] the GPU was lost (%d); the driver offers no VK_EXT_device_fault to say why", r); return; }
@@ -482,10 +483,16 @@ static void gpu_slow(chunk *c, VkResult fr, uint64_t ns, int cut) {
     nrep++; int n = c->ncr < CR_MAX ? c->ncr : CR_MAX;
     LOG("[RED] [vk] submission %llu took %.0f ms on the GPU%s%s (the one before had completed): it recorded %d passes, draws and dispatches, the last %d of them:", (unsigned long long)c->seq, ns / 1e6,
         cut ? ", its end timestamp never written (the driver's hang recovery cut it short)" : "", fr == VK_ERROR_DEVICE_LOST ? ", and its fence reports the device lost" : "", c->ncr, n);
-    for (int k = 0; k < n; k++) { int i = (c->ncr - n + k) % CR_MAX; char kd = c->cr[i].kind; int at = c->ncr - n + k;
-        if (kd == 'p') LOG("[vk]   %d: pass %u x %u", at, c->cr[i].n, c->cr[i].m);
-        else if (kd == 'c' || kd == 'C') LOG("[vk]   %d: %sdispatch, compute %s, %u x %u groups", at, kd == 'C' ? "indirect " : "", c->cr[i].a, c->cr[i].n, c->cr[i].m);
-        else LOG("[vk]   %d: %sdraw, vertex %s fragment %s, %u vertices x %u instances", at, kd == 'D' ? "indirect " : "", c->cr[i].a, c->cr[i].b ? c->cr[i].b : "-", c->cr[i].n, c->cr[i].m); }
+    for (int k = 0; k < n;) {   // a run of the same crumb (Breath of the Wild's chunks hold runs of 17 alike draws) is one line, "× run"
+        int i = (c->ncr - n + k) % CR_MAX, run = 1; char kd = c->cr[i].kind; int at = c->ncr - n + k;
+        while (k + run < n) { int j = (c->ncr - n + k + run) % CR_MAX;
+            if (c->cr[j].kind != kd || c->cr[j].a != c->cr[i].a || c->cr[j].b != c->cr[i].b || c->cr[j].n != c->cr[i].n || c->cr[j].m != c->cr[i].m) break;
+            run++; }
+        char x[24] = ""; if (run > 1) snprintf(x, sizeof x, " (x %d, to %d)", run, at + run - 1);
+        if (kd == 'p') LOG("[vk]   %d: pass %u x %u%s", at, c->cr[i].n, c->cr[i].m, x);
+        else if (kd == 'c' || kd == 'C') LOG("[vk]   %d: %sdispatch, compute %s, %u x %u groups%s", at, kd == 'C' ? "indirect " : "", c->cr[i].a, c->cr[i].n, c->cr[i].m, x);
+        else LOG("[vk]   %d: %sdraw, vertex %s fragment %s, %u vertices x %u instances%s", at, kd == 'D' ? "indirect " : "", c->cr[i].a, c->cr[i].b ? c->cr[i].b : "-", c->cr[i].n, c->cr[i].m, x);
+        k += run; }
 }
 // Submit the current chunk (an empty one too: its fence then follows the earlier ones); nvn_fence: the NVN fence it completes. → its sequence number, 0 if none
 static uint64_t chunk_submit(uint64_t nvn_fence) {
