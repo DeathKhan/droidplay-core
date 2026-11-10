@@ -129,7 +129,26 @@ typedef struct {
     ds_list *dsf;   // its descriptor sets kept by each chunk, [2 chunk + tf] (dsl, dsl_tf): made at its first set (ds_get), never freed (as the shader)
     uint32_t ndesc;   // descriptors in dsl, an array's counted up to 1024 (what stage_set writes of it): DM_VK_SET_STATS=1 checks each stage_set writes them all
     uint8_t dsbig;   // bit tf: one set of its layout (dsl, dsl_tf) did not fit an empty pool (ds_alloc_n, RED 93): ds_get gives none for it, without making another pool
+    uint8_t cbdyn[18], ndyn;   // set_reuse: cb[i] a dynamic uniform buffer, its offset at cbdyn[i] of the bind's (0xff: a plain one, its offset in the set); ndyn of them
 } vshader;
+// Descriptor sets bound again instead of written again (stage_set, sr_find). Every draw copies its constant buffers to new arena offsets, so a set holding those offsets
+// never matched the draw before, and stage_set wrote every set of every stage: Breath of the Wild about 7,500 a frame, vkUpdateDescriptorSets 3.4 ms a frame of the
+// replay on an Ayn Odin 2. With the constant buffers dynamic uniform buffers, their offsets go to vkCmdBindDescriptorSets, and what a set holds (buffer, range, views,
+// samplers) repeats from draw to draw: a set already written with the same descriptors in this recording is bound again. The same design as nx2android's dynamic uniform
+// buffers and per-submission set cache (9013fc9, 2b7e2a1), BOTWRecompAndroid's (7cdb67e, 37aaefe) and triasbrata's nxnative-android (DM_VK_STAGE_REUSE), written anew here.
+// A shader has at most maxDescriptorSetUniformBuffersDynamic / 2 of them (a pipeline layout's limit covers all its sets: the vertex and fragment shaders' halves), compute
+// all it can take, a geometry shader none; the rest stay plain, their offsets part of the set. Binding 0 (the support buffer) stays plain: it is unwritten in most sets.
+// DM_VK_SET_REUSE=1 (env.txt, or a game's android_defaults.txt): on. Off by default (plain uniform buffers and a write for every set, as before): it changes every shader's set
+// layout, so each device's pipeline cache and start-up list miss once, and dynamic uniform buffers have run only on the Pad 3's Adreno 830 so far
+static int set_reuse(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SET_REUSE"); v = e && *e == '1'; if (v) LOG("[vk] DM_VK_SET_REUSE=1: dynamic uniform buffers, and a descriptor set written in the chunk is bound again"); } return v; }
+static void sh_dyn(vshader *s) {   // which constant buffers are dynamic (cbdyn, ndyn): the first that fit, offsets ordered by binding as vkCmdBindDescriptorSets takes them
+    memset(s->cbdyn, 0xff, sizeof s->cbdyn); s->ndyn = 0;
+    uint32_t lim = g_vk.props.limits.maxDescriptorSetUniformBuffersDynamic, n = s->stage == SH_CS ? lim : s->stage == SH_VS || s->stage == SH_PS ? lim / 2 : 0;
+    if (!set_reuse()) n = 0;
+    if (n > (uint32_t)s->ncb) n = (uint32_t)s->ncb;
+    for (uint32_t i = 0; i < n; i++) { int r = 0; for (uint32_t j = 0; j < n; j++) r += s->cb[j].binding < s->cb[i].binding; s->cbdyn[i] = (uint8_t)r; }
+    s->ndyn = (uint8_t)n;
+}
 static nvn_hmap g_sh = {.klen = 16};
 static char g_spv_dir[512];
 static int g_depth_zero, g_origin_ll = 1, g_queue_ll;   // g_queue_ll: the queue's raster flip, captured when it was initialized (mtl_set_queue_origin_lower_left); winding = front ^ queue, as Metal's draws
@@ -459,7 +478,8 @@ static vshader *sh_get(const char *key) {
     // the set's layout: support buffer, constant buffers, storage buffers, textures, images
     VkDescriptorSetLayoutBinding b[1 + CB_MAX + 16 + 64 + 16 + 4]; uint32_t nb = 0;
     b[nb++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
-    for (int i = 0; i < s->ncb; i++) b[nb++] = (VkDescriptorSetLayoutBinding){(uint32_t)s->cb[i].binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
+    sh_dyn(s);
+    for (int i = 0; i < s->ncb; i++) b[nb++] = (VkDescriptorSetLayoutBinding){(uint32_t)s->cb[i].binding, s->cbdyn[i] != 0xff ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
     for (int i = 0; i < s->nsb; i++) b[nb++] = (VkDescriptorSetLayoutBinding){(uint32_t)s->sb[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
     for (int i = 0; i < s->ntx; i++) b[nb++] = (VkDescriptorSetLayoutBinding){(uint32_t)s->tx[i].binding, tex_dtype(&s->tx[i], 0), (uint32_t)(s->tx[i].array > 1 ? s->tx[i].array : 1), (VkShaderStageFlags)s->vkstage, NULL};
     for (int i = 0; i < s->nim; i++) b[nb++] = (VkDescriptorSetLayoutBinding){(uint32_t)s->im[i].binding, tex_dtype(&s->im[i], 1), (uint32_t)(s->im[i].array > 1 ? s->im[i].array : 1), (VkShaderStageFlags)s->vkstage, NULL};
@@ -1149,7 +1169,7 @@ static int rp_start(void) {
     VkCommandBuffer c = cb(); if (!c) return 0;
     VkRenderPassBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = P.rp, .framebuffer = P.fb, .renderArea = {{0, 0}, {P.w, P.h}}};
     if (prof_on()) prof_pass_begin();
-    vkCmdBeginRenderPass(c, &bi, VK_SUBPASS_CONTENTS_INLINE); bf_reset();
+    vkCmdBeginRenderPass(c, &bi, VK_SUBPASS_CONTENTS_INLINE); bf_reset(); crumb('p', NULL, NULL, P.w, P.h);
     P.active = 1; g_passes++;
     return 1;
 }
@@ -1598,7 +1618,7 @@ static int ds_recycle(void) {   // the switches, read once (chunks_init: before 
 }
 static uint64_t g_ds_got, g_ds_reused, g_ds_made, g_ds_calls, g_ds_checked, g_ds_short; static _Atomic uint64_t g_ds_resets;   // sets handed out, of them from a list's free ones; sets made, in calls; DM_VK_SET_STATS
 static int ds_pool_add(void) {   // a new pool for the current chunk
-    VkDescriptorPoolSize sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16384}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
+    VkDescriptorPoolSize sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16384}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 16384}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
     VkDescriptorPoolCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2048, .poolSizeCount = sizeof sz / sizeof *sz, .pPoolSizes = sz};
     if (C->ndp == C->cdp) { C->cdp = C->cdp ? 2 * C->cdp : 4; C->dp = realloc(C->dp, C->cdp * sizeof *C->dp); }
@@ -2002,9 +2022,43 @@ static int c1_memo(const prog_t *pr, int st, uint32_t *o, uint32_t *e) {
     return -1;
 }
 static int has_c1(const vshader *s) { for (int i = 0; i < s->ncb; i++) if (s->cb[i].slot == 1) return 1; return 0; }
-// dseq: the chunk set came from (ds_get's C->seq): nothing is written once another is recorded (ds_moved), and the caller tells that 0 from another failure by ds_moved
-static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog_stage, uint32_t base_inst, uint64_t dseq) {
+// ---- Sets written in this recording, by what they hold (set_reuse) ----
+// Direct-mapped by a hash of the layout and the descriptors (binding, type, count, then each buffer, offset and range, sampler and view, or texel buffer view; a dynamic
+// buffer's offset is 0 there), compared whole on a hit. An entry holds only while its recording does (seq): a set is one chunk's, written once in a recording and free again
+// once that chunk completes (ds_get), so it is bound again only in the command buffer it was written for. A view or image dropped while a chunk records is destroyed only
+// once that chunk completes (dead_add), so a handle in an entry names the same object for the whole recording. Sets of the capture variant (dsl_tf) are not kept: tf_capture
+// writes the feedback buffers into the set after stage_set. A set too large to describe in SR_SIG words is written every time
+enum { SR_N = 4096, SR_SIG = 2048 };
+typedef struct { uint64_t seq, h; VkDescriptorSetLayout l; VkDescriptorSet set; uint32_t n, cap; uint64_t *sig; } sr_ent;
+static sr_ent g_sr[SR_N]; static uint64_t g_sig[SR_SIG], g_sig_h; static uint32_t g_nsig;   // the description sr_find made last, for sr_put
+static uint64_t g_sr_hit, g_sr_miss, g_sr_long;   // sets bound again; written and kept; too large to keep (cumulative)
+// the entry for layout l holding wr's descriptors (their sets not named yet) → *hit 1 when it holds a set so written in this recording; NULL when too large to describe
+static sr_ent *sr_find(VkDescriptorSetLayout l, const VkWriteDescriptorSet *wr, uint32_t nw, int *hit) {
+    uint32_t n = 0; *hit = 0;
+    for (uint32_t i = 0; i < nw; i++) { const VkWriteDescriptorSet *w = &wr[i]; uint32_t k = w->descriptorCount;
+        if (n + 1 + 3 * k > SR_SIG) { g_sr_long++; return NULL; }
+        g_sig[n++] = (uint64_t)w->dstBinding << 40 | (uint64_t)w->descriptorType << 20 | k;
+        for (uint32_t j = 0; j < k; j++) {
+            if (w->pBufferInfo) { g_sig[n++] = (uint64_t)w->pBufferInfo[j].buffer; g_sig[n++] = w->pBufferInfo[j].offset; g_sig[n++] = w->pBufferInfo[j].range; }
+            else if (w->pImageInfo) { g_sig[n++] = (uint64_t)w->pImageInfo[j].sampler; g_sig[n++] = (uint64_t)w->pImageInfo[j].imageView; }   // every image is in GENERAL
+            else g_sig[n++] = (uint64_t)w->pTexelBufferView[j]; } }
+    uint64_t h = (uint64_t)l * 0x9e3779b97f4a7c15ull;
+    for (uint32_t i = 0; i < n; i++) h = (h ^ g_sig[i]) * 0xff51afd7ed558ccdull;
+    h ^= h >> 29; g_sig_h = h; g_nsig = n;
+    sr_ent *e = &g_sr[(h ^ h >> 32) & (SR_N - 1)];
+    *hit = e->seq == C->seq && e->l == l && e->h == h && e->n == n && !memcmp(e->sig, g_sig, n * sizeof *g_sig);
+    return e;
+}
+static void sr_put(sr_ent *e, VkDescriptorSetLayout l, VkDescriptorSet set) {   // set written with sr_find's last description, in this recording
+    if (e->cap < g_nsig) { uint32_t c = g_nsig < 64 ? 64 : g_nsig; uint64_t *x = realloc(e->sig, c * sizeof *x); if (!x) { e->seq = 0; return; } e->sig = x; e->cap = c; }
+    memcpy(e->sig, g_sig, g_nsig * sizeof *g_sig); e->n = g_nsig; e->h = g_sig_h; e->l = l; e->set = set; e->seq = C->seq;
+}
+// The set of shader s's stage for the draw being made into *pset, and the offsets of its dynamic uniform buffers into dyn (s->ndyn of them, by binding): a set written with
+// the same descriptors in this recording (sr_find), else one from the chunk (ds_get; tf: of dsl_tf) written here. dseq: the chunk recorded when the draw's first stage began
+// (C->seq after cur()): nothing is written or taken once another is recorded (ds_moved), and the caller tells that 0 from another failure by ds_moved
+static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, const prog_t *pr, int prog_stage, uint32_t base_inst, uint64_t dseq) {
     int nst = nvn_stage_of(s->stage);
+    VkDescriptorSet set = VK_NULL_HANDLE; *pset = VK_NULL_HANDLE;   // the writes name their set once it is known (below)
     // one write per binding; every element of an array is written (an unwritten descriptor is undefined)
     VkWriteDescriptorSet wr[1 + CB_MAX + 16 + 64 + 16]; VkDescriptorBufferInfo bi[1 + CB_MAX + 16]; VkDescriptorImageInfo *ii; VkBufferView *bvs; uint32_t nw = 0, nbi = 0, nii = 0, nbv = 0;
     uint8_t c2buf[C2_SIZE]; const uint8_t *c2 = c2_bank(nst, c2buf);   // NULL: handle words read with c2_word, the whole bank made only for a c2 constant buffer (below)
@@ -2053,7 +2107,9 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
             memset(d + n, 0, q - n); for (; q + 4 <= aa; q += 4) memcpy(d + q, &nan, 4);
             al = aa; g_ext_checked++;
         } else if (!ucopy(src, n, al, &b, &off)) return 0;
-        bi[nbi] = (VkDescriptorBufferInfo){b, off, al}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)s->cb[i].binding, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, &bi[nbi++], NULL};
+        int dy = s->cbdyn[i] != 0xff; if (dy) dyn[s->cbdyn[i]] = (uint32_t)off;   // a dynamic one's offset goes to the bind, its descriptor at 0
+        bi[nbi] = (VkDescriptorBufferInfo){b, dy ? 0 : off, al};
+        wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)s->cb[i].binding, 0, 1, dy ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, &bi[nbi++], NULL};
     }
     for (int i = 0; i < s->nsb; i++) {   // the address in c0 at the translator's offset names one of the bound storage buffers
         // where the address is (dmsh_build.py reflect): c0's storage buffer table of the stage, compute's uniform buffer table (c0 + 0x210 + 16 r: a uniform buffer read through
@@ -2164,14 +2220,22 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
         else { wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)t->binding, 0, (uint32_t)cnt, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[nii], NULL, NULL}; nii += cnt; }
     }
     pthread_mutex_unlock(&g_reg_mu);
-    // a vt_get above synced and closed the set's chunk (ds_moved): its completion may have handed the set out again or reset its pools (past g_ds_cap: the set freed), so it
-    // is not written; the caller takes another from the chunk recorded now. Nothing past here closes a chunk
+    // a vt_get above synced and closed the draw's chunk (ds_moved): the sets of its earlier stages came from that chunk, whose completion may have handed them out again or
+    // reset its pools (past g_ds_cap: the sets freed), so nothing is taken or written; the caller takes every stage's again from the chunk recorded now. Nothing past here
+    // closes a chunk (ds_get only takes cur(), the chunk dseq names)
     if (ds_moved(dseq)) { if (own) { free(ii); free(bvs); } return 0; }
     if (g_ds_stats) {   // every descriptor of the layout written (binding 0 only where it is used): a set handed out again (ds_get) must keep none of an earlier draw's
         uint32_t nd = 0; for (uint32_t i = 0; i < nw; i++) nd += wr[i].descriptorCount;
         g_ds_checked++; if (nd + (s->b0 || !support_skip() ? 0u : 1u) != s->ndesc && g_ds_short++ < 16) LOG("[RED] [vk] shader %s: its descriptor set written with %u of its layout's %u descriptors", s->key, nd, s->ndesc); }
+    // the chunk dseq names, still recorded: with DM_VK_SET_RECYCLE=0 ds_moved is always 0, and a sync inside stage_set may have closed it (C NULL, or another chunk)
+    int hit = 0; sr_ent *e = !tf && set_reuse() && C && C->seq == dseq ? sr_find(s->dsl, wr, nw, &hit) : NULL;
+    if (hit) { *pset = e->set; g_sr_hit++; if (own) { free(ii); free(bvs); } return 1; }
+    if (!(set = ds_get(s, tf))) { if (own) { free(ii); free(bvs); } return 0; }
+    for (uint32_t i = 0; i < nw; i++) wr[i].dstSet = set;
     vkUpdateDescriptorSets(g_vk.dev, nw, wr, 0, NULL);
     if (own) { free(ii); free(bvs); }
+    if (e) { sr_put(e, s->dsl, set); g_sr_miss++; }
+    *pset = set;
     return 1;
 }
 
@@ -2335,11 +2399,11 @@ static int tf_capture(vshader *vs, const prog_t *pr, int pst, const p_draw *dw, 
     memcpy(k.attr, D.attr, sizeof k.attr); memcpy(k.stream, D.stream, sizeof k.stream);
     pipe_t *pp = pipe_get(&k); if (!pp) return 0;
     g_drawing = 1;
-    VkDescriptorSet set;
+    VkDescriptorSet set; uint32_t dyn[18];
     for (int t = 0;; t++) {   // t 1: the set taken again from the chunk recorded now when a sync inside stage_set closed the one it came from (ds_moved), before any feedback buffer is queued
-        g_bind_bad = 0; set = ds_get(vs, 1); uint64_t dseq = C ? C->seq : 0;
-        if (set && stage_set(vs, set, pr, pst, (uint32_t)dw->base_instance, dseq)) break;
-        if (!set || !ds_moved(dseq) || ds_again(t, 1)) return 0;
+        g_bind_bad = 0; if (!cur()) return 0; uint64_t dseq = C->seq;
+        if (stage_set(vs, 1, &set, dyn, pr, pst, (uint32_t)dw->base_instance, dseq)) break;
+        if (!ds_moved(dseq) || ds_again(t, 1)) return 0;
     }
     if (g_bind_bad) return 0;
     VkDescriptorBufferInfo bi[4]; VkWriteDescriptorSet wr[4]; uint32_t nw = 0;   // from here to the bind nothing closes a chunk (ar_alloc, wb_add and cb take cur())
@@ -2355,7 +2419,7 @@ static int tf_capture(vshader *vs, const prog_t *pr, int pst, const p_draw *dw, 
     VkRenderPassBeginInfo rb = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g_null_rp, .framebuffer = g_null_fb, .renderArea = {{0, 0}, {1, 1}}};
     vkCmdBeginRenderPass(c, &rb, VK_SUBPASS_CONTENTS_INLINE); bf_reset();   // its pipeline, viewport and scissor are set behind the bind filter (bf_*): unknown to it
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->p);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, 0, 1, &set, 0, NULL);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, 0, 1, &set, vs->ndyn, dyn);
     VkViewport v = {0, 0, 1, 1, 0, 1}; VkRect2D sc = {{0, 0}, {1, 1}}; vkCmdSetViewport(c, 0, 1, &v); vkCmdSetScissor(c, 0, 1, &sc);
     int ok = bind_vbufs(c, vs, dw->first, (int64_t)dw->first + dw->count, (uint32_t)dw->base_instance, 1);
     if (ok) vkCmdDraw(c, (uint32_t)dw->count, 1, 0, (uint32_t)dw->base_instance);   // gl_VertexIndex counts from 0: the vertex buffers start at the first vertex
@@ -2552,19 +2616,21 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     pipe_t *pm = pso_memo_find(k.sh, prim), *pp = pm;   // the draw before's pipeline when nothing its key takes has changed (pso_memo_find); NULL: the key is built
     if (!pm || pso_check()) { pipe_key_build(&k, prim); pp = pipe_get(&k); if (!pp) { g_drop[2]++; return 0; } pso_memo_note(&k, prim, pp, pm); }
     uint32_t base_inst = (uint32_t)(dw ? dw->base_instance : di->base_instance);
-    VkDescriptorSet sets[4] = {0};
+    VkDescriptorSet sets[4] = {0}; uint32_t dyn[4][18];   // dyn: each stage's dynamic offsets (stage_set)
     for (int t = 0;; t++) {   // t 1: every stage again from the chunk recorded now when a sync inside stage_set closed the one the sets came from (ds_moved)
-        uint64_t dseq = 0; int i = 0; g_bind_bad = 0;   // dseq: the chunk the sets came from (one: nothing between a stage_set and the next ds_get closes a chunk)
-        for (; i < 4; i++) if (k.sh[i]) { if (!(sets[i] = ds_get(k.sh[i], 0))) break; if (!dseq) dseq = C->seq; if (!stage_set(k.sh[i], sets[i], pprog[i], pst[i], base_inst, dseq)) break; }
+        int i = 0; g_bind_bad = 0;
+        if (!cur()) { g_drop[3]++; return 0; }
+        uint64_t dseq = C->seq;   // the chunk the sets come from (one: only a sync inside stage_set closes a chunk, and that stage_set then fails)
+        for (; i < 4; i++) if (k.sh[i] && !stage_set(k.sh[i], 0, &sets[i], dyn[i], pprog[i], pst[i], base_inst, dseq)) break;
         if (i == 4) break;
-        if (!sets[i] || !ds_moved(dseq) || ds_again(t, 0)) { g_drop[3]++; return 0; }
+        if (!ds_moved(dseq) || ds_again(t, 0)) { g_drop[3]++; return 0; }
     }
     if (g_bind_bad) { g_drop[4]++; static int nb; if (nb < 10) { nb++; LOG("[RED] [vk] draw skipped: a binding has no valid descriptor (shaders %s %s)", k.sh[0]->key, k.sh[1] ? k.sh[1]->key : "-"); } return 0; }
     if (!rp_start()) { g_drop[5]++; return 0; }   // after the textures: their uploads end a pass begun before (it is begun again on the same targets); it only takes cur(), so the sets' chunk is the one they are bound in below
     VkCommandBuffer c = C->cb;
     occl_begin();
     bf_pipeline(c, pp->p);   // binds the command buffer already holds are left out (bf_*)
-    for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], 0, NULL);
+    for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], k.sh[i]->ndyn, dyn[i]);
     // dynamic state: the viewport (see the file header for the origin), the scissor, stencil, blend constants, depth bias
     float vx = 0, vy = 0, vw = (float)P.w, vh = (float)P.h; if (D.has_vp) { vx = D.vp[0][0]; vy = D.vp[0][1]; vw = D.vp[0][2]; vh = D.vp[0][3]; }
     float n = D.dr[0] < 0 ? 0 : D.dr[0] > 1 ? 1 : D.dr[0], f = D.dr[1] < 0 ? 0 : D.dr[1] > 1 ? 1 : D.dr[1];
@@ -2641,7 +2707,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!bind_vbufs(c, k.sh[0], lo, vhi, base_inst, inst)) { g_drop[6]++; return 0; }
     if (ib) { bf_ibuf(c, ib, ioff, i32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16); vkCmdDrawIndexed(c, icount, inst, 0, (int32_t)((di ? di->base_vertex : 0) - lo), base_inst); }
     else vkCmdDraw(c, count, inst, (uint32_t)(dw->first - lo), base_inst);
-    g_draws++; C->ndraw++;
+    g_draws++; C->ndraw++; crumb((dw ? dw->ind : di->ind) ? 'D' : 'd', k.sh[0]->key, k.sh[1] ? k.sh[1]->key : NULL, ib ? icount : count, inst);
     if (g_prof_cur >= 0) { prof_rec *pr = &g_prof[g_prof_cur]; uint64_t nv = (uint64_t)(ib ? icount : count) * inst; pr->draws++; pr->verts += nv;
         if (nv > pr->big) { pr->big = nv; pr->bigvs = k.sh[0]->key; pr->bigfs = k.sh[1] ? k.sh[1]->key : NULL; } }
     if (dump_on()) {
@@ -2692,21 +2758,21 @@ static int vk_dispatch(const p_dispatch *dp) {
     cpipe_t *cp = cpipe_get(s); if (!cp) return 0;
     stage_textures(s);
     memcpy(g_cdim, g, sizeof g_cdim);
-    VkDescriptorSet set; int ok;
+    VkDescriptorSet set; int ok; uint32_t dyn[18];
     for (int t = 0;; t++) {   // t 1: the set taken again from the chunk recorded now when a sync inside stage_set closed the one it came from (ds_moved)
-        g_bind_bad = 0; set = ds_get(s, 0); uint64_t dseq = C ? C->seq : 0; ok = set && stage_set(s, set, pr, pst, 0, dseq) && !g_bind_bad;
-        if (ok || !set || !ds_moved(dseq)) break;
+        g_bind_bad = 0; if (!cur()) return 0; uint64_t dseq = C->seq; int got = stage_set(s, 0, &set, dyn, pr, pst, 0, dseq); ok = got && !g_bind_bad;
+        if (got || !ds_moved(dseq)) break;
         if (ds_again(t, 2)) return 0;
     }
     if (!ok) return 0;
     VkCommandBuffer c = cb(); if (!c) return 0;
     cb_barrier();
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pl, 0, 1, &set, 0, NULL);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pl, 0, 1, &set, s->ndyn, dyn);
     int pr_i = -1;
     if (prof_on() && C->pq && C->npq + 2 <= 512 && g_nprof < 1024) { prof_rec *r = &g_prof[pr_i = g_nprof++]; memset(r, 0, sizeof *r); r->c = C; r->ncolor = -1; r->w = g[0]; r->h = g[1]; r->draws = (int)g[2]; r->seq = g_prof_seq++;
         r->s0 = C->npq++; vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->pq, (uint32_t)r->s0); }
-    vkCmdDispatch(c, g[0], g[1], g[2]);
+    vkCmdDispatch(c, g[0], g[1], g[2]); crumb(dp->ind ? 'C' : 'c', s->key, NULL, g[0], g[1] * g[2]);
     if (pr_i >= 0) { g_prof[pr_i].s1 = C->npq++; vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, C->pq, (uint32_t)g_prof[pr_i].s1); }
     cb_barrier();
     g_dispatches++; C->ndraw++;
