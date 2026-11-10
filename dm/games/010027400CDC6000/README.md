@@ -11,6 +11,7 @@ Status: brought up on Android, on an Ayn Odin 2 (Adreno 740, Android 13). The ti
 | `net_loopback on` | [`game.tsv`](game.tsv), `hle_loopback.c` | single player is a RakNet server and a client in one process; without UDP on 127.0.0.1 a new game waits forever at the loading screen. See [New game](#new-game) |
 | `modules main subsdk0 sdk`, `mem_reserve 0x140000000`, `mem_alias 0x60000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000`, `sys_resource 0x400000`, `depth_mode zero` | `game.tsv` | the provisional profile's values from the survey and the Mac's heap check (a 2.96 GB heap); kept as they were |
 | LSPK packages read by the shader split | `dm/gfx/tools/shader_split.py` `lspk_shaders` | the shaders are in the `.bshd` files of `Data/*.pak`: 11,578 of them, where a plain scan found `main`'s 73 and every frame was black ([shaders](../../../docs/reference/shaders.md)) |
+| `DM_VK_SET_REUSE=1` | [`android_defaults.txt`](android_defaults.txt) | Android: descriptor sets bound again within a chunk; 2–3% of the replay's CPU time on the Pad 3, the picture the same (the file says what was measured) |
 
 ## New game
 
