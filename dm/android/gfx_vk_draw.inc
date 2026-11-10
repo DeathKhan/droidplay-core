@@ -128,7 +128,7 @@ typedef struct {
     int wlayer;   // a vertex, tessellation or geometry shader that writes the layer (spv_layer_out): its draws get every layer of their targets (rp_prepare)
     ds_list *dsf;   // its descriptor sets kept by each chunk, [2 chunk + tf] (dsl, dsl_tf): made at its first set (ds_get), never freed (as the shader)
     uint32_t ndesc;   // descriptors in dsl, an array's counted up to 1024 (what stage_set writes of it): DM_VK_SET_STATS=1 checks each stage_set writes them all
-    uint8_t dsbig;   // bit tf: one set of its layout (dsl, dsl_tf) did not fit an empty pool (ds_alloc_n, RED 93): ds_get gives none for it, without making another pool
+    uint8_t dsbig;   // bit tf: one set of its layout (dsl, dsl_tf) does not fit an empty pool (sh_get ds_fits, else ds_alloc_n, RED 93): ds_get gives none for it, without making another pool
 } vshader;
 static nvn_hmap g_sh = {.klen = 16};
 static char g_spv_dir[512];
@@ -425,6 +425,22 @@ static VkDescriptorType tex_dtype(const rb_tex *t, int image) {
     int buf = (t->type & 0xff) == 2;
     return image ? (buf ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) : (buf ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 }
+// What each pool holds (ds_pool_add), by the descriptor types sh_get's layouts use
+static const VkDescriptorPoolSize g_ds_pool_sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16384}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
+                                                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
+// Whether one set of a layout with these bindings fits an empty pool. A layout over it never gets a set, and it is known from the layout alone: tried in a pool, each such
+// shader made a pool of its own (ds_alloc_n's fresh pool, about 9.75 MB on Adreno 840) before its first draw was dropped. NVN2 shaders that read the texture pool by ID
+// (Ryujinx's handle fallback, <stage>_t_cb0_40000000: 2^20 elements; nvn_mtl.m pool_gpu on the Mac) are over it: Ocarina of Time's Kokiri Forest met 180 of them in 40 s,
+// 1.75 GB of pools no set was ever made from, beside the 4.6 GB the process held when the low-memory killer ended it (DM_VK_MEMREPORT)
+static int ds_fits(const VkDescriptorSetLayoutBinding *b, uint32_t nb) {
+    for (size_t i = 0; i < sizeof g_ds_pool_sz / sizeof *g_ds_pool_sz; i++) {
+        uint64_t n = 0;
+        for (uint32_t j = 0; j < nb; j++) if (b[j].descriptorType == g_ds_pool_sz[i].type) n += b[j].descriptorCount;
+        if (n > g_ds_pool_sz[i].descriptorCount) return 0;
+    }
+    return 1;
+}
+static uint64_t g_ds_toobig;   // shaders whose layout fits no pool (ds_fits): their draws are dropped
 static vshader *sh_get(const char *key) {
     char k[16]; memcpy(k, key, 16);
     vshader *s = nvn_hm_get(&g_sh, k); if (s) return s->ok ? s : NULL;
@@ -466,10 +482,14 @@ static vshader *sh_get(const char *key) {
     VkDescriptorSetLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = nb, .pBindings = b};
     if (vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &s->dsl) != VK_SUCCESS) { LOG("[RED] [vk] descriptor layout of shader %s failed", s->key); return NULL; }
     for (uint32_t i = 0; i < nb; i++) s->ndesc += b[i].descriptorCount > 1024 ? 1024 : b[i].descriptorCount;
+    if (!ds_fits(b, nb)) { s->dsbig |= 1; g_ds_toobig++;
+        uint32_t big = 0; for (uint32_t i = 0; i < nb; i++) if (b[i].descriptorCount > big) big = b[i].descriptorCount;
+        static int n; if (n++ < 4) LOG("[RED] [vk] shader %s: one descriptor set of its layout is larger than a whole pool (an array of %u elements): its draws are dropped", s->key, big); }
     if (s->modtf) {   // the capture variant's set: the same bindings and the feedback buffers
         for (int q = 0; q < 4; q++) if (s->tf_stride[q]) b[nb++] = (VkDescriptorSetLayoutBinding){100u + (uint32_t)q, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL};
         lc.bindingCount = nb;
         if (vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &s->dsl_tf) != VK_SUCCESS) s->modtf = VK_NULL_HANDLE;
+        if (!ds_fits(b, nb)) s->dsbig |= 2;
     }
     s->ok = 1;
     if (vk_debug()) LOG("[vk] shader %s stage %d: %d constant buffers, %d storage buffers, %d textures, %d images%s%s", s->key, s->stage, s->ncb, s->nsb, s->ntx, s->nim, s->modz ? ", depth -1..1 variant" : "", s->b0 ? ", reads the support buffer" : "");
@@ -1585,7 +1605,7 @@ static pipe_t *pipe_get(const pipe_key *k) {
 // A failed stage_set leaves its set unbound (the draw is dropped). A set handed out again may still name a texel buffer view or image view destroyed since its last use: Vulkan
 // allows writing over such a descriptor, and every one is written before the set is bound. DM_VK_SET_STATS=1 checks that each stage_set writes all of its layout's descriptors.
 // Memory: the pools are reset only once a chunk holds more than DS_CAP sets (DM_VK_SET_CAP=<n>), all of them, and the chunk's lists emptied (a set is not freed alone: the
-// pools have no FREE_DESCRIPTOR_SET_BIT). A layout one set of which does not fit an empty pool costs one pool, once (vshader dsbig, RED 93). DM_VK_SET_RECYCLE=0 (env.txt):
+// pools have no FREE_DESCRIPTOR_SET_BIT). A layout one set of which does not fit an empty pool gets none (sh_get ds_fits; else ds_alloc_n finds it: one pool, once; vshader dsbig, RED 93). DM_VK_SET_RECYCLE=0 (env.txt):
 // a new set for each stage and the pools reset when the chunk completes, as before
 enum { DS_CAP = 16384 };   // a chunk holds at most what each list gave in one recording, plus 3 from a batch: about 4,000 once warm on a dumped frame of Breath of the Wild (16.6k over 4 chunks), the whole frame's 7,500 if every window came to each
 static int g_ds_on = -1, g_ds_cap = DS_CAP, g_ds_stats;
@@ -1598,9 +1618,7 @@ static int ds_recycle(void) {   // the switches, read once (chunks_init: before 
 }
 static uint64_t g_ds_got, g_ds_reused, g_ds_made, g_ds_calls, g_ds_checked, g_ds_short; static _Atomic uint64_t g_ds_resets;   // sets handed out, of them from a list's free ones; sets made, in calls; DM_VK_SET_STATS
 static int ds_pool_add(void) {   // a new pool for the current chunk
-    VkDescriptorPoolSize sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16384}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
-                                 {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
-    VkDescriptorPoolCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2048, .poolSizeCount = sizeof sz / sizeof *sz, .pPoolSizes = sz};
+    VkDescriptorPoolCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2048, .poolSizeCount = sizeof g_ds_pool_sz / sizeof *g_ds_pool_sz, .pPoolSizes = g_ds_pool_sz};
     if (C->ndp == C->cdp) { C->cdp = C->cdp ? 2 * C->cdp : 4; C->dp = realloc(C->dp, C->cdp * sizeof *C->dp); }
     if (vkCreateDescriptorPool(g_vk.dev, &pc, NULL, &C->dp[C->ndp]) != VK_SUCCESS) { RED_ONCE(90, "descriptor pool creation failed"); return 0; }
     C->ndp++; return 1;
@@ -1642,8 +1660,8 @@ static int ds_room(ds_list ***a, int n, int *cap) {   // room for one more list 
 static VkDescriptorSet ds_get(vshader *s, int tf) {
     VkDescriptorSetLayout l = tf ? s->dsl_tf : s->dsl;
     g_ds_got++;
+    if (s->dsbig >> !!tf & 1) return VK_NULL_HANDLE;   // no pool holds one (ds_fits, RED 93): ds_alloc would make pools until creation failed
     if (!ds_recycle()) return ds_alloc(l);
-    if (s->dsbig >> !!tf & 1) return VK_NULL_HANDLE;   // no pool holds one (RED 93)
     if (!cur() || (!s->dsf && !(s->dsf = calloc(2 * (size_t)g_nchunk, sizeof *s->dsf)))) return VK_NULL_HANDLE;
     ds_list *L = &s->dsf[2 * (C - g_ch) + !!tf];
     if (!L->used && !ds_room(&C->dt, C->ndt, &C->cdt)) return VK_NULL_HANDLE;   // the arrays grow before any set is made: a list holding sets is always in dl
