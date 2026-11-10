@@ -699,6 +699,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** `make -C dm/host/tests GAME=<id> run` runs `t_net_eventfd`.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (SDK 22.2.8).
 
+### Loopback UDP needs no network
+
+- **Symptom:** after New Game the loading screen draws and its tips change, at the game's frame rate, but the progress bar stays empty forever; no red line, no crash. The thread dumps (`files/threads_now` on Android) show every thread idle or polling. The last files opened are the story's (`fs open not found: …/Story/story_generated.div.osi` in every mod, then `Data/Patch1_Gold.pak`); then nothing. The same on the Mac.
+- **Cause:** Divinity: Original Sin 2 runs single player as a RakNet server and a client in one process. On New Game its server, on the `ServerWorker thread`, calls `nn::socket::Socket(AF_INET, SOCK_DGRAM, 0)` (`main+0x1adc06c`, RakPeer's startup) twice, and the host returned -1 / ENETDOWN, as for every socket. Probes on the state machines' swap logs (`main+0x53fe0c` client, `main+0xd17478` server, x4 / x5 = the state names) showed the server reach `LoadSession`, its load thread end normally, and the server stay there, while the client waited in `StartServer`. A Switch with no network still has the bsd service's loopback: sockets open, bind, and carry datagrams to 127.0.0.1; only traffic to another host fails.
+- **Fix:** the profile key `net_loopback` (`DM_NET_LOOPBACK` overrides it) gives the game AF_INET datagram sockets that carry datagrams between its own sockets inside the host (`hle_loopback.c`): `Socket`, `Bind` (port 0 takes an ephemeral one), `GetSockName`, `SendTo`, `RecvFrom` (blocking, non-blocking by `Fcntl` or `MSG_DONTWAIT`, `SO_RCVTIMEO`), `Set/GetSockOpt`, `Close` and `Poll`, in the int-argument overloads RakNet calls. A destination outside 127.0.0.0/8 (another host, a broadcast) fails with ENETUNREACH, so nothing reaches the device's network; TCP and the other overloads still fail with ENETDOWN. Off by default: a game that finds every socket failing takes its offline branch, and turning this on for every game wants a check of the games that open UDP sockets (Pia's LAN play among them).
+- **Check:** `make -C dm/host/tests GAME=<id> run` runs `t_net_loopback`.
+- **Found on:** [Divinity: Original Sin 2](../../dm/games/010027400CDC6000/README.md) (SDK 8.2.0, RakNet 15.03.26). With the key both state machines go on to `Running` and character creation loads 11 s after Begin (Ayn Odin 2); its RakNet peer sends one datagram, to itself, as it binds: the client and server talk in process.
+
 ### The local user's profile image
 
 - **Symptom:** `Break#1 reason=0 Result=0` right after the first save is created, then exit 42; the stack has `nn::diag::detail::OnAssertionFailure` under `nn::image::JpegDecoder::Decode` (`sdk+0x394e4`), called from the game (Burnout Paradise Remastered, SDK 9.3).
