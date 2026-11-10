@@ -1146,7 +1146,7 @@ static int rp_start(void) {
     VkCommandBuffer c = cb(); if (!c) return 0;
     VkRenderPassBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = P.rp, .framebuffer = P.fb, .renderArea = {{0, 0}, {P.w, P.h}}};
     if (prof_on()) prof_pass_begin();
-    vkCmdBeginRenderPass(c, &bi, VK_SUBPASS_CONTENTS_INLINE); bf_reset();
+    vkCmdBeginRenderPass(c, &bi, VK_SUBPASS_CONTENTS_INLINE); bf_reset(); crumb('p', NULL, NULL, P.w, P.h);
     P.active = 1; g_passes++;
     return 1;
 }
@@ -2634,7 +2634,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!bind_vbufs(c, k.sh[0], lo, vhi, base_inst, inst)) { g_drop[6]++; return 0; }
     if (ib) { bf_ibuf(c, ib, ioff, i32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16); vkCmdDrawIndexed(c, icount, inst, 0, (int32_t)((di ? di->base_vertex : 0) - lo), base_inst); }
     else vkCmdDraw(c, count, inst, (uint32_t)(dw->first - lo), base_inst);
-    g_draws++; C->ndraw++;
+    g_draws++; C->ndraw++; crumb((dw ? dw->ind : di->ind) ? 'D' : 'd', k.sh[0]->key, k.sh[1] ? k.sh[1]->key : NULL, ib ? icount : count, inst);
     if (g_prof_cur >= 0) { prof_rec *pr = &g_prof[g_prof_cur]; uint64_t nv = (uint64_t)(ib ? icount : count) * inst; pr->draws++; pr->verts += nv;
         if (nv > pr->big) { pr->big = nv; pr->bigvs = k.sh[0]->key; pr->bigfs = k.sh[1] ? k.sh[1]->key : NULL; } }
     if (dump_on()) {
@@ -2699,7 +2699,7 @@ static int vk_dispatch(const p_dispatch *dp) {
     int pr_i = -1;
     if (prof_on() && C->pq && C->npq + 2 <= 512 && g_nprof < 1024) { prof_rec *r = &g_prof[pr_i = g_nprof++]; memset(r, 0, sizeof *r); r->c = C; r->ncolor = -1; r->w = g[0]; r->h = g[1]; r->draws = (int)g[2]; r->seq = g_prof_seq++;
         r->s0 = C->npq++; vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->pq, (uint32_t)r->s0); }
-    vkCmdDispatch(c, g[0], g[1], g[2]);
+    vkCmdDispatch(c, g[0], g[1], g[2]); crumb(dp->ind ? 'C' : 'c', s->key, NULL, g[0], g[1] * g[2]);
     if (pr_i >= 0) { g_prof[pr_i].s1 = C->npq++; vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, C->pq, (uint32_t)g_prof[pr_i].s1); }
     cb_barrier();
     g_dispatches++; C->ndraw++;
