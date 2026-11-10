@@ -3,7 +3,7 @@
 #   powershell -ExecutionPolicy Bypass -File dm\android\windows\test_setup.ps1 -Setup <DroidPlay-Setup-x.y.z.exe>
 # 1. A DroidPlay that Install DroidPlay.cmd installed (its folder, a desktop shortcut running uvw.exe), and some of the player's data, made up
 # 2. Setup, silent: the files, the shortcuts with DroidPlay's AppUserModelID, the old install gone, --check's Python rows, the window opened offscreen
-# 3. Setup again over a running DroidPlay: the Restart Manager closes it, and /RELAUNCH opens the new one
+# 3. Setup again over a running DroidPlay: the Restart Manager closes it, its "Updating DroidPlay" window shows meanwhile, and /RELAUNCH opens the new one
 # 4. The uninstaller, silent: the folder and the shortcuts gone, the player's data kept
 param([Parameter(Mandatory = $true)] [string] $Setup)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
@@ -30,6 +30,7 @@ $s = Shortcut (Join-Path $Desk 'DroidPlay.lnk'); $s.TargetPath = Join-Path $env:
 
 Say '2. Setup, silent'
 Run-Setup 'install' @('/TASKS=desktopicon')
+Check (-not (Select-String -Path "$Logs\install.log" -SimpleMatch 'Showing the update window' -Quiet)) 'no update window for an install'
 foreach ($f in 'runtime\python.exe', 'runtime\pythonw.exe', 'core\scripts\nxnative_android.py', 'core\VERSION', 'DroidPlay.ico', 'unins000.exe') { Check (Test-Path (Join-Path $App $f)) "$f installed" }
 Check (-not (Test-Path (Join-Path $Old 'droidnative'))) 'the uv install''s folder removed'
 Check (-not (Test-Path (Join-Path $Old 'version.txt'))) 'the uv install''s files removed'
@@ -50,6 +51,7 @@ Check (-not $w.HasExited) 'the installed DroidPlay opens and stays open'
 Say '3. Setup again, over the running DroidPlay'
 Run-Setup 'update' @('/RELAUNCH')
 Check $w.HasExited 'the running DroidPlay was closed for the update'
+Check (Select-String -Path "$Logs\update.log" -SimpleMatch 'Showing the update window' -Quiet) 'the update showed its "Updating DroidPlay" window'
 Start-Sleep -Seconds 5
 $again = App-Processes | Where-Object { $_.Name -eq 'pythonw.exe' }
 Check ($again.Count -ge 1) '/RELAUNCH opened DroidPlay again'
