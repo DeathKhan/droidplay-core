@@ -49,6 +49,12 @@ Status: brought up on Android, on an Ayn Odin 2 (Adreno 740, Android 13). The ti
 
 - 30 fps, the game's own: it asks for present interval 2 (`WindowInitialize swap chain 2 textures, interval 2`), at 1600x900 cropped to 1280x720 in handheld mode.
 
+## Shadows
+
+- **`DM_VK_SKIP_SHADOWS=1` leaves the shadows out** (`env.txt`; off by default), for a cheaper frame on a slower phone: the profile's `vk_shadow_rt square512` names the game's shadow maps, and the replay drops the draws of depth-only passes on a square target of 512 or more (`gfx_vk_shadow.inc`). The game's own clears of the map still run, so every lookup reads "nothing in front" and the scene is lit throughout. A tester asked for it (issue #113): their own patch, which left out square depth passes of 512 or more, ran Fort Joy faster on an Adreno 735, with the battery under 40 °C instead of 47 °C.
+- **Where the game draws them:** a 1536x1536 D16 map (`vk124`), with one empty colour slot beside it: on the title screen and the main menu behind it about 970 draws a frame in four passes, in character creation about 200; the hold and the cabin deck, lit by lanterns below deck, draw none (pass profiles, `files/prof_now`). Fort Joy's maps are not measured yet: with the switch on, the log's `shadow map … set as the target` lines name each shape caught.
+- **Measured on the title screen** (`boot`, uncapped with `DM_PRESENT_INTERVAL=display`, OnePlus Pad 3, Adreno 830, two runs each in turn, 2026-11-10): the shadow passes are 915 of the frame's 2,094 draws and 3.4 ms of its 11.4–11.6 ms of pass time on the GPU (one profiled frame each). Left out: 1,123–1,132 draws a frame, the replay's CPU time 8.6–9.0 ms a frame instead of 10.0–10.4, GPU p50 9.75–9.9 ms instead of 10.2–10.5; 60 fps both ways (the display's rate). Every surface is lit instead of shaded; nothing else in the picture changed.
+
 ## Open
 
 - On a cold pipeline cache, 25 draws of a new game's first minutes are left out while their pipelines build in the background (`[vk] draws not made: … pipeline 25`, `pipeline built in the background … draws left out meanwhile`); with the cache warm, `hold` leaves out none.

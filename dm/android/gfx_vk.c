@@ -1653,6 +1653,7 @@ static int png_texels(const char *path, VkFormat f, int bpp, const uint8_t *p, u
 #include "gfx_vk_draw.inc"
 #include "gfx_vk_dscopy.inc"
 #include "gfx_vk_readback.inc"   // arena write-backs read through a cached copy where the arena reads slowly (DM_VK_WB_READBACK)
+#include "gfx_vk_shadow.inc"   // DM_VK_SKIP_SHADOWS: a game's shadow map passes left out (vk_shadow_rt)
 
 // ---------------- Submission ----------------
 static void post(post_op o) {   // done when the current chunk completes, after its write-backs
@@ -1819,18 +1820,18 @@ void mtl_exec(const uint8_t *p) {
                 // (one command buffer per frame kept the GPU idle until the CPU had recorded everything: Super Mario Bros. Wonder's level took CPU 29 ms + GPU 41 ms
                 // a frame one after the other). A dispatch's storage buffer read by later draws on the GPU is found in the chunks in flight too (fwd_find)
                 if (C && C->ndraw >= EARLY_DRAWS && !vk_safe()) flush();
-                R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;
+                R.rt = *(const p_set_rt *)a; R.has_rt = 1; g_sh_rt = shadow_rt(&R.rt); break;
             case OP_SCISSOR: R.sc = *(const p_scissor *)a; R.has_sc = 1; break;
             case OP_CLEAR_COLOR: if (!rc_skips()) clear_color((const p_clear_color *)a); break;
             case OP_CLEAR_DS: if (!rc_skips()) clear_ds((const p_clear_ds *)a); break;
             case OP_CLEAR_TEX: clear_tex((const p_clear_tex *)a); break;
-            case OP_DRAW: if (rc_skips()) break;
+            case OP_DRAW: if (rc_skips() || shadow_skips()) break;
                 if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
                 { p_draw t; const p_draw *dw = draw_rec(a, h.size, &t);   // short records: draw_rec (nvn_obj.h)
                   if (dw->prim == DM_PRIM_MESH_TASKS) {   // NVN2's DrawMeshTasks: the Adreno 740's driver (Vulkan 1.3.128) has no VK_EXT_mesh_shader, and no lowering is ported (nvn_mtl.m runs them as Metal mesh draws)
                       RED_ONCE(131, "task / mesh shader draws (NVN2 DrawMeshTasks) are skipped: no mesh shaders on this replay (Mario Kart World's roadside bushes and grass tufts)"); g_mesh_skipped++; break; }
                   if (!vk_draw(dw, NULL)) g_draws_dropped++; break; }
-            case OP_DRAW_IDX: if (rc_skips()) break;
+            case OP_DRAW_IDX: if (rc_skips() || shadow_skips()) break;
                 if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
                 { p_draw_idx t; if (!vk_draw(NULL, draw_idx_rec(a, h.size, &t))) g_draws_dropped++; break; }
             case OP_DISPATCH: if (!vk_dispatch((const p_dispatch *)a)) g_draws_dropped++; break;
@@ -2156,6 +2157,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         (unsigned long long)atomic_load(&g_pso_made), atomic_load(&g_pso_ns) / 1e6, (unsigned long long)atomic_load(&g_cpso_made), atomic_load(&g_cpso_ns) / 1e6, (unsigned long long)atomic_load(&g_mod_made), atomic_load(&g_mod_ns) / 1e6);
     LOG("[vk] draws not made: shader missing %llu, targets %llu, pipeline %llu, descriptors %llu, invalid binding %llu, pass %llu, vertex buffers %llu; dropped in all %llu, task / mesh draws skipped %llu; shaders whose descriptor set fits no pool %llu (cumulative)", (unsigned long long)g_drop[0], (unsigned long long)g_drop[1], (unsigned long long)g_drop[2], (unsigned long long)g_drop[3], (unsigned long long)g_drop[4], (unsigned long long)g_drop[5], (unsigned long long)g_drop[6], (unsigned long long)g_draws_dropped, (unsigned long long)g_mesh_skipped, (unsigned long long)g_ds_toobig);
     pool_stats();
+    shadow_line();
     LOG("[vk] read on the GPU from a dispatch's pending write: vertex streams %llu, other bindings %llu, written in place by a later dispatch %llu (cumulative; gfx_vk_draw.inc stream_fwd, buf_fwd)", (unsigned long long)g_fwd, (unsigned long long)g_buf_fwd[0], (unsigned long long)g_buf_fwd[1]);
     LOG("[vk] render passes with every layer of their targets attached (a draw writes the layer): %llu (cumulative; gfx_vk_draw.inc rp_prepare_)", (unsigned long long)g_layered_passes);
     if (slot0_fill_on()) LOG("[vk] render passes given a scratch target in their empty colour slot 0: %llu (cumulative; gfx_vk_draw.inc slot0_fill_on)", (unsigned long long)g_slot0_fills);
