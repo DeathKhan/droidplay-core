@@ -39,6 +39,7 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     pthread_mutex_unlock(&g_pool_mu);
     return ok;
 }
+void mtl_arch_save(int wait_ms, int ending) { (void)wait_ms; (void)ending; }   // Metal's pipeline archive (nvn_mtl.m); nothing to save here
 void mtl_alias_drop_pool(const void *pool) { (void)pool; }
 
 // ---- Submission ----
@@ -166,6 +167,7 @@ int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; (void)t0; (v
 void mtl_ub_present(double iv) { (void)iv; }
 void mtl_pkg_stats(uint64_t *a, uint64_t *b) { *a = *b = 0; }
 uint64_t mtl_pkg_edge_skips(void) { return 0; }
+uint64_t mtl_pkg_copy_absorbs(void) { return 0; }   // Metal's packaged-texture copies taken as written (nvn_mtl.m pkg_copy_absorb): none here
 uint64_t mtl_pkg_miss(void) { return 0; }
 uint64_t mtl_upload_ns_take(void) { return 0; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }

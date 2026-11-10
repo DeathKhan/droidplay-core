@@ -834,6 +834,7 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     return 1;
 }
 void vt_drop_pool(const void *pool);   // below, with the textures
+void mtl_arch_save(int wait_ms, int ending) { (void)wait_ms; (void)ending; }   // Metal's pipeline archive (nvn_mtl.m); the Vulkan pipeline cache is written at pause (front_android.c) and during play
 void mtl_alias_drop_pool(const void *pool) { vt_drop_pool(pool); }
 
 // ---------------- Formats ----------------
@@ -1921,6 +1922,7 @@ int mtl_pso_prebuild_tool(void) { return 0; }
 // ---------------- Statistics the interface layer reads ----------------
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
+uint64_t mtl_pkg_copy_absorbs(void) { return 0; }   // Metal's packaged-texture copies taken as written (nvn_mtl.m pkg_copy_absorb): none here
 uint64_t mtl_pkg_miss(void) { return 0; }
 uint64_t mtl_upload_bytes(void) { return g_up_bytes; }
 void mtl_vbuf_stats(uint64_t *a, uint64_t *b, uint64_t *c, uint64_t *d, uint64_t *e, uint64_t *f) { *a = *b = *c = *d = *e = *f = 0; }
