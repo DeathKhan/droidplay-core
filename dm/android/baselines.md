@@ -101,9 +101,10 @@ pipelines cached, made 398 graphics pipelines in 9.5 s and measured 57.1 fps, wi
     shuffles in Brilliant Diamond (23 fragment shaders), Link's Awakening (5) and Animal Crossing (1).
   - **Warp-aggregated atomics** stay right in 16-lane groups: a ballot, a leader lane, one atomic, then a shuffle from the leader (most of Final Fantasy Resonance's compute
     shaders). The lane ID, the masks, the ballot and the shuffle's source all stay within one subgroup.
-  - **Open: a shuffle from 16 or more lanes away has no lane to read.** Final Fantasy Resonance reduces over the whole warp with shuffles of 1, 2, 4, 8 and 16 lanes (clamp 31)
-    in 309 compute shaders, and the last step reads an undefined value on this GPU. Mario Kart World's reductions go no further than 4 lanes, but 1,333 of its shuffles take
-    their source lane at run time. Found by reading the translated SPIR-V; neither game has run on the Pixel.
+  - **Fixed: a shuffle from 16 or more lanes away has no lane to read.** Final Fantasy Resonance reduces over the whole warp with shuffles of 1, 2, 4, 8 and 16 lanes (clamp
+    31) in 309 compute shaders. On this GPU the last step gave the lane's own value, which counted each subgroup's sum twice (`t_warp_reduce`). Each subgroup is now a warp of
+    its own (`spv_narrow`: [rendering.md](../../docs/reference/rendering.md#maxwells-32-lane-warps-in-a-narrower-subgroup)). Mario Kart World has 3 such shaders, and 1,333
+    of its shuffles take their source lane at run time (one past the subgroup reads the lane's own value). Final Fantasy Resonance's opening runs at 30 fps on the Pixel, GPU 23 ms.
   - **Not examined:** Animal Crossing's 499 fragment shaders with a ballot.
 - **No `VK_EXT_vertex_attribute_divisor`, but `VK_KHR_vertex_attribute_divisor`** (core in Vulkan 1.4, `supportsNonZeroFirstInstance` false). The replay looks only for the EXT, so
   a vertex stream that steps once every N > 1 instances steps every instance, with red line 87. Odyssey has none on these routes. Open: enable the KHR (the same structures),
