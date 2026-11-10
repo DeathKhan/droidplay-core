@@ -11,7 +11,7 @@
 #define VKB_FNS(X) \
     X(vkAcquireNextImageKHR) X(vkAllocateCommandBuffers) X(vkAllocateDescriptorSets) X(vkAllocateMemory) X(vkBeginCommandBuffer) X(vkBindBufferMemory) \
     X(vkBindImageMemory) X(vkCmdBeginQuery) X(vkCmdBeginRenderPass) X(vkCmdBindDescriptorSets) X(vkCmdBindIndexBuffer) X(vkCmdBindPipeline) \
-    X(vkCmdBindVertexBuffers) X(vkCmdBlitImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdCopyBufferToImage) \
+    X(vkCmdBindVertexBuffers) X(vkCmdBlitImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) \
     X(vkCmdCopyImage) X(vkCmdCopyImageToBuffer) X(vkCmdDispatch) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdEndQuery) X(vkCmdEndRenderPass) \
     X(vkCmdPipelineBarrier) X(vkCmdPushConstants) X(vkCmdResetQueryPool) X(vkCmdResolveImage) X(vkCmdSetBlendConstants) X(vkCmdSetDepthBias) \
     X(vkCmdSetScissor) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilReference) X(vkCmdSetStencilWriteMask) X(vkCmdSetViewport) X(vkCmdWriteTimestamp) \
@@ -20,11 +20,11 @@
     X(vkCreateImageView) X(vkCreatePipelineCache) X(vkCreatePipelineLayout) X(vkCreateQueryPool) X(vkCreateRenderPass) X(vkCreateSampler) \
     X(vkCreateSemaphore) X(vkCreateShaderModule) X(vkCreateSwapchainKHR) X(vkDestroyBuffer) X(vkDestroyBufferView) X(vkDestroyFramebuffer) \
     X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyPipeline) X(vkDestroyPipelineLayout) X(vkDestroySurfaceKHR) X(vkDestroySwapchainKHR) \
-    X(vkDeviceWaitIdle) X(vkEndCommandBuffer) X(vkEnumerateDeviceExtensionProperties) X(vkEnumeratePhysicalDevices) X(vkFreeMemory) \
+    X(vkDeviceWaitIdle) X(vkEndCommandBuffer) X(vkEnumerateDeviceExtensionProperties) X(vkEnumeratePhysicalDevices) X(vkFlushMappedMemoryRanges) X(vkFreeMemory) \
     X(vkGetBufferMemoryRequirements) X(vkGetDeviceProcAddr) X(vkGetDeviceQueue) X(vkGetImageMemoryRequirements) X(vkGetPhysicalDeviceFeatures) \
     X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
-    X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPipelineCacheData) X(vkGetQueryPoolResults) X(vkGetSwapchainImagesKHR) X(vkMapMemory) X(vkQueuePresentKHR) \
+    X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPipelineCacheData) X(vkGetQueryPoolResults) X(vkGetSwapchainImagesKHR) X(vkInvalidateMappedMemoryRanges) X(vkMapMemory) X(vkQueuePresentKHR) \
     X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkResetCommandPool) X(vkResetDescriptorPool) X(vkResetFences) X(vkUnmapMemory) X(vkUpdateDescriptorSets) \
     X(vkWaitForFences)
 #define VKB_DECL(f) extern __attribute__((visibility("hidden"))) PFN_##f f;

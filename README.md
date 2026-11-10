@@ -67,11 +67,11 @@ Screen captures from the test runs, taken on the device. The round button at the
 | Game | Device | State |
 |---|---|---|
 | Pokémon Brilliant Diamond 1.3.0 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Playable: 60 fps in Eterna City's overworld. On a Retroid Pocket 5 it no longer crashes at launch, but Eterna City runs at 15 fps on its own driver (58 with [Turnip](#another-vulkan-driver-turnip)) |
-| Animal Crossing: New Horizons 3.0.3 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Runs at 30 fps (as on the Switch) in the new game's airport on all three, and outside the player's house on the Odin 2 and Pad 3; not played through |
+| Animal Crossing: New Horizons 3.0.3 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Runs at 30 fps (as on the Switch) in the new game's airport and outside the player's house on all three; not played through |
 | Super Mario Odyssey 1.4.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | The Start menu at 60 fps, the opening cutscene at 60 (38 on the Retroid Pocket 5), and play in the Cap Kingdom at 60 on the Odin 2, past the hint video that used to crash it (the host's AVC decoder, fixed) |
 | Super Smash Bros. Ultimate 13.0.5 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Boots to its opening movie at 60 fps on all three, with the hinted shared font the packer now ships (Android's Roboto made it crash); battles at 40–59 fps on the Odin 2, 13–30 fps on the other two (pipelines built during play) |
 | The Legend of Zelda: Link's Awakening 1.1.0 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Plays with its picture right at 60 fps on the Odin 2, 31 on the Pad 3 and 35 on the Retroid Pocket 5. The boot crash it had on every launch on the Retroid Pocket 5 and now and then on the Pad 3 is fixed (checked on the Retroid Pocket 5) |
-| The Legend of Zelda: Skyward Sword HD 1.0.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | The opening movie at 55–60 fps (41 on the Retroid Pocket 5); Skyloft plays at 59–60 fps on the Odin 2 and Pad 3, with grey terrain |
+| The Legend of Zelda: Skyward Sword HD 1.0.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | The opening movie at 55–60 fps (41 on the Retroid Pocket 5); Skyloft plays at 59–60 fps on the Odin 2 and Pad 3, with grey terrain, and at 43 on the Retroid Pocket 5, with its terrain in colour |
 | Final Fantasy Resonance 1.0.1 | Ayn Odin 2, OnePlus Pad 3 | From a new game's opening into the first field at about 42 fps on both, with the field drawn right (10–16 fps before 0.6.0). On the Odin 2 the field's flames are missing. Not played past the first field; not tried on the Retroid Pocket 5 |
 | The Legend of Zelda: Breath of the Wild 1.9.0 | Ayn Odin 2 | Runs with a correct picture at about 20 fps (CPU-bound in the Vulkan replay) † |
 | Super Mario Bros. Wonder 1.2.1 | POCO X5 5G (Adreno 619) | Playable: about 30 fps at render scale 0.8 † |
@@ -86,6 +86,11 @@ drivers, and the known problems with what is known of their causes.
 
 Every other game in the [games table](dm/games/README.md#games) has a profile and can be packed the same way, but has not been run on Android. A game without a
 profile can still be packed as an *experimental build*: most likely it does not boot, but it is the starting point for porting it.
+
+The Android host replays NVN only. A game that draws with OpenGL or makes its own Vulkan calls (OpenGL or Vulkan in the games table's Graphics column) cannot
+draw on Android, since the OpenGL and Vulkan layers are the Mac's, on Metal: Balatro, Digimon Story Cyber Sleuth and Well Dweller (OpenGL), and Hades and both
+Super Mario Galaxy games (Vulkan). The packing script stops on such a game and says why, before the rewrite and the shaders. Super Mario 3D All-Stars still
+builds, since its launcher draws with NVN, but Super Mario 64 and Sunshine inside it call Vulkan and cannot draw.
 
 ## Testing and reporting
 
