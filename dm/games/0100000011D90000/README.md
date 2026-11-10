@@ -64,6 +64,7 @@ Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform
 - [A guest thread attached to the Java VM (Android)](../../../docs/reference/memory.md#a-guest-thread-attached-to-the-java-vm-android): the software keyboard's name entry.
 - [Storage buffer write-backs read from cached memory on Vulkan](../../../docs/reference/rendering.md#storage-buffer-write-backs-read-from-cached-memory-on-vulkan): Eterna City at 20 fps on Turnip, 60 fps after.
 - [Queued commands grown by doubling](../../../docs/reference/frame-rate.md#queued-commands-grown-by-doubling): Eterna City on a Retroid Pocket 5 with Turnip at 25 fps, 38.7 after.
+- [Uniform bound tests in a vertex shader lose the device on the Adreno 830](../../../docs/reference/rendering.md#uniform-bound-tests-in-a-vertex-shader-lose-the-device-on-the-adreno-830): vertex shader `09898bd947898191` (293 tests) on a Galaxy S25 Edge, after the nxnative merge of 2026-11-10.
 
 ## Open
 

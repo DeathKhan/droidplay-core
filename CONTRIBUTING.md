@@ -20,7 +20,7 @@ particular to the port.
 - **Checks before a pull request**, besides nxnative's that apply:
   - the Android host builds: `cmake -G Ninja -S dm/android -B <build dir> -DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a
     -DANDROID_PLATFORM=android-29 -DGAME=<title ID>`, then `ninja -C <build dir> dmhost_app` (the Android CI job does this);
-  - `python -m unittest test_android_cli test_romfs_image test_spv_cb_extents` in `dm/tools/tests`;
+  - `python -m unittest test_android_cli test_romfs_image test_spv_cb_extents test_spv_cbsize` in `dm/tools/tests`;
   - on a device: which games you ran, for how long, with what result (frame times from the log's `timing up to frame` lines), and the device, its GPU and
     Android version. Say what you did not run.
 - **Commits** follow nxnative's form (below), with an `Android:` subject for a change to the port.
