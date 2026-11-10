@@ -125,9 +125,9 @@ class CbExtents(unittest.TestCase):
             def fn(sig, one_line=False):
                 a = src.index(sig); return src[a:src.index('\n', a) + 1] if one_line else src[a:src.index('\n}\n', a) + 3]
             c = ('#include <stdint.h>\n#include <stdlib.h>\n#include <string.h>\ntypedef struct { int binding, slot; uint32_t ext; } rb_cbuf;\n'
-                 + fn('static int spv_lit(') + fn('static void spv_cb_ext(') + fn('static int cb_index(', True) + fn('static void spv_cb_ext2(')
+                 + fn('#define CB_MAX ', True) + fn('static int spv_lit(') + fn('static void spv_cb_ext(') + fn('static int cb_index(', True) + fn('static void spv_cb_ext2(')
                  + '__attribute__((visibility("default"))) void run(const uint32_t *w, size_t n, const int *b, int ncb, uint32_t *ext, int two) {\n'
-                 '    rb_cbuf cb[18]; for (int i = 0; i < ncb; i++) { cb[i].binding = b[i]; cb[i].slot = 0; cb[i].ext = 0; }\n'
+                 '    rb_cbuf cb[CB_MAX]; for (int i = 0; i < ncb; i++) { cb[i].binding = b[i]; cb[i].slot = 0; cb[i].ext = 0; }\n'
                  '    if (two) spv_cb_ext2(w, n, cb, ncb, ext); else spv_cb_ext(w, n, cb, ncb, ext);\n}\n')
             (cls.tmp / 'scan.c').write_text(c, encoding='utf-8')
             subprocess.run([CC, '-shared', '-fPIC', '-O1', '-Wall', '-Wno-unused-function', cls.tmp / 'scan.c', '-o', cls.tmp / 'scan.so'], check=True)
