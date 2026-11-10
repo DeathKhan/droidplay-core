@@ -35,6 +35,9 @@ Status: brought up on Android, on an Ayn Odin 2 (Adreno 740, Android 13). The ti
 - `DM_KEYS=32:A,36:B,39:A,42:A,45:A,48:A,51:A,70:A~1.0,76:PLUS,82:A` reaches it in about 2 minutes 30 s; the `tohold` route below does the same from a fresh save.
 - Quick Save (Plus, then A) writes `Save0000/Save0000.lsv` and its thumbnail; Continue loads it again (`hold` below). The game autosaves on its own a few seconds into play.
 
+- Walked by hand (2026-11-10, adb joystick events): the left stick moves the character with the camera following; the stairs at the hold's west end lead up a level to a doorway blocked by a toppled crate, the tutorial's Move puzzle (X on the crate opens the Action Menu: Pick Up, Open, Move, Attack, Examine; Pick Up clears it). The ladder in the room below asks whether to leave the Tutorial Deck; Yes loads the next level in about 25 s: the cabin deck, where Magister Siwan's dialogue moves the quest on (narrator lines, ambient remarks). 30 fps there too: frame time p50 33.3 / p95 33.8 ms, GPU 8.7 ms, 798 draws, submit 13.8 ms of CPU a frame. Not yet past its corridor to the top deck and its first fight. Holding the left stick in (L3) for 1 s on a tutorial box hides tutorials for the profile.
+- Sound plays: Wwise mixes into AudioOut #0 (6 channels, `main+0x1bd3050`), which carries signal throughout (`DM_AUDIO_DUMP`); the audio renderer the game also opens (`main+0x162c988`) is nearly silent (436 of 24,000 frames), which is expected of it here.
+
 ## Routes
 
 [`bench_android.tsv`](bench_android.tsv), for `scripts/bench_android.py`:
@@ -48,6 +51,6 @@ Status: brought up on Android, on an Ayn Odin 2 (Adreno 740, Android 13). The ti
 
 ## Open
 
-- 25 draws a run are dropped for a pipeline that was not made (`[vk] draws not made: … pipeline 25`), in the first area. Not looked at yet.
+- On a cold pipeline cache, 25 draws of a new game's first minutes are left out while their pipelines build in the background (`[vk] draws not made: … pipeline 25`, `pipeline built in the background … draws left out meanwhile`); with the cache warm, `hold` leaves out none.
 - `[nvn] [RED] SetRenderEnableConditional: the host draws anyway for now`, from the title on.
 - Further into the game (Fort Joy, the first fights, saving and loading) is not played yet.
