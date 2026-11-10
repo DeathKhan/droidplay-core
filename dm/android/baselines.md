@@ -45,7 +45,7 @@ median GPU time per frame. Animal Crossing runs at 30 fps on the Switch too.
 | Skyward Sword HD, Skyloft's plaza (a save) | 30.0–30.5 · 33.3 / 36.6–46.8 · GPU 4.8–4.9 | 30.0–34.0 · 30.6–32.9 / 44.4–46.5 · GPU 12.6–12.8 | Not measured: the game stops at its first save (see below) | 60 · 16.6–16.7 / 20.6–20.7 · GPU 9.8–9.9 |
 | **Final Fantasy Resonance 1.0.1**, the Lancarse logo and the Brightness screen (a fresh save) | 59.6–59.7 · 16.8 / 18.7 · GPU 1.8 | not measured here | not run | 59.6 · 16.8 / 21.3–21.5 · GPU 5.8 |
 | Final Fantasy Resonance, the first field (a save made by its `tofield` route) | 42.2–42.6 · 23.3–23.6 / 27.1–27.4 · GPU 12.5–12.7 | not measured here | not run | 30.1–33.3 · 29.7–33.0 / 40.9–42.8 · GPU 20.2–22.7 |
-| **The Legend of Zelda: Breath of the Wild 1.9.0**, the Shrine of Resurrection (the `outdoors` save, a 40 s window) | not run (the device held by another session) | **GPU lost** at the first frame in the field (problem 14); with the hanging draw skipped: 20.0 · 48.6–49.2 / 68–71 · GPU 22.3 on main, **30.0 · 33.1–33.4 / 38.2–38.9 · GPU 15.5–16.6** with droidplay-core#91, #93, #97 and #108 (BotW's defaults, held until it has run on a second device) | not run | not run |
+| **The Legend of Zelda: Breath of the Wild 1.9.0**, the Shrine of Resurrection (the `outdoors` save, a 40 s window) | no GPU hang: 30.0–30.5 · 33.0–33.3 / 37.5–38.2 · GPU 13.2–15.3 on main (the frame step tries 60 and fails), **29.9 · 33.2 / 36.2–36.6 · GPU 14.3** with droidplay-core#108 | **GPU lost** at the first frame in the field (problem 14); with the hanging draw skipped: 20.0 · 48.6–49.2 / 68–71 · GPU 22.3 on main, **30.0 · 33.1–33.4 / 38.2–38.9 · GPU 15.5–16.6** with droidplay-core#91, #93, #97 and #108 (BotW's defaults) | not run | not run |
 
 Link's Awakening's numbers are for a wrong picture (problem 8): the 3D world never reaches the screen, so the overworld's frame rate leaves out part of
 its real work. Skyward Sword HD's Skyloft is drawn with grey terrain (problem 10); on the Galaxy S25 Edge its terrain has its colours.
@@ -180,6 +180,7 @@ Numbered in the order they were found, so links to a number stay right:
       - duplicate colour attachments left unused.
     - **What differs.** Its pipeline key is the horizontal pass's byte for byte but for the write mask, with the same D16 depth image. Only the target image differs: it is also the sixth colour target of the G-buffer passes.
     - **Workaround for measuring.** Skipping the draw (a local test switch) keeps the GPU alive, and the game runs.
+    - **Not on the Odin 2.** Its Adreno 740 (driver 0x802a4000) runs the same draw without a hang: seven launches of the same save on main 1e4dd802 with droidplay-core#108, nothing skipped, no slow submission reported.
     - **Not tried:** Turnip (needs a driver build for the Adreno 830); rendering that pass into another image and copying it over.
 
 ## Reading the numbers
