@@ -76,6 +76,7 @@ set(ANDROID_C
   ${CMAKE_CURRENT_SOURCE_DIR}/haptics_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/apple_stubs.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk_driver.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/module_pack.c
   ${CMAKE_CURRENT_SOURCE_DIR}/gfx_${DM_GFX}.c)
 
 # char is signed, as on Apple arm64 (the host and its third-party code were written there); AArch64 Linux / Android makes plain char unsigned. bcdec read BC4 / BC5 SNORM
@@ -172,6 +173,7 @@ if(DM_TESTS)
   # t_svc_memory_16k is not built: it simulates 16 KiB pages over the kernel's, which works where mmap aligns to 16 KiB (Apple silicon); a 4 KiB kernel gives
   # the guest address space only 4 KiB alignment. A 16 KiB-page Android kernel runs t_svc_memory itself at its real page size
   dm_test(t_nro SOURCES ${T}/t_nro.c)
+  dm_test(t_module_pack SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/t_module_pack.c ${CMAKE_CURRENT_SOURCE_DIR}/module_pack.c)
   dm_test(t_audio SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/t_audio.c ${CMAKE_CURRENT_SOURCE_DIR}/coreaudio_aaudio.c)
   target_link_libraries(t_audio aaudio mediandk m)
   dm_test(t_media SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/t_media.c ${CMAKE_CURRENT_SOURCE_DIR}/media_android.c)

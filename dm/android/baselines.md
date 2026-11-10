@@ -37,8 +37,8 @@ median GPU time per frame. Animal Crossing runs at 30 fps on the Switch too.
 | **Super Smash Bros. Ultimate 13.0.5**, boot with Android's Roboto as the shared font (fixed: problem 3) | **Crashes** 2–4 s in | **Crashes** | **Crashes** |
 | Smash, the opening movie (with a hinted shared font, now packed with the game) | 60 · 12.0 / 33.9 | 59.9 · 13.1–13.4 / 34.7–35.1 | 59.7 · 13.5–13.9 / 35.5–36.0 |
 | Smash, a battle (a fuller shared font; stage and CPU fighter vary) | 39.7–59.3 fps | 16.8–29.7 fps, frames up to 215 ms | 13.4–19.3 fps, frames up to 368 ms |
-| **The Legend of Zelda: Link's Awakening 1.1.0**, the opening movie (a fresh save) | 59.8–59.9 · 16.7 / 17.6–17.7 · GPU 2.3–2.4 | 59.7 · 16.7 / 16.8 · GPU 4.5 (the other run crashed at boot) | **Crashes** at boot (problem 9) |
-| Link's Awakening, the overworld at the Ancient Ruins (a save) | 59.9–60 · 16.7 / 17.2–17.3 · GPU 4.1 | 31.3 · 33.2 / 34.7 · GPU 12.0 (the other run crashed at boot) | **Crashes** at boot |
+| **The Legend of Zelda: Link's Awakening 1.1.0**, the opening movie (a fresh save) | 59.8–59.9 · 16.7 / 17.6–17.7 · GPU 2.3–2.4 | 59.7 · 16.7 / 16.8 · GPU 4.5 (the other run crashed at boot) | 57.4–58.9 · 16.7 / 17.0–18.6 · GPU 5.6–6.4 (10 runs, 2026-11-10, after problem 9's fix) |
+| Link's Awakening, the overworld at the Ancient Ruins (a save) | 59.9–60 · 16.7 / 17.2–17.3 · GPU 4.1 | 31.3 · 33.2 / 34.7 · GPU 12.0 (the other run crashed at boot) | 34.7–36.0 · 32.8–33.0 / 34.5 · GPU 12.8 (2026-11-10, after problem 9's fix; the game falls to its 30 fps interval, problem 12) |
 | **The Legend of Zelda: Skyward Sword HD 1.0.1**, the opening movie (a fresh save) | 55.2–55.9 · 18.1–18.3 / 36.6–37.7 · GPU 2.3–2.4 | 59.9–60 · 16.7 / 24.5–25.1 · GPU 2.8 | 41.1–41.4 · 24.4–24.6 / 49.1–49.8 · GPU 3.7 |
 | Skyward Sword HD, Skyloft's plaza (a save) | 30.0–30.5 · 33.3 / 36.6–46.8 · GPU 4.8–4.9 | 30.0–34.0 · 30.6–32.9 / 44.4–46.5 · GPU 12.6–12.8 | Not measured: the game stops at its first save (see below) |
 
@@ -106,10 +106,13 @@ Numbered in the order they were found, so links to a number stay right:
      scaling between formats 130 and 130: not blittable on this GPU`): no Adreno blits `D32_SFLOAT_S8_UINT`. The occlusion pass tests its stencil (bit 1)
      against the copy, so it wrote nothing and its target kept its cleared 1.0. The copies are now drawn: [Depth-stencil copies a blit cannot make, drawn on
      Vulkan](../../docs/reference/rendering.md#depth-stencil-copies-a-blit-cannot-make-drawn-on-vulkan).
-9. **Link's Awakening crashes at boot** on every launch on the Retroid Pocket 5 (7 of 7), now and then on the Pad 3 (3 of 8), never on the Odin 2
-   (0 of 10): `CRASH sig=11 pc=main+0x1c180` about 0.1 s in, in the constructor of the camera `MainCamera_1P`. It reads an entry of a 0x58-byte table at
-   `main+0x1bcc898` by a 16-bit index that is still 0xFFFF, the default its caller sets at `main+0xbdb68` until a lookup fills it, so the read lands
-   5.5 MB past the table. Whatever that lookup finds is in place on the Odin 2 by then and often not on the other two: a race at startup, not found yet.
+9. **Fixed: Link's Awakening crashed at boot** on every launch on the Retroid Pocket 5 (7 of 7), now and then on the Pad 3 (3 of 8), never on the Odin 2
+   (0 of 10): `CRASH sig=11 pc=main+0x1c180` about 0.4 s in, in the constructor of the camera `MainCamera_1P`. It reads an entry of a 0x58-byte table at
+   `main+0x1bcc898` by a 16-bit index that is always 0xFFFF there (its caller sets it at `main+0xbdb68` and nothing changes it), so every boot reads 5.5 MB
+   past the table, past main's end. Not a race in the game: on a Switch the modules are mapped back to back and that address is subsdk0's code, while the
+   host mapped each module where `mmap` put it, and on Android what lay past main depended on what other mappings had filled the gap by then. The modules
+   are now mapped back to back: [Modules back to back, as Horizon maps them](../../docs/reference/memory.md#modules-back-to-back-as-horizon-maps-them-android).
+   On the Retroid Pocket 5 0 of 11 boots crashed after it, and 6 of 6 on the same build with `DM_MODULE_PACK=0` (the old placement), each at `main+0x214c889`.
 10. **Skyward Sword HD draws Skyloft's terrain and sky flat grey** on the Odin 2 and the Pad 3, with no red line. A pass dump on the Pad 3 shows the terrain
     grey in the first pass that draws it, while Link and the bird statue, drawn next with the same ASTC 6×6 textures, have their colours. The terrain's draws
     also sample 64×64 textures the game renders earlier in the frame, which come out black from the game's own constants; whether that is right also needs
@@ -124,6 +127,12 @@ Numbered in the order they were found, so links to a number stay right:
     three on the Odin 2, 60.0 on the Pad 3): [A 1080p linear render target's write-back staged in a buffer of its own every
     frame](../../docs/reference/rendering.md#a-1080p-linear-render-targets-write-back-staged-in-a-buffer-of-its-own-every-frame). Link's Awakening's overworld
     likewise falls to 31 fps on the Pad 3: the game switched interval 175 times in one run there, against 4 on the Odin 2.
+12. **Link's Awakening's overworld plays at 30 fps on the Retroid Pocket 5** (34.7–36.0 fps over the Ancient Ruins window, frame p50 33 ms, p95 34.5 ms, the
+    picture right). The game sets its present interval from the vsyncs its last frame took (`main+0xca44`–`0xcb24`, applied at `main+0x1144c18`), and frames
+    there take two even at interval 1, so it switches between 1 and 2 about 350 times a run. Per frame in that window: the game's own CPU 5.3 ms, the
+    replay's recording of about 616 draws 9.7 ms on the game's thread (`@nvn_ms`), a 9.0 ms `nvnSyncWait` on the GPU (`@sync_ms`), GPU 12.9 ms at 490
+    MHz, the floor this device keeps (`min_pwrlevel` 3; 670 MHz at most), 44% busy. The wait and the work after it are in series, so a frame's work takes about
+    24 ms, two vsyncs; 60 fps needs the recording cost or the GPU's time to come down by about a third, or the two to overlap. Not worked on yet.
 
 ## Reading the numbers
 
@@ -137,7 +146,7 @@ Numbered in the order they were found, so links to a number stay right:
   which it drew at 30 fps, and the first published version of this page counted that as the island. A player's saves are in the app's internal storage,
   which can swap, so play is not affected; only this route on this device is. Brilliant Diamond crashes there earlier, and Smash's saves did not fail.
   Skyward Sword HD saves while its file list loads, and crashes (`main+0xf2b210`, `addr=0x20`) when it reads the save back after the failed commit, so its
-  Skyloft route is not measured there either; its boot route survives the failed commit.
+  Skyloft route is not measured there either; its boot route survives the failed commit. Link's Awakening's routes survive theirs too (five or six a run).
 - **The Pad 3's logcat drops lines from a game that logs fast.** Android 16 rate-limits an app's log, and Link's Awakening logs every file open, so the
   line that marks it ready never reached logcat. The benchmark now takes it from the host's own `log.txt` when logcat lacks it.
 - **Smash's battles are a range, not a baseline.** The route picks Random stage and a random CPU fighter (D-pad moves on the stage grid did not land on the
