@@ -21,7 +21,8 @@ from test_spv_readonly import NDK, HOST, EXE   # noqa: E402
 TOOL = lambda n: (NDK / 'shader-tools' / HOST / f'{n}{EXE}') if NDK and (NDK / 'shader-tools' / HOST / f'{n}{EXE}').exists() else shutil.which(n)
 SPV_AS, SPV_VAL = TOOL('spirv-as'), TOOL('spirv-val')
 
-# The kernel: lane 0 stores a word at the stage memory's index %AT% and one into the storage buffer; the other lanes return early. %WORDS% sizes the stage memory
+# The kernel: lane 0 stores a word at the stage memory's index %AT% and one into the storage buffer, twice a local it never stored; the other lanes return early.
+# %WORDS% sizes the stage memory
 KERNEL = '''OpCapability Shader
 OpCapability GroupNonUniform
 %glsl = OpExtInstImport "GLSL.std.450"
@@ -38,6 +39,9 @@ OpDecorate %ssbo Binding 1
 %fn = OpTypeFunction %void
 %u32 = OpTypeInt 32 0
 %bool = OpTypeBool
+%f32 = OpTypeFloat 32
+%pff = OpTypePointer Function %f32
+%c2 = OpConstant %f32 2
 %c0 = OpConstant %u32 0
 %cat = OpConstant %u32 %AT%
 %cv = OpConstant %u32 0x03000000
@@ -55,6 +59,7 @@ OpDecorate %ssbo Binding 1
 %lane = OpVariable %pin Input
 %main = OpFunction %void None %fn
 %l0 = OpLabel
+%loc = OpVariable %pff Function
 %id = OpLoad %u32 %lane
 %z = OpIEqual %bool %id %c0
 OpSelectionMerge %l2 None
@@ -65,7 +70,10 @@ OpReturn
 %p = OpAccessChain %pwu %mem %cat
 OpStore %p %cv
 %q = OpAccessChain %puu %ssbo %c0 %c0
-OpStore %q %cv
+%lv = OpLoad %f32 %loc
+%twice = OpFMul %f32 %lv %c2
+%tb = OpBitcast %u32 %twice
+OpStore %q %tb
 OpBranch %l2
 %l2 = OpLabel
 OpReturn
@@ -119,6 +127,11 @@ class SpvMesh(unittest.TestCase):
                             self.assertFalse(any(x[2] == spv_mesh.DEC_BUFFERBLOCK for x in decor), 'no BufferBlock in SPIR-V 1.4')
                             pcs = [x for x in ins if x[0] == spv_mesh.OP_VARIABLE and x[3] == spv_mesh.SC_PUSHCONSTANT]
                             self.assertEqual(len(pcs), 0 if task else 1, 'the first workgroup comes in a push constant without a task')
+                            self.zeroed(ins)
+                            arith = {x[2] for x in ins if x[0] in spv_mesh.FLOAT_ARITH}
+                            nc = {x[1] for x in decor if x[2] == spv_mesh.DEC_NOCONTRACTION}
+                            self.assertEqual(nc, arith, 'every float result of a mesh shader, the kernel\'s and the entry point\'s, is NoContraction')
+                            self.assertGreaterEqual(len(arith), 3 if gl else 1)
 
     def test_task_shader(self):
         info = {'kind': 'ts', 'threads': 32, 'payload': 256}
@@ -129,6 +142,15 @@ class SpvMesh(unittest.TestCase):
         self.assertEqual([x[1] for x in ins if x[0] == spv_mesh.OP_ENTRY], [spv_mesh.MODEL_TASK])
         self.assertEqual(sum(x[0] == spv_mesh.OP_EMITMESHTASKS for x in ins), 1)
         self.assertEqual(sum(x[0] == spv_mesh.OP_VARIABLE and x[3] == spv_mesh.SC_PAYLOAD for x in ins), 1)
+        self.zeroed(ins)
+        self.assertFalse(any(x[0] == spv_mesh.OP_DECORATE and x[2] == spv_mesh.DEC_NOCONTRACTION for x in ins), 'a task shader computes no position')
+
+    def zeroed(self, ins):   # every Function variable starts at its type's zero
+        nulls = {x[2]: x[1] for x in ins if x[0] == spv_mesh.OP_CONSTANTNULL}
+        ptr = {x[1]: x[3] for x in ins if x[0] == spv_mesh.OP_TYPEPOINTER}
+        loc = [x for x in ins if x[0] == spv_mesh.OP_VARIABLE and x[3] == spv_mesh.SC_FUNCTION]
+        self.assertTrue(loc)
+        for x in loc: self.assertEqual(nulls.get(x[4] if len(x) > 4 else None), ptr[x[1]], 'a local without its zero')
 
     def test_refuses_own_shared_memory(self):   # a second workgroup variable would lie over the stage memory
         info = mesh_info(False, False)

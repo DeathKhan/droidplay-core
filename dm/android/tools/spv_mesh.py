@@ -13,12 +13,14 @@
 # shaders write theirs; components the SPH does not enable are (0, 0, 0, 1), what the hardware gives. gl: the -1..1 depth variant (z' = (z + w) / 2, as
 # spv_android.z_variant gives a vertex shader). Modules come out as SPIR-V 1.4, which VK_EXT_mesh_shader needs: every global goes in the entry point's interface.
 # The design follows nxnative's Metal wrapper; Banana Native (git.eden-emu.dev/moceure/BananaNative) showed Qualcomm's Adreno 840 driver drawing NVN2 mesh
-# programs through VK_EXT_mesh_shader with vec4 outputs. No code is taken from either.
+# programs through VK_EXT_mesh_shader with vec4 outputs. No code is taken from either. The zeroed locals and the mesh kernel's NoContraction are the ideas of DeathKhan's
+# nx2android fork (github.com/DeathKhan/nx2android, b77d948 and fe4ca70, for its mesh shaders emulated in compute), written anew here.
 import struct
 
 # SPIR-V numbers (the unified grammar, SPV_EXT_mesh_shader)
 OP_NAME, OP_EXTENSION, OP_EXTINSTIMPORT, OP_MEMORYMODEL, OP_ENTRY, OP_EXECMODE, OP_CAPABILITY = 5, 10, 11, 14, 15, 16, 17
 OP_TYPEVOID, OP_TYPEBOOL, OP_TYPEINT, OP_TYPEFLOAT, OP_TYPEVECTOR, OP_TYPEARRAY, OP_TYPESTRUCT, OP_TYPEPOINTER, OP_TYPEFUNCTION = 19, 20, 21, 22, 23, 28, 30, 32, 33
+OP_CONSTANTNULL = 46
 OP_CONSTANT, OP_FUNCTION, OP_FUNCTIONEND, OP_FUNCTIONCALL, OP_VARIABLE, OP_LOAD, OP_STORE, OP_ACCESSCHAIN = 43, 54, 56, 57, 59, 61, 62, 65
 OP_DECORATE, OP_MEMBERDECORATE, OP_COMPOSITECONSTRUCT, OP_COMPOSITEEXTRACT, OP_BITCAST, OP_IADD, OP_FADD, OP_IMUL, OP_FMUL = 71, 72, 80, 81, 124, 128, 129, 132, 133
 OP_ULESSTHAN, OP_IEQUAL, OP_SHIFTRIGHTLOGICAL, OP_SHIFTLEFTLOGICAL, OP_BITWISEAND, OP_PHI, OP_LOOPMERGE, OP_SELECTIONMERGE = 176, 170, 194, 196, 199, 245, 246, 247
@@ -28,7 +30,8 @@ MODEL_GLCOMPUTE, MODEL_TASK, MODEL_MESH = 5, 5364, 5365
 CAP_MESH = 5283
 MODE_OUTPUTVERTICES, MODE_OUTPUTPOINTS, MODE_OUTPUTLINES, MODE_OUTPUTPRIMITIVES, MODE_OUTPUTTRIANGLES = 26, 27, 5269, 5270, 5298
 SC_INPUT, SC_OUTPUT, SC_WORKGROUP, SC_FUNCTION, SC_PUSHCONSTANT, SC_PAYLOAD = 1, 3, 4, 7, 9, 5402
-DEC_BLOCK, DEC_BUILTIN, DEC_INVARIANT, DEC_LOCATION, DEC_OFFSET, DEC_PERPRIMITIVE = 2, 11, 18, 30, 35, 5271
+DEC_BLOCK, DEC_BUILTIN, DEC_INVARIANT, DEC_NOCONTRACTION, DEC_LOCATION, DEC_OFFSET, DEC_PERPRIMITIVE = 2, 11, 18, 42, 30, 35, 5271
+FLOAT_ARITH = {127, 129, 131, 133, 136, 140, 141, 142, 143, 144, 145, 146, 147, 148}   # OpFNegate .. OpDot: the instructions NoContraction applies to
 BI_POSITION, BI_POINTSIZE, BI_WORKGROUPID, BI_LOCALINDEX = 0, 1, 26, 29
 BI_POINT_INDICES, BI_LINE_INDICES, BI_TRIANGLE_INDICES = 5294, 5295, 5296
 SCOPE_WORKGROUP, SEM_ACQREL_WORKGROUP = 2, 0x108
@@ -62,6 +65,7 @@ class _Module:
         self.consts = {}
         for x in ins:
             if x[0] == OP_CONSTANT and len(x) == 4: self.consts.setdefault((x[1], x[3]), x[2])
+        self.nulls = {x[1]: x[2] for x in ins if x[0] == OP_CONSTANTNULL}
 
     def new(self):
         self.bound += 1; return self.bound - 1
@@ -75,6 +79,11 @@ class _Module:
         if (ty, bits) not in self.consts:
             c = self.new(); self.glob.append([OP_CONSTANT, ty, c, bits]); self.consts[(ty, bits)] = c
         return self.consts[(ty, bits)]
+
+    def null(self, ty):
+        if ty not in self.nulls:
+            c = self.new(); self.glob.append([OP_CONSTANTNULL, ty, c]); self.nulls[ty] = c
+        return self.nulls[ty]
 
     def var(self, ty, sc, *decor):
         p = self.type(OP_TYPEPOINTER, sc, ty); v = self.new(); self.glob.append([OP_VARIABLE, p, v, sc])
@@ -145,6 +154,27 @@ def _storage_buffers(m, ins):
         elif x[0] == OP_FUNCTIONPARAMETER and x[1] in sbp: raise ValueError('a storage buffer passed to a function: not retyped')
 
 
+def _zero_locals(m, ins):
+    """Every Function variable without an initializer starts at its type's zero → how many. The translator's locals are the shader's registers, undefined until the
+    first store, and a translated task or mesh kernel reads some of them on a path with no store first (Ocarina of Time's grass: task 99280b7b8aae78df, mesh
+    65a079a285d693a0 and eb021183bf9b0092). On Adreno that read gets whatever the compiler left in the register, which turned the grass and leaves white"""
+    ptr = {x[1]: x[3] for x in ins if x[0] == OP_TYPEPOINTER and x[2] == SC_FUNCTION}; n = 0
+    for x in ins:
+        if x[0] == OP_VARIABLE and len(x) == 4 and x[3] == SC_FUNCTION and x[1] in ptr: x.append(m.null(ptr[x[1]])); n += 1
+    return n
+
+
+def _no_contraction(m, code):
+    """Every float arithmetic result is decorated NoContraction → how many. Ocarina of Time draws its foliage twice with two mesh shaders, a depth prepass and a colour
+    pass tested EQUAL, so both must compute a vertex's position to the bit. Invariant on the position output doesn't do that here: the kernel computes the position
+    into the stage memory and the entry point copies it out, and invariance doesn't follow a value through memory. The Adreno compiler then fused a multiply and an
+    add in one kernel and not in the other, and the colour pass lost blades to the depth test (white specks). The translator writes the shader's own fused
+    multiply-adds as Fma, so nothing the shader asks for is lost"""
+    ids = [x[2] for x in code if x[0] in FLOAT_ARITH]
+    m.annot += [[OP_DECORATE, r, DEC_NOCONTRACTION] for r in ids]
+    return len(ids)
+
+
 def wrap(data, info, lay, gl=False, max_groups=MAX_GROUPS):
     """The compute module data (dmsh_xlate's SPIR-V of a task or mesh job) as a task or mesh module. info: dmsh_meshstage.info; lay: dmsh_meshstage.memory's offsets.
     → (SPIR-V bytes, the mask of per-primitive output locations)"""
@@ -162,7 +192,7 @@ def wrap(data, info, lay, gl=False, max_groups=MAX_GROUPS):
     mems = [x for x in shared if ptr[x[1]][1] in arr and arr[ptr[x[1]][1]][0] == uint_t]
     if len(shared) != 1 or len(mems) != 1: raise ValueError(f'{kind}: {len(shared)} workgroup variables, not the stage memory alone')
     mem, words = mems[0][2], cval[arr[ptr[mems[0][1]][1]][1]]
-    m = _Module(hdr, ins); _storage_buffers(m, ins); fn = _Fn(m); u, f, b = fn.u, fn.f, fn.b
+    m = _Module(hdr, ins); _storage_buffers(m, ins); _zero_locals(m, ins); fn = _Fn(m); u, f, b = fn.u, fn.f, fn.b
     void = m.type(OP_TYPEVOID); fty = m.type(OP_TYPEFUNCTION, void)
     pwu = m.type(OP_TYPEPOINTER, SC_WORKGROUP, u)
     v3u = m.type(OP_TYPEVECTOR, u, 3); v4f = m.type(OP_TYPEVECTOR, f, 4)
@@ -225,7 +255,8 @@ def wrap(data, info, lay, gl=False, max_groups=MAX_GROUPS):
         p_out = out + v_blocks * len(vertex) * BLOCK
         members = lambda comps: {n: [comps.index((n, c)) if (n, c) in comps else None for c in range(4)] for n in dict.fromkeys(n for n, _ in comps)}
         vm, pm = members(vertex), members(primitive)
-        # the outputs: position (invariant, as a vertex shader's: Ocarina of Time draws foliage with a mesh depth prepass and a mesh colour pass tested EQUAL), point size, vec4 per location
+        # the outputs: position (invariant, as a vertex shader's: Ocarina of Time draws foliage with a mesh depth prepass and a mesh colour pass tested EQUAL; with
+        # _no_contraction below for the kernel's part), point size, vec4 per location
         av = m.type(OP_TYPEARRAY, v4f, m.const(u, max_v)); af = m.type(OP_TYPEARRAY, f, m.const(u, max_v))
         ap = m.type(OP_TYPEARRAY, v4f, m.const(u, max(max_p, 1)))
         pov4 = m.type(OP_TYPEPOINTER, SC_OUTPUT, v4f); pof = m.type(OP_TYPEPOINTER, SC_OUTPUT, f)
@@ -283,6 +314,7 @@ def wrap(data, info, lay, gl=False, max_groups=MAX_GROUPS):
         modes = [[OP_EXECMODE, entry, MODE_OUTPUTVERTICES, max_v], [OP_EXECMODE, entry, MODE_OUTPUTPRIMITIVES, max_p],
                  [OP_EXECMODE, entry, {1: MODE_OUTPUTPOINTS, 2: MODE_OUTPUTLINES, 3: MODE_OUTPUTTRIANGLES}[verts]]]
     fn.code.append([OP_FUNCTIONEND])
+    if kind == 'ms': _no_contraction(m, ins + fn.code)
     # the module put together: SPIR-V 1.4, the capability and extension, the new entry point over every global, the kernel's execution modes moved to it
     m.hdr[1] = VERSION_1_4; m.hdr[3] = m.bound
     globals_ = [x[2] for x in ins if x[0] == OP_VARIABLE and x[3] != SC_FUNCTION] + [x[2] for x in m.glob if x[0] == OP_VARIABLE]
