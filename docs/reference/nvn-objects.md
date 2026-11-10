@@ -753,7 +753,7 @@ Games read this count as a position in their own command memory and size their h
 - **Symptom:** a SIGSEGV on the game's `Renderer` thread a few seconds into loading, before the first frame, at `main+0x1aa90ac` (Frostpunk 1.0.1): a virtual call through an object whose first words are floats (±1.0, a quad's vertices), with the slot argument 64.
 - **Cause:** `nvnDeviceGetInteger` answered 4096 for item 0x5F, `SEPARATE_SAMPLER_BINDINGS_PER_STAGE`, a guess from the sampler pool's size; the table measured on a Switch has no 0x5F. Frostpunk's renderer keeps a binding table of 32 slots per stage, takes its slot count as min(0x5E, 0x5F) (`main+0x1aa68d4`, then min(128, 4096) = 128) and clears that many slots each frame (`main+0x762f50`), so it wrote 96 slots past the table and released whatever object pointers lay there.
 - **Fix:** 0x5F answers 32 (`hle_nvn.c` `g_devinfo`): NVN2's own constant for the item is 32, the driver keeps the separate samplers' handles after the 128 separate textures' (c2 0x568 + 8 × slot), and a game written for the Switch that sizes a table of 32 to this minimum can only have seen 32 or less. `t_nvn.c` checks 0x5E and 0x5F.
-- **Found on:** Frostpunk (`0100B1C0249B4000`, SDK 20.5.19, 11 bit studios' Liquid engine): Mac and Android.
+- **Found on:** [Frostpunk](../../dm/games/0100B1C0249B4000/README.md) (SDK 20.5.19, 11 bit studios' Liquid engine): Mac and Android.
 
 ### Extensions fetched by name and called unchecked
 
