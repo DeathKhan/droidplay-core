@@ -1769,6 +1769,13 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** as on Metal ([Compressed textures as render targets through an uncompressed shadow](#compressed-textures-as-render-targets-through-an-uncompressed-shadow)): `rp_prepare` attaches a shadow image of blocks × blocks in the view's format (`bcrt_shadow`, made once per base image, level, layer and format), copies the level's (layer's, or 3D depth plane's) blocks into it first, and `rp_end` copies them back (`bcrt_copy`: `vkCmdCopyImage` between a format and a compressed one of the same block size). The shadows go with their base image (`bcrt_drop` from `views_drop`).
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): agl's BC4 block encoder writes a 32×32×32 BC4 3D texture one depth plane per pass through an RGBA16UI view; three faulting submissions at every start on an Ayn Odin 2 (Adreno 740, driver 0676.32), none after the fix. One of them held the sky's scattering-table upload, so the sky stayed murky olive.
 
+### BC textures decoded on the CPU, viewed in their BC formats (Android)
+
+- **Symptom:** Android, on a GPU without BC textures (the device line says `BC decoded on the CPU`: the Pixel 9 Pro XL's Mali-G715): `[RED] [vk] texture view in format 139 over an image of format 9: read in the image's`, a BC4 view of a BC4 texture whose image holds R8 once decoded. A view in the texture's sRGB twin (BC7_SRGB over BC7) was read in the image's UNORM format, so its colours were not decoded from sRGB.
+- **Cause:** on such a GPU `vt_create` decodes a BC texture into an uncompressed image (`bc_target`: RGBA8, R8, RG8 or RGBA16F), but `view_format` compared the view's BC format with the image's decoded one, and the decoded image was made without MUTABLE_FORMAT, so no view of it could take another format.
+- **Fix:** `view_format` maps a decoded image's BC view format through `bc_target` first: the image's own BC format is the image itself, its sRGB twin is the decoded format's twin. A decoded colour image lists its format and that twin, as an uncompressed one does ([Colour images keep Adreno's framebuffer compression](#colour-images-keep-adrenos-framebuffer-compression)). A GPU with BC textures is unchanged: its images are never decoded.
+- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) on a Pixel 9 Pro XL (Mali-G715, driver 0xd803000, Vulkan 1.4.343): the red line at the Start menu, gone with the fix; the Start menu and the opening cutscene draw right at 60 fps with or without it.
+
 ### Replay syncs limited to what is read
 
 - **Symptom:** low frame rate with the GPU and the CPU both mostly idle; the render thread waiting in `view_` / `submit_wait`.
