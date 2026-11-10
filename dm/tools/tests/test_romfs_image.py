@@ -153,6 +153,7 @@ class Images(unittest.TestCase):
         self.assertEqual(self.dst.read_bytes(), original)
         self.assertFalse(Path(str(self.dst) + '.part').exists())
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'push_romfs.sh to an iPhone or iPad: BSD stat and Apple device tools (DroidPlay Core runs this file on Linux too)')
     def test_push_helper_refreshes_cache_and_propagates_copy_failure(self):
         resources = self.root / 'resources.env'
         resources.write_text('DM_RESOURCE_ROMFS=' + shlex.quote(str(self.src)) + '\n')
