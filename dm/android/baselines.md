@@ -184,10 +184,15 @@ Numbered in the order they were found, so links to a number stay right:
    host mapped each module where `mmap` put it, and on Android what lay past main depended on what other mappings had filled the gap by then. The modules
    are now mapped back to back: [Modules back to back, as Horizon maps them](../../docs/reference/memory.md#modules-back-to-back-as-horizon-maps-them-android).
    On the Retroid Pocket 5 0 of 11 boots crashed after it, and 6 of 6 on the same build with `DM_MODULE_PACK=0` (the old placement), each at `main+0x214c889`.
-10. **Skyward Sword HD draws Skyloft's terrain and sky flat grey** on the Odin 2 and the Pad 3, with no red line. A pass dump on the Pad 3 shows the terrain
-    grey in the first pass that draws it, while Link and the bird statue, drawn next with the same ASTC 6×6 textures, have their colours. The terrain's draws
-    also sample 64×64 textures the game renders earlier in the frame, which come out black from the game's own constants; whether that is right also needs
-    a Mac dump to compare. The opening movie is right.
+10. **Fixed, cause not bisected: Skyward Sword HD drew Skyloft's terrain and sky flat grey** on the Odin 2 and the Pad 3, with no red line. A pass dump on the
+    Pad 3 showed the terrain grey in the first pass that draws it, while Link and the bird statue, drawn next with the same ASTC 6×6 textures, had their colours.
+    The terrain's draws also sample 64×64 textures the game renders earlier in the frame, which came out black. The opening movie was right.
+    - **Check (2026-11-10, no build):** Skyloft is in colour on both. Each ran the `skyloft` route with the SSHD it held. On the Odin 2 that was SSHD's code and
+      shaders from `cf42941d` (chain 4) and a host from the RP5 save-fix branch of that morning (#123, since merged): three runs, 56–60 fps. On the Pad 3 it was
+      DroidPlay 0.7.0-1-g4743c9da with SSHD's files from 2026-11-09 22:08 (chain 4): two runs, 60 fps, GPU 6.8 ms.
+    - Grey was last recorded on `main` at `ee18169a` (2026-11-08). The wide-subgroup rewrite (`DM_SPV_WIDE=0`) and layered targets (SSHD makes no layered pass) are not
+      what fixed it. Candidates, not tested: the replay's copy fixes of 2026-11-08, texture copies between formats converting (`97fce01c`) and depth-stencil copies a
+      blit cannot make drawn (`b86d5505`).
 11. **Fixed for Skyward Sword HD: it played at 30 fps** on the Odin 2 and the Pad 3 (the Mac runs Skyloft at 60): the game drops its present interval
     to 2 when frames come late. Its long frames showed the replay writing a 1920×1080 RGBA8 render target back to guest memory after its pass (`[vk]
     linear render target s19 1920x1080 (format 0x25) written back to guest memory`) and uploading it again (`texture uploads 0 first + 2 re-uploads,
