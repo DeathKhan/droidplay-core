@@ -33,7 +33,7 @@ median GPU time per frame. Animal Crossing runs at 30 fps on the Switch too.
 | Super Mario Odyssey, the opening cutscene (Start pressed on a fresh save) | 59.9 · 16.7 / 18.4 · GPU 5.5 (one run crashed at boot) | 59.9 · 16.7 / 18.9 · GPU 9.3 | **38** · 25.9 / 30.6–31.5 · GPU 12.9 | 60 · 16.6 / 19.3–19.4 · GPU 9.9 |
 | Super Mario Odyssey, play (the Cap Kingdom, at the Look Around hint) | 60 · 16.7 / 18.5 · GPU 4.5 (one run, 15 s; it crashed at the hint video before the fix in problem 1) | not run | not run | not run |
 | **Pokémon Brilliant Diamond 1.3.0**, language menu (a fresh save) | 60 · 16.7 / 19.2–19.4 | 60 · 16.6–16.7 / 18.5–18.8 | 60 · 16.6–16.7 / 18.1–19.4 (2026-11-10, after problem 2's fix) | not run |
-| Pokémon Brilliant Diamond, Eterna City (a save) | 60 · 16.6 / 18.1–18.2 · GPU 8.1 | 58.9–59.7 · 16.6–16.8 / 18.8–19.7 · GPU 10.7 | **14.9** · 66.8–66.9 / 72.8–73.2 · GPU 16.0–16.1 (2026-11-10, after problem 2's fix; problem 13) | not run |
+| Pokémon Brilliant Diamond, Eterna City (a save) | 60 · 16.6 / 18.1–18.2 · GPU 8.1 | 58.9–59.7 · 16.6–16.8 / 18.8–19.7 · GPU 10.7 | 54.6–60.0 · 16.6–18.2 / 18.5–21.3 · GPU 13.5–15.0 (2026-11-10, after problem 13's fix; 24.0–24.6 before) | not run |
 | **Animal Crossing: New Horizons 3.0.3**, the new game's airport (a fresh save) | 30 · 33.3 / 34.7–35.4 · GPU 5.3 | 30 · 33.3 / 35.7–35.8 · GPU 7.1 | 30 · 33.4 / 36.5–36.7 · GPU 15.8 | 30 · 33.4 / 35.8–35.9 · GPU 15.8 |
 | Animal Crossing, outside the player's house (a save) | 30 · 33.3–33.4 / 35.7–35.8 · GPU 9.4–9.7 | 29.9 · 33.3–33.4 / 38.0–38.1 · GPU 15.5–15.9 | Not measured: the game stops at its first save (see below) | 30 · 33.2–33.4 / 35.6–36.3 · GPU 22.7–23.1 |
 | **Super Smash Bros. Ultimate 13.0.5**, boot with Android's Roboto as the shared font (fixed: problem 3) | **Crashes** 2–4 s in | **Crashes** | **Crashes** | not run (fixed before) |
@@ -158,12 +158,13 @@ Numbered in the order they were found, so links to a number stay right:
     replay's recording of about 616 draws 9.7 ms on the game's thread (`@nvn_ms`), a 9.0 ms `nvnSyncWait` on the GPU (`@sync_ms`), GPU 12.9 ms at 490
     MHz, the floor this device keeps (`min_pwrlevel` 3; 670 MHz at most), 44% busy. The wait and the work after it are in series, so a frame's work takes about
     24 ms, two vsyncs; 60 fps needs the recording cost or the GPU's time to come down by about a third, or the two to overlap. Not worked on yet.
-13. **Brilliant Diamond's Eterna City runs at 15 fps on the Retroid Pocket 5's own driver** (14.9 fps, frame p50 66.8–66.9 ms, GPU 16.0–16.1 ms; since problem 2's
-    fix), against 57.7–58.2 fps (GPU 8.8–9.2 ms) with Turnip on the same build, back to back. `NVN submit+present` is nearly all of the frame, and the completion
-    thread (`vk-done`) is on a CPU 78% of the time: simpleperf puts 70% of its samples on the loads of `wb_apply`'s compare of storage-buffer write-backs with their
-    snapshots (`chunk_done`) and 21% on `memcpy`. That is the symptom of [Storage buffer write-backs read from cached memory on Vulkan](../../docs/reference/rendering.md#storage-buffer-write-backs-read-from-cached-memory-on-vulkan),
-    though here the arena already takes the cached coherent type (type 4, flags `0xf`, of the types `0x11`): on this driver the CPU reads GPU-written memory slowly
-    anyway. Not worked on yet.
+13. **Fixed: Brilliant Diamond's Eterna City ran at 15–25 fps on the Retroid Pocket 5's own driver** (14.9 fps after problem 2's fix, 24.0–24.6 on `main` at `4743c9da`,
+    frame p50 40–41 ms, GPU 16.8–17.0 ms), against 57.7–58.2 fps with Turnip on the same build. The completion thread (`vk-done`) took 26 ms a frame landing six
+    storage-buffer write-backs of about 494 KB: the driver lists the arena's memory type 4 as cached and coherent (`0xf`), but the CPU maps it uncached (1.3–1.6 GB/s
+    with wide loads, about 50 ns a byte in `wb_apply`'s byte loop, against 11–13 GB/s from malloc'd memory). The GPU now copies such write-backs into a cached
+    transfer-destination buffer (type 2, `0xb`) at each submission's end and the completion thread reads them from there, 1.7 ms a frame: Eterna City at 54.6–60.0 fps
+    (60.0 in three runs of four; frame p50 16.6–18.2 ms, GPU 13.5–15.0 ms) in runs alternating with `main`'s, the picture the same. [Storage buffer write-backs read from
+    memory the CPU maps uncached](../../docs/reference/rendering.md#storage-buffer-write-backs-read-from-memory-the-cpu-maps-uncached).
 
 14. **Open: Breath of the Wild loses the GPU on the Pad 3** at its first frame in the field. Then `vkQueueSubmit` gives -4 (`VK_ERROR_DEVICE_LOST`), the loading screen stays up for good, and the GPU time reads 0.
     - **What hangs.** One draw a frame hangs the GPU: vertex `2decd3e894b3736a`, fragment `26ae1640f3448ba4`, a fullscreen triangle sampling one 640×360 RGBA8 texture into another, the vertical pass of a blur whose horizontal pass runs fine just before it. The driver recovers each hang about 250 ms in (the chunk's fence signals, its end timestamp never written) until one runs past 3 s. `VK_EXT_device_fault` gives no address and no vendor record.

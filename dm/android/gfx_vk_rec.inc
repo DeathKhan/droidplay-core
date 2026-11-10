@@ -19,7 +19,7 @@
 #include <sched.h>
 enum { RQ_SIZE = 8u << 20 };   // about 25,000 records a frame of 30 to 200 bytes: several frames' worth
 enum { R_BEGINQ = 1, R_BEGINRP, R_BINDDS, R_BINDIB, R_BINDP, R_BINDVB, R_BLIT, R_CLRATT, R_CLRCOL, R_CLRDS, R_CPB2I, R_CPI, R_CPI2B, R_DISPATCH, R_DRAW, R_DRAWIDX, R_ENDQ, R_ENDRP,
-       R_BARRIER, R_PUSH, R_RESETQ, R_RESOLVE, R_BLENDC, R_DBIAS, R_SCISSOR, R_SCMASK, R_SREF, R_SWMASK, R_VIEWPORT, R_TS, R_BEGINCB, R_ENDCB, R_SUBMIT, R_WRAP };
+       R_BARRIER, R_PUSH, R_RESETQ, R_RESOLVE, R_BLENDC, R_DBIAS, R_SCISSOR, R_SCMASK, R_SREF, R_SWMASK, R_VIEWPORT, R_TS, R_BEGINCB, R_ENDCB, R_SUBMIT, R_WRAP, R_CPB };
 typedef struct { uint32_t fn, n; VkCommandBuffer cb; } rq_hdr;   // n: the record's bytes, header included, a multiple of 16
 static uint8_t *g_rq;
 static _Atomic uint64_t g_rq_w, g_rq_r;   // bytes written / made since the start (the ring offset is the count modulo RQ_SIZE)
@@ -127,6 +127,12 @@ static void rec_vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage i, VkIma
     if (!rec_on()) { vkCmdClearDepthStencilImage(cb, i, l, v, n, rg); return; }
     uint8_t *r = rq_take(R_CLRDS, cb, sizeof(rq_hdr) + sizeof(a_clrds) + n * sizeof *rg), *d = r + sizeof(rq_hdr) + sizeof(a_clrds);
     *(a_clrds *)(void *)(r + sizeof(rq_hdr)) = (a_clrds){i, l, *v, n}; RQ_ARR(d, rg, n); rq_push(r);
+}
+typedef struct { VkBuffer s, d; uint32_t n; } a_cpb;
+static void rec_vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffer sb, VkBuffer db, uint32_t n, const VkBufferCopy *rg) {
+    if (!rec_on()) { vkCmdCopyBuffer(cb, sb, db, n, rg); return; }
+    uint8_t *r = rq_take(R_CPB, cb, sizeof(rq_hdr) + sizeof(a_cpb) + n * sizeof *rg), *d = r + sizeof(rq_hdr) + sizeof(a_cpb);
+    *(a_cpb *)(void *)(r + sizeof(rq_hdr)) = (a_cpb){sb, db, n}; RQ_ARR(d, rg, n); rq_push(r);
 }
 typedef struct { VkBuffer b; VkImage i; VkImageLayout l; uint32_t n; } a_cpb2i;
 static void rec_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer b, VkImage i, VkImageLayout l, uint32_t n, const VkBufferImageCopy *rg) {
@@ -272,6 +278,7 @@ static void rq_make(const uint8_t *rec) {   // one record's call
                          vkCmdClearAttachments(cb, a->na, at, a->nr, rc); break; }
         case R_CLRCOL: { const a_clrcol *a = (const void *)s; vkCmdClearColorImage(cb, a->i, a->l, &a->v, a->n, (const VkImageSubresourceRange *)(const void *)(s + sizeof *a)); break; }
         case R_CLRDS: { const a_clrds *a = (const void *)s; vkCmdClearDepthStencilImage(cb, a->i, a->l, &a->v, a->n, (const VkImageSubresourceRange *)(const void *)(s + sizeof *a)); break; }
+        case R_CPB: { const a_cpb *a = (const void *)s; vkCmdCopyBuffer(cb, a->s, a->d, a->n, (const VkBufferCopy *)(const void *)(s + sizeof *a)); break; }
         case R_CPB2I: { const a_cpb2i *a = (const void *)s; vkCmdCopyBufferToImage(cb, a->b, a->i, a->l, a->n, (const VkBufferImageCopy *)(const void *)(s + sizeof *a)); break; }
         case R_CPI: { const a_cpi *a = (const void *)s; vkCmdCopyImage(cb, a->s, a->sl, a->d, a->dl, a->n, (const VkImageCopy *)(const void *)(s + sizeof *a)); break; }
         case R_CPI2B: { const a_cpi2b *a = (const void *)s; vkCmdCopyImageToBuffer(cb, a->i, a->l, a->b, a->n, (const VkBufferImageCopy *)(const void *)(s + sizeof *a)); break; }
@@ -337,6 +344,7 @@ static void *rq_thread(void *arg) {
 #define vkCmdClearAttachments rec_vkCmdClearAttachments
 #define vkCmdClearColorImage rec_vkCmdClearColorImage
 #define vkCmdClearDepthStencilImage rec_vkCmdClearDepthStencilImage
+#define vkCmdCopyBuffer rec_vkCmdCopyBuffer
 #define vkCmdCopyBufferToImage rec_vkCmdCopyBufferToImage
 #define vkCmdCopyImage rec_vkCmdCopyImage
 #define vkCmdCopyImageToBuffer rec_vkCmdCopyImageToBuffer

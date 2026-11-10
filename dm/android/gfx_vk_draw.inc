@@ -524,7 +524,8 @@ static void key_hex(const uint8_t k[8], char out[17]) { static const char *hx = 
 // type, cached and coherent (types 0 and 6: flags 0x1 and 0xf), so the arena was cached there all along. Mesa's Turnip lists a write-combined type first (types 0 to 2:
 // 0x7, then 0xf), which the arena took: Pokémon Brilliant Diamond's write-backs held the completion thread about 37 ms a frame, the replay waited for free chunks (cur)
 // and the game ran at 20 fps; 60 fps in the cached type, GPU time unchanged (5.9 against 6.1 ms). DM_VK_ARENA_CACHED=0 (env.txt): the first host-visible coherent type,
-// as before (the A/B of this alone)
+// as before (the A/B of this alone). A type's flags do not say how the CPU maps it: the Retroid Pocket 5's driver maps its cached coherent type uncached, and the write-backs
+// are then read through a cached copy (gfx_vk_readback.inc)
 static uint32_t ar_mem_type(uint32_t bits) {
     static int cached = -1, logged;
     if (cached < 0) { const char *e = getenv("DM_VK_ARENA_CACHED"); cached = !(e && *e == '0'); }
@@ -534,13 +535,13 @@ static uint32_t ar_mem_type(uint32_t bits) {
                        cached ? "" : " (DM_VK_ARENA_CACHED=0: the first host-visible coherent type)");
     return mt;
 }
+#define AR_USAGE (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | \
+                  VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)   // also gfx_vk_readback.inc rb_speed
 // the current chunk's (gfx_vk.c): blocks kept and reused when it completes
 static int ar_new(VkDeviceSize n) {
     if (C->nar == C->car) { C->car = C->car ? 2 * C->car : 8; C->ar = realloc(C->ar, C->car * sizeof *C->ar); }
     arena_blk *a = &C->ar[C->nar]; memset(a, 0, sizeof *a);
-    VkBufferCreateInfo bc = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
+    VkBufferCreateInfo bc = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = AR_USAGE};
     if (vkCreateBuffer(g_vk.dev, &bc, NULL, &a->b) != VK_SUCCESS) return 0;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, a->b, &mr);
     uint32_t mt = ar_mem_type(mr.memoryTypeBits);
