@@ -4,7 +4,8 @@ The first baselines of DroidPlay Core (then droidnative) on more than one device
 `scripts/bench_android.py` (the same save, scripted input and measuring window). The first four were measured 2026-11-08 on its `main` at `f4f7abb3`
 with PR #1 (the present's vsync sleep outside the submission lock) and PR #3 (the game window keeps the screen on); The Legend of Zelda: Link's Awakening
 and Skyward Sword HD the same evening on `main` at `ee18169a`. Each game was packed by `build_android_from_nsp.py`. They are a starting point for fixes,
-not a verdict: every known problem below that is not marked fixed is open.
+not a verdict: every known problem below that is not marked fixed is open. The Samsung Galaxy S25 Edge's column and Final Fantasy Resonance's rows were
+added 2026-11-10, measured the same way on `main` at `cf42941d` (Brilliant Diamond not yet on the S25 Edge).
 
 ## Devices
 
@@ -13,8 +14,9 @@ not a verdict: every known problem below that is not marked fixed is open.
 | Ayn Odin 2 | QCS8550 (Snapdragon 8 Gen 2) | Adreno 740, V@0676.32, 1.3.128 | 13 | 12 GB |
 | OnePlus Pad 3 | SM8750P (Snapdragon 8 Elite) | Adreno 830, V@0800.74, 1.3.284 | 16 | 12 GB |
 | Retroid Pocket 5 | SM8250 (Snapdragon 865) | Adreno 650, V@0746.0, 1.1.128 | 13 | 8 GB |
+| Samsung Galaxy S25 Edge | SM8750 (Snapdragon 8 Elite for Galaxy) | Adreno 830, V@0800.40.1, 1.3.284 | 16 | 12 GB |
 
-All three use 4 KB pages. The Odin 2 and the Retroid Pocket 5 have built-in controls; the Pad 3 shows the on-screen controls over the game.
+All four use 4 KB pages. The Odin 2 and the Retroid Pocket 5 have built-in controls; the Pad 3 and the S25 Edge show the on-screen controls over the game.
 
 The RAM column is the device's installed capacity, not a measurement of how much memory a game uses. These baselines report frame rates and frame
 times, not per-game peak memory use or a matched memory-use comparison with an emulator. A result on the 8 GB Retroid Pocket 5 does not establish
@@ -25,30 +27,33 @@ how the same game runs on a different 8 GB device.
 Frames per second over a 30 s window, then frame time p50 / p95 in ms, from two measured runs after a warm-up run (ranges where they differ). GPU is the
 median GPU time per frame. Animal Crossing runs at 30 fps on the Switch too.
 
-| Game, scene | Odin 2 | Pad 3 | Retroid Pocket 5 |
-|---|---|---|---|
-| **Super Mario Odyssey 1.4.1**, Start menu (a fresh save) | 60 · 16.7 / 17.6–18.7 | 60 · 16.6 / 18.0 | 60 · 16.6 / 17.5–17.9 |
-| Super Mario Odyssey, the opening cutscene (Start pressed on a fresh save) | 59.9 · 16.7 / 18.4 · GPU 5.5 (one run crashed at boot) | 59.9 · 16.7 / 18.9 · GPU 9.3 | **38** · 25.9 / 30.6–31.5 · GPU 12.9 |
-| Super Mario Odyssey, play (the Cap Kingdom, at the Look Around hint) | 60 · 16.7 / 18.5 · GPU 4.5 (one run, 15 s; it crashed at the hint video before the fix in problem 1) | not run | not run |
-| **Pokémon Brilliant Diamond 1.3.0**, language menu (a fresh save) | 60 · 16.7 / 19.2–19.4 | 60 · 16.6–16.7 / 18.5–18.8 | 60 · 16.6–16.7 / 18.1–19.4 (2026-11-10, after problem 2's fix) |
-| Pokémon Brilliant Diamond, Eterna City (a save) | 60 · 16.6 / 18.1–18.2 · GPU 8.1 | 58.9–59.7 · 16.6–16.8 / 18.8–19.7 · GPU 10.7 | **14.9** · 66.8–66.9 / 72.8–73.2 · GPU 16.0–16.1 (2026-11-10, after problem 2's fix; problem 13) |
-| **Animal Crossing: New Horizons 3.0.3**, the new game's airport (a fresh save) | 30 · 33.3 / 34.7–35.4 · GPU 5.3 | 30 · 33.3 / 35.7–35.8 · GPU 7.1 | 30 · 33.4 / 36.5–36.7 · GPU 15.8 |
-| Animal Crossing, outside the player's house (a save) | 30 · 33.3–33.4 / 35.7–35.8 · GPU 9.4–9.7 | 29.9 · 33.3–33.4 / 38.0–38.1 · GPU 15.5–15.9 | Not measured: the game stops at its first save (see below) |
-| **Super Smash Bros. Ultimate 13.0.5**, boot with Android's Roboto as the shared font (fixed: problem 3) | **Crashes** 2–4 s in | **Crashes** | **Crashes** |
-| Smash, the opening movie (with a hinted shared font, now packed with the game) | 60 · 12.0 / 33.9 | 59.9 · 13.1–13.4 / 34.7–35.1 | 59.7 · 13.5–13.9 / 35.5–36.0 |
-| Smash, a battle (a fuller shared font; stage and CPU fighter vary) | 39.7–59.3 fps | 16.8–29.7 fps, frames up to 215 ms | 13.4–19.3 fps, frames up to 368 ms |
-| **The Legend of Zelda: Link's Awakening 1.1.0**, the opening movie (a fresh save) | 59.8–59.9 · 16.7 / 17.6–17.7 · GPU 2.3–2.4 | 59.7 · 16.7 / 16.8 · GPU 4.5 (the other run crashed at boot) | 57.4–58.9 · 16.7 / 17.0–18.6 · GPU 5.6–6.4 (10 runs, 2026-11-10, after problem 9's fix) |
-| Link's Awakening, the overworld at the Ancient Ruins (a save) | 59.9–60 · 16.7 / 17.2–17.3 · GPU 4.1 | 31.3 · 33.2 / 34.7 · GPU 12.0 (the other run crashed at boot) | 34.7–36.0 · 32.8–33.0 / 34.5 · GPU 12.8 (2026-11-10, after problem 9's fix; the game falls to its 30 fps interval, problem 12) |
-| **The Legend of Zelda: Skyward Sword HD 1.0.1**, the opening movie (a fresh save) | 55.2–55.9 · 18.1–18.3 / 36.6–37.7 · GPU 2.3–2.4 | 59.9–60 · 16.7 / 24.5–25.1 · GPU 2.8 | 41.1–41.4 · 24.4–24.6 / 49.1–49.8 · GPU 3.7 |
-| Skyward Sword HD, Skyloft's plaza (a save) | 30.0–30.5 · 33.3 / 36.6–46.8 · GPU 4.8–4.9 | 30.0–34.0 · 30.6–32.9 / 44.4–46.5 · GPU 12.6–12.8 | Not measured: the game stops at its first save (see below) |
-| **The Legend of Zelda: Breath of the Wild 1.9.0**, the Shrine of Resurrection (the `outdoors` save, a 40 s window) | not run (the device held by another session) | **GPU lost** at the first frame in the field (problem 14); with the hanging draw skipped: 20.0 · 48.6–49.2 / 68–71 · GPU 22.3 on main, **30.0 · 33.1–33.4 / 38.2–38.9 · GPU 15.5–16.6** with droidplay-core#91, #93, #97 and #108 (BotW's defaults, held until it has run on a second device) | not run |
+| Game, scene | Odin 2 | Pad 3 | Retroid Pocket 5 | Galaxy S25 Edge |
+|---|---|---|---|---|
+| **Super Mario Odyssey 1.4.1**, Start menu (a fresh save) | 60 · 16.7 / 17.6–18.7 | 60 · 16.6 / 18.0 | 60 · 16.6 / 17.5–17.9 | 60 · 16.7 / 17.6–17.7 · GPU 2.2 |
+| Super Mario Odyssey, the opening cutscene (Start pressed on a fresh save) | 59.9 · 16.7 / 18.4 · GPU 5.5 (one run crashed at boot) | 59.9 · 16.7 / 18.9 · GPU 9.3 | **38** · 25.9 / 30.6–31.5 · GPU 12.9 | 60 · 16.6 / 19.3–19.4 · GPU 9.9 |
+| Super Mario Odyssey, play (the Cap Kingdom, at the Look Around hint) | 60 · 16.7 / 18.5 · GPU 4.5 (one run, 15 s; it crashed at the hint video before the fix in problem 1) | not run | not run | not run |
+| **Pokémon Brilliant Diamond 1.3.0**, language menu (a fresh save) | 60 · 16.7 / 19.2–19.4 | 60 · 16.6–16.7 / 18.5–18.8 | 60 · 16.6–16.7 / 18.1–19.4 (2026-11-10, after problem 2's fix) | not run |
+| Pokémon Brilliant Diamond, Eterna City (a save) | 60 · 16.6 / 18.1–18.2 · GPU 8.1 | 58.9–59.7 · 16.6–16.8 / 18.8–19.7 · GPU 10.7 | **14.9** · 66.8–66.9 / 72.8–73.2 · GPU 16.0–16.1 (2026-11-10, after problem 2's fix; problem 13) | not run |
+| **Animal Crossing: New Horizons 3.0.3**, the new game's airport (a fresh save) | 30 · 33.3 / 34.7–35.4 · GPU 5.3 | 30 · 33.3 / 35.7–35.8 · GPU 7.1 | 30 · 33.4 / 36.5–36.7 · GPU 15.8 | 30 · 33.4 / 35.8–35.9 · GPU 15.8 |
+| Animal Crossing, outside the player's house (a save) | 30 · 33.3–33.4 / 35.7–35.8 · GPU 9.4–9.7 | 29.9 · 33.3–33.4 / 38.0–38.1 · GPU 15.5–15.9 | Not measured: the game stops at its first save (see below) | 30 · 33.2–33.4 / 35.6–36.3 · GPU 22.7–23.1 |
+| **Super Smash Bros. Ultimate 13.0.5**, boot with Android's Roboto as the shared font (fixed: problem 3) | **Crashes** 2–4 s in | **Crashes** | **Crashes** | not run (fixed before) |
+| Smash, the opening movie (with a hinted shared font, now packed with the game) | 60 · 12.0 / 33.9 | 59.9 · 13.1–13.4 / 34.7–35.1 | 59.7 · 13.5–13.9 / 35.5–36.0 | 60 · 9.8–12.4 / 33.5–33.7 · GPU 1.9–2.1 |
+| Smash, a battle (a fuller shared font; stage and CPU fighter vary) | 39.7–59.3 fps | 16.8–29.7 fps, frames up to 215 ms | 13.4–19.3 fps, frames up to 368 ms | 59.9 fps, frames up to 52 ms · GPU 6.3–6.6 |
+| **The Legend of Zelda: Link's Awakening 1.1.0**, the opening movie (a fresh save) | 59.8–59.9 · 16.7 / 17.6–17.7 · GPU 2.3–2.4 | 59.7 · 16.7 / 16.8 · GPU 4.5 (the other run crashed at boot) | 57.4–58.9 · 16.7 / 17.0–18.6 · GPU 5.6–6.4 (10 runs, 2026-11-10, after problem 9's fix) | 60 · 16.7 / 16.8 · GPU 4.9 |
+| Link's Awakening, the overworld at the Ancient Ruins (a save) | 59.9–60 · 16.7 / 17.2–17.3 · GPU 4.1 | 31.3 · 33.2 / 34.7 · GPU 12.0 (the other run crashed at boot) | 34.7–36.0 · 32.8–33.0 / 34.5 · GPU 12.8 (2026-11-10, after problem 9's fix; the game falls to its 30 fps interval, problem 12) | 38.1–44.6 · 16.8–32.5 / 33.8–34.1 · GPU 13.0–13.7 |
+| **The Legend of Zelda: Skyward Sword HD 1.0.1**, the opening movie (a fresh save) | 55.2–55.9 · 18.1–18.3 / 36.6–37.7 · GPU 2.3–2.4 | 59.9–60 · 16.7 / 24.5–25.1 · GPU 2.8 | 41.1–41.4 · 24.4–24.6 / 49.1–49.8 · GPU 3.7 | 60 · 16.6 / 18.0–18.1 · GPU 2.5 |
+| Skyward Sword HD, Skyloft's plaza (a save) | 30.0–30.5 · 33.3 / 36.6–46.8 · GPU 4.8–4.9 | 30.0–34.0 · 30.6–32.9 / 44.4–46.5 · GPU 12.6–12.8 | Not measured: the game stops at its first save (see below) | 60 · 16.6–16.7 / 20.6–20.7 · GPU 9.8–9.9 |
+| **Final Fantasy Resonance 1.0.1**, the Lancarse logo and the Brightness screen (a fresh save) | 59.6–59.7 · 16.8 / 18.7 · GPU 1.8 | not measured here | not run | 59.6 · 16.8 / 21.3–21.5 · GPU 5.8 |
+| Final Fantasy Resonance, the first field (a save made by its `tofield` route) | 42.2–42.6 · 23.3–23.6 / 27.1–27.4 · GPU 12.5–12.7 | not measured here | not run | 30.1–33.3 · 29.7–33.0 / 40.9–42.8 · GPU 20.2–22.7 |
+| **The Legend of Zelda: Breath of the Wild 1.9.0**, the Shrine of Resurrection (the `outdoors` save, a 40 s window) | not run (the device held by another session) | **GPU lost** at the first frame in the field (problem 14); with the hanging draw skipped: 20.0 · 48.6–49.2 / 68–71 · GPU 22.3 on main, **30.0 · 33.1–33.4 / 38.2–38.9 · GPU 15.5–16.6** with droidplay-core#91, #93, #97 and #108 (BotW's defaults, held until it has run on a second device) | not run | not run |
 
 Link's Awakening's numbers are for a wrong picture (problem 8): the 3D world never reaches the screen, so the overworld's frame rate leaves out part of
-its real work. Skyward Sword HD's Skyloft is drawn with grey terrain (problem 10).
+its real work. Skyward Sword HD's Skyloft is drawn with grey terrain (problem 10); on the Galaxy S25 Edge its terrain has its colours.
 
 Time from launch to the first frame, warm: about 1.3 s (Odyssey), 3.2–4.3 s (Brilliant Diamond, a Unity game), 1.5 s (Animal Crossing), 2.0–3.0 s (Smash),
 0.4–0.6 s (Link's Awakening), 1.3–2.1 s (Skyward Sword HD). The first launch after an install is slower while the driver builds its pipelines: Brilliant
-Diamond's first frame took 33 s on the Pad 3's first launch.
+Diamond's first frame took 33 s on the Pad 3's first launch. On the Galaxy S25 Edge: 1.0–1.2 s (Odyssey), 1.2–1.4 s (Animal Crossing), 1.6–1.9 s
+(Smash), 0.4–0.5 s (Link's Awakening), 1.0–1.1 s (Skyward Sword HD), 0.5–0.6 s (Final Fantasy Resonance).
 
 ## Known problems
 
@@ -131,7 +136,8 @@ Numbered in the order they were found, so links to a number stay right:
     later runs spread from 33 to 57 fps, the write-back's 8.3 MB staging buffer being made and freed every frame. It is pooled now (60 fps in three runs of
     three on the Odin 2, 60.0 on the Pad 3): [A 1080p linear render target's write-back staged in a buffer of its own every
     frame](../../docs/reference/rendering.md#a-1080p-linear-render-targets-write-back-staged-in-a-buffer-of-its-own-every-frame). Link's Awakening's overworld
-    likewise falls to 31 fps on the Pad 3: the game switched interval 175 times in one run there, against 4 on the Odin 2.
+    likewise falls to 31 fps on the Pad 3: the game switched interval 175 times in one run there, against 4 on the Odin 2. On the Galaxy S25 Edge, the
+    other Adreno 830 here, it plays at 38.1–44.6 fps over the Ancient Ruins window (frame p50 16.8–32.5 ms, GPU 13.0–13.7 ms).
 12. **Link's Awakening's overworld plays at 30 fps on the Retroid Pocket 5** (34.7–36.0 fps over the Ancient Ruins window, frame p50 33 ms, p95 34.5 ms, the
     picture right). The game sets its present interval from the vsyncs its last frame took (`main+0xca44`–`0xcb24`, applied at `main+0x1144c18`), and frames
     there take two even at interval 1, so it switches between 1 and 2 about 350 times a run. Per frame in that window: the game's own CPU 5.3 ms, the
@@ -181,6 +187,10 @@ Numbered in the order they were found, so links to a number stay right:
   same stage from run to run), so the load differs per run.
 - **Animal Crossing's island has a pinned clock.** `DM_FIXED_TIME` fixes the island at 3 PM on the day after the save, so the light and Isabelle's announcement
   repeat.
+- **The Galaxy S25 Edge's runs alternate with another build's.** Its column and the Odin 2's Final Fantasy Resonance rows were measured during PR #76's
+  regression check: `main`'s warm-up and first run came after the PR's warm-up and first run, and its second run after the PR's second, each build
+  reinstalled from its own APK with its own code and shaders, so a second run starts with the driver's pipeline cache holding both builds' pipelines. On the
+  S25 Edge, Link's Awakening's overworld (problem 11) and Final Fantasy Resonance's field vary by a few fps from run to run, and Smash's battle with its stage.
 - **The Odin 2's runs after the first may have started from the last run's save** in the boot routes and Odyssey's cutscene (a script bug since fixed). Those
   routes never reach a save point, so the scene is the same.
 
