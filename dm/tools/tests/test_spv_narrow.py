@@ -291,9 +291,10 @@ class SpvNarrow(unittest.TestCase):
             r = subprocess.run([adb, '-s', serial, 'shell', f'cd {d} && chmod 755 t_warp_reduce && ./t_warp_reduce {cs}; echo "exit $?"'], capture_output=True, text=True)
             print(r.stdout.strip()); return r.stdout
         translated = on_device('cs_in.spv')
-        size = int(re.search(r'subgroup size (\d+)', translated).group(1))
+        m = re.search(r'subgroup size (\d+)', translated); assert m, translated
+        size = int(m.group(1))
         if size < 32:
-            out, what = self.run_on(data, size=size); self.assertTrue(what & STEP)
+            out, what = self.run_on(data, size=size); self.assertTrue(what & STEP); assert out is not None
             (self.tmp / 'cs_out.spv').write_bytes(out); subprocess.run([adb, '-s', serial, 'push', self.tmp / 'cs_out.spv', d], check=True, capture_output=True)
             result = on_device('cs_out.spv')
         else: result = translated
