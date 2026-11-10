@@ -24,7 +24,7 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'dm/android/tools'))
-import device_lock   # noqa: E402
+import device_lock   # noqa: E402  # pyright: ignore[reportMissingImports]   (dm/android/tools, put on the path above)
 PKG = 'org.nxnative.android'
 EXT = f'/storage/emulated/0/Android/data/{PKG}/files'
 GAME_PROC = PKG + ':game'

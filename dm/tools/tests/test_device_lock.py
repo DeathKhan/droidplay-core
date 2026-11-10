@@ -14,7 +14,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'dm/android/tools'))
-import device_lock as dl   # noqa: E402
+import device_lock as dl   # noqa: E402  # pyright: ignore[reportMissingImports]   (dm/android/tools, put on the path above)
 
 HOLD = ("import sys, time; sys.path.insert(0, {tools!r}); import device_lock as dl\n"
         "dl.acquire(sys.argv[1], 'a test hold'); print('held', flush=True)\n"
@@ -35,7 +35,7 @@ class Lock(unittest.TestCase):
             if p.poll() is None: p.kill()
             p.wait(); p.stdout.close()   # pyright: ignore[reportOptionalMemberAccess]
 
-    def hold(self, serial, seconds=30, holder='session one'):   # another process holding serial; returns once it holds it
+    def hold(self, serial, seconds: float = 30, holder='session one'):   # another process holding serial; returns once it holds it
         env = dict(os.environ, NXNATIVE_DEVICE_HOLDER=holder); env.pop(dl.LOCKED_ENV, None)
         p = subprocess.Popen([sys.executable, '-c', HOLD.format(tools=str(REPO / 'dm/android/tools')), serial, str(seconds)], env=env, stdout=subprocess.PIPE, text=True)
         self.procs.append(p)
