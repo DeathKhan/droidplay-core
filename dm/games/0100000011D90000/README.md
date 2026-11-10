@@ -68,6 +68,7 @@ Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform
 - [Uniform bound tests in a vertex shader lose the device on the Adreno 830](../../../docs/reference/rendering.md#uniform-bound-tests-in-a-vertex-shader-lose-the-device-on-the-adreno-830): vertex shader `09898bd947898191` (293 tests) on a Galaxy S25 Edge, after the nxnative merge of 2026-11-10.
 - [Subgroup operations rewritten for stages the GPU runs none in](../../../docs/reference/rendering.md#subgroup-operations-rewritten-for-stages-the-gpu-runs-none-in): the crash at launch in the Retroid Pocket 5's shader compiler (Adreno 650), on the shuffles of Maxwell's `fwidth` in 23 fragment shaders (`b2f8ca02b9c1a06c` first).
 - [Storage buffer write-backs read from memory the CPU maps uncached](../../../docs/reference/rendering.md#storage-buffer-write-backs-read-from-memory-the-cpu-maps-uncached): Eterna City on a Retroid Pocket 5's own driver at 24 fps, 54.6–60.0 after.
+- [Maxwell's 32-lane warps in a wider subgroup](../../../docs/reference/rendering.md#maxwells-32-lane-warps-in-a-wider-subgroup): on the Adreno 830's 64-lane subgroups the same 23 `fwidth` shaders read other quads' values in lanes 32-63 as translated; rewritten so that each 32 lanes are one warp (not yet compared in a frame).
 
 ## Open
 

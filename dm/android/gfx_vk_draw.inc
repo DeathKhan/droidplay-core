@@ -359,11 +359,43 @@ done:
     free(o); free(loc); free(pst); free(ppt); free(privp); free(nullc); free(der);
     return res;
 }
+// The module with each 32 lanes of a wider subgroup one warp (spv_wide.h), in *out (to free); 0 when it needs nothing: a subgroup of 32 lanes, a stage that runs
+// no subgroup operations (spv_limits'), or a module that uses none; 0 too for a stage spv_wide leaves (SPV_WIDE_STAGES: not fragment), which the log names once.
+// DM_SPV_WIDE=0 (env.txt): modules as translated
+static size_t spv_fit_wide(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_WIDE"); on = !(e && *e == '0'); }
+    *out = NULL;
+    uint32_t st = on && g_sg_size > 32 ? spv_wide_wanted(code, nw, g_sg_stages) : 0;
+    if (!st) return 0;
+    if (!(st & SPV_WIDE_STAGES)) {   // a stage no device test covers yet: as translated, said once for each
+        static _Atomic uint32_t told;
+        if (!(atomic_fetch_or(&told, st) & st))
+            LOG("[RED] [vk] %s: a %s shader with Maxwell's 32-lane warp instructions on the GPU's %u-lane subgroups: spv_wide rewrites fragment shaders only, so it is "
+                "made as translated, and its lanes 32 and up may shuffle from or vote with the wrong lanes (said once for its stage)", what,
+                st == 0x20 ? "compute" : st == 0x40 ? "task" : st == 0x80 ? "mesh" : st == 0x8 ? "geometry" : st & 6 ? "tessellation" : "vertex", g_sg_size);
+        return 0;
+    }
+    uint32_t *s = malloc(2 * (size_t)code[3] * 4), *o = NULL; size_t need = 0, k = 0; int got = 0;
+    if (!s) return 0;
+    spv_wide(code, nw, g_sg_stages, s, NULL, 0, &need, &got);
+    if (need && (o = malloc(need * 4))) k = spv_wide(code, nw, g_sg_stages, s, o, need, &need, &got);
+    free(s);
+    if (!k) { free(o); o = NULL; }
+    static _Atomic int logged, nred;
+    if (k && !atomic_exchange(&logged, 1))
+        LOG("[vk] the GPU's subgroups have %u lanes: shaders that use Maxwell's 32-lane warps are rewritten so that each 32 lanes are one warp (lane & 31, shuffles "
+            "within it, its own ballot word). First: %s", g_sg_size, what);
+    if (k && vk_debug()) LOG("[vk] %s: warps of 32 lanes in a %u-lane subgroup", what, g_sg_size);
+    if ((got & SPV_WIDE_KEPT) && atomic_fetch_add(&nred, 1) < 8)
+        LOG("[RED] [vk] %s uses subgroup operations spv_wide does not rewrite for the GPU's %u-lane subgroups: made as it is, lanes 32 and up may read other lanes", what, g_sg_size);
+    *out = o; return k;
+}
 // The module without subgroup operations in a stage where the GPU runs none (spv_limits.h), in *out (to free); 0 when it needs nothing. A GPU that runs them in
 // every graphics stage gets every module as translated, untouched; so does one that runs them in the module's stage. DM_SPV_LIMITS=0 (env.txt): modules as translated
 static size_t spv_fit(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_LIMITS"); on = !(e && *e == '0'); }
     *out = NULL;
+    size_t wk = spv_fit_wide(code, nw, what, out); if (wk) return wk;   // a stage that runs them: as wide as the GPU's subgroups
     if (!on || (g_sg_stages & VK_SHADER_STAGE_ALL_GRAPHICS) == VK_SHADER_STAGE_ALL_GRAPHICS || !spv_lim_wanted(code, nw, g_sg_stages)) return 0;
     uint32_t *s = malloc(2 * (size_t)code[3] * 4), *o = NULL; size_t need = 0, k = 0; int got = 0;
     if (!s) return 0;
