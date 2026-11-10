@@ -130,6 +130,7 @@ typedef struct {
     uint32_t ndesc;   // descriptors in dsl, an array's counted up to 1024 (what stage_set writes of it): DM_VK_SET_STATS=1 checks each stage_set writes them all
     uint8_t dsbig;   // bit tf: one set of its layout (dsl, dsl_tf) does not fit an empty pool (sh_get ds_fits, else ds_alloc_n, RED 93): ds_get gives none for it, without making another pool
     uint8_t cbdyn[18], ndyn;   // set_reuse: cb[i] a dynamic uniform buffer, its offset at cbdyn[i] of the bind's (0xff: a plain one, its offset in the set); ndyn of them
+    uint8_t pool;   // reads the texture pool by ID: its modules read the pool set (gfx_vk_pool.inc), which its pipelines' layouts take at POOL_SET
 } vshader;
 // Descriptor sets bound again instead of written again (stage_set, sr_find). Every draw copies its constant buffers to new arena offsets, so a set holding those offsets
 // never matched the draw before, and stage_set wrote every set of every stage: Breath of the Wild about 7,500 a frame, vkUpdateDescriptorSets 3.4 ms a frame of the
@@ -379,13 +380,17 @@ static size_t spv_fit(const uint32_t *code, size_t nw, const char *what, uint32_
         LOG("[RED] [vk] %s uses subgroup operations in a stage where the GPU has none (it runs them in stages %#x), some of which spv_limits does not rewrite: made as it is", what, g_sg_stages);
     *out = o; return k;
 }
+static size_t spv_pool_fit(const uint32_t *code, size_t nw, const char *what, uint32_t **out);   // gfx_vk_pool.inc
+static int pool_on(void); static void pool_note_shader(vshader *s, int info); static void pool_drop_view(VkImageView iv);
+static __thread int t_pool_info;   // what spv_pool did to the modules sh_module_code made since sh_get cleared it
 static VkShaderModule sh_module_code(const uint32_t *code, size_t nw, const char *what) {
+    uint32_t *pf = NULL; size_t pn = spv_pool_fit(code, nw, what, &pf); if (pn) { code = pf; nw = pn; }   // the texture pool by ID moved into the pool set
     uint32_t *fit = NULL; size_t fn = spv_fit(code, nw, what, &fit); if (fn) { code = fit; nw = fn; }
     VkShaderModule m = VK_NULL_HANDLE; VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = code};
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     if (vkCreateShaderModule(g_vk.dev, &ci, NULL, &m) != VK_SUCCESS) { LOG("[RED] [vk] shader module %s refused by the driver", what); m = VK_NULL_HANDLE; }
     atomic_fetch_add(&g_mod_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_mod_made, 1);
-    free(fit);
+    free(fit); free(pf);
     return m;
 }
 static VkShaderModule ps_variant(vshader *s, uint32_t miss) {
@@ -449,8 +454,9 @@ static const VkDescriptorPoolSize g_ds_pool_sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_
                                                     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
 // Whether one set of a layout with these bindings fits an empty pool. A layout over it never gets a set, and it is known from the layout alone: tried in a pool, each such
 // shader made a pool of its own (ds_alloc_n's fresh pool, about 9.75 MB on Adreno 840) before its first draw was dropped. NVN2 shaders that read the texture pool by ID
-// (Ryujinx's handle fallback, <stage>_t_cb0_40000000: 2^20 elements; nvn_mtl.m pool_gpu on the Mac) are over it: Ocarina of Time's Kokiri Forest met 180 of them in 40 s,
-// 1.75 GB of pools no set was ever made from, beside the 4.6 GB the process held when the low-memory killer ended it (DM_VK_MEMREPORT)
+// (Ryujinx's handle fallback, <stage>_t_cb0_40000000: 2^20 elements; nvn_mtl.m pool_gpu on the Mac) were over it: Ocarina of Time's Kokiri Forest met 180 of them in 40 s,
+// 1.75 GB of pools no set was ever made from, beside the 4.6 GB the process held when the low-memory killer ended it (DM_VK_MEMREPORT). Their arrays are the pool set's now
+// (gfx_vk_pool.inc), and they are over it only with DM_VK_POOL=0 or on a GPU without what the pool set needs
 static int ds_fits(const VkDescriptorSetLayoutBinding *b, uint32_t nb) {
     for (size_t i = 0; i < sizeof g_ds_pool_sz / sizeof *g_ds_pool_sz; i++) {
         uint64_t n = 0;
@@ -479,18 +485,24 @@ static vshader *sh_get(const char *key) {
     a = js_get(&r, "sbufs");
     for (int i = 0; a && i < a->n && s->nsb < 16; i++) { const jv *o = &a->kid[i]; s->sb[s->nsb++] = (rb_sbuf){js_int(o, "binding", 0), js_int(o, "slot", 0), js_int(o, "cb_slot", 0), js_int(o, "cb_offset", 0), js_int(o, "flags", 0)}; }
     rb_tex_read(js_get(&r, "textures"), s->tx, &s->ntx, 64); rb_tex_read(js_get(&r, "images"), s->im, &s->nim, 16);
+    if (pool_on()) {   // the texture and sampler pools read by ID (handle 0x40000000, the arrays as long as the ID ranges) are the pool set's, not the stage's (spv_pool.h)
+        int k = 0; for (int i = 0; i < s->ntx; i++) { if (s->tx[i].handle == 0x40000000 && s->tx[i].cbuf_slot == 0 && s->tx[i].array > 32) s->pool = 1; else s->tx[k++] = s->tx[i]; }
+        s->ntx = k;
+    }
     memset(s->vin, 'f', sizeof s->vin);
     a = js_get(&r, "vin");
     for (int q = 0; a && a->t == 4 && q < a->n; q++) { int l = atoi(a->key[q]); if (l >= 0 && l < 16 && a->kid[q].s) s->vin[l] = a->kid[q].s[0]; }
     a = js_get(&r, "tf");   // [[outputs, stride] or [] per feedback buffer]
     for (int b = 0; a && a->t == 3 && b < a->n && b < 4; b++) if (a->kid[b].t == 3 && a->kid[b].n == 2) s->tf_stride[b] = (uint32_t)a->kid[b].kid[1].num;
     js_free(&r);
+    t_pool_info = 0;
     snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key); s->mod = sh_module(p, &s->b0);
     { size_t nw = 0; uint32_t *w = spv_read(p, &nw);
       if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); s->wlayer = s->stage != SH_PS && s->stage != SH_CS && spv_layer_out(w, nw); uint32_t ext[CB_MAX]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
     if (s->stage == SH_VS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p, &s->b0); }
     if (s->tf_stride[0] | s->tf_stride[1] | s->tf_stride[2] | s->tf_stride[3]) { snprintf(p, sizeof p, "%s/%s.tf.spv", g_spv_dir, s->key); s->modtf = sh_module(p, &s->b0); }
     if (!s->mod) return NULL;
+    pool_note_shader(s, t_pool_info); if (t_pool_info & SPV_POOL_FAIL) return NULL;   // a pool read spv_pool left: its arrays are in no layout
     // the set's layout: support buffer, constant buffers, storage buffers, textures, images
     VkDescriptorSetLayoutBinding b[1 + CB_MAX + 16 + 64 + 16 + 4]; uint32_t nb = 0;
     b[nb++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
@@ -680,6 +692,7 @@ int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c
 // The texture and sampler pools' entries, as the game registers them (IDs include each pool's base in the host table)
 typedef struct { tex_t t; view_t v; int has_v, ok; } treg_t;
 static treg_t *g_treg; static int g_ntreg; static samp_par *g_sreg; static uint8_t *g_sreg_ok; static int g_nsreg;
+static uint64_t *g_sreg_ver, g_sreg_gen;   // when each sampler ID was last registered (the pool set takes those registered since: gfx_vk_pool.inc pool_sync)
 static VkSampler (*g_scache)[2];   // each sampler ID's VkSampler (no shadow / shadow) once made for its registration, emptied when it is registered again (stage_set, DM_VK_TEX_ONCE)
 static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;
 static void reg_tex(int id, const tex_t *t, const view_t *v) {
@@ -694,8 +707,10 @@ static void reg_samp(int id, const samp_par *p) {
     if (id < 0) return;
     pthread_mutex_lock(&g_reg_mu);
     if (id >= g_nsreg) { int n = id + 1024; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, n); memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg);
-        g_scache = realloc(g_scache, n * sizeof *g_scache); if (g_scache) memset(g_scache + g_nsreg, 0, (n - g_nsreg) * sizeof *g_scache); g_nsreg = n; }
+        g_scache = realloc(g_scache, n * sizeof *g_scache); if (g_scache) memset(g_scache + g_nsreg, 0, (n - g_nsreg) * sizeof *g_scache);
+        g_sreg_ver = realloc(g_sreg_ver, n * sizeof *g_sreg_ver); memset(g_sreg_ver + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sreg_ver); g_nsreg = n; }
     if (p) { g_sreg[id] = *p; g_sreg_ok[id] = 1; } else g_sreg_ok[id] = 0;
+    g_sreg_ver[id] = ++g_sreg_gen;
     if (g_scache) g_scache[id][0] = g_scache[id][1] = VK_NULL_HANDLE;
     pthread_mutex_unlock(&g_reg_mu);
 }
@@ -824,7 +839,7 @@ static void views_drop(VkImage img) {
             int hit = 0; for (int q = 0; q < 9; q++) hit |= fv[q] == iv;
             if (hit) { uint8_t fk[9 * sizeof(VkImageView) + 12]; memcpy(fk, fv, sizeof fk); dead_add(2, (uint64_t)(VkFramebuffer)g_fbs.vals[j]); nvn_hm_del(&g_fbs, fk); j = (uint32_t)-1; }
         }
-        dead_add(1, (uint64_t)iv); view_key kk = *k; nvn_hm_del(&g_views, &kk); i = (uint32_t)-1;
+        pool_drop_view(iv); dead_add(1, (uint64_t)iv); view_key kk = *k; nvn_hm_del(&g_views, &kk); i = (uint32_t)-1;
     }
 }
 static nvn_hmap g_samps = {.klen = sizeof(samp_par) + 4};
@@ -867,6 +882,7 @@ static VkImageViewType view_type_of(int st) {   // Ryujinx's SamplerType
         default: return arr ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     }
 }
+#include "gfx_vk_pool.inc"   // NVN2's texture and sampler pools read by ID: the pool set
 
 // ---------------- Render passes and framebuffers ----------------
 typedef struct { VkFormat color[8]; VkFormat depth; uint32_t ncolor, samples; } rp_key;
@@ -1448,13 +1464,14 @@ static void pb_dump(void) {   // crash.c, on the crashing thread, after its back
 // so a compile there no longer holds the game's draws up (the driver's pipeline cache is internally synchronized)
 static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t *onva, VkPrimitiveTopology *otp) {
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &g_empty_dsl); }
-    VkDescriptorSetLayout sets[4] = {g_empty_dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl}; uint32_t nset = 1;
+    VkDescriptorSetLayout sets[POOL_SET + 1] = {g_empty_dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl}; uint32_t nset = 1;
     VkPipelineShaderStageCreateInfo st[4]; uint32_t ns = 0;
     for (int i = 0; i < 4; i++) { vshader *s = k->sh[i]; if (!s) continue;
         sets[s->set & 3] = k->tf ? s->dsl_tf : s->dsl; if ((uint32_t)(s->set & 3) + 1 > nset) nset = (uint32_t)(s->set & 3) + 1;
         VkShaderModule mod = k->tf ? s->modtf : s->stage == SH_VS && k->z && s->modz ? s->modz : s->mod;
         if (s->stage == SH_PS) { const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0; if (miss) mod = ps_variant(s, miss); }   // see spv_drop_inputs
-        st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .module = mod, .pName = "main"}; }
+        st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .module = mod, .pName = "main"};
+        if (s->pool) { sets[POOL_SET] = g_pool_dsl; nset = POOL_SET + 1; } }
     VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nset, .pSetLayouts = sets};
     if (vkCreatePipelineLayout(g_vk.dev, &lc, NULL, &pp->pl) != VK_SUCCESS) return VK_ERROR_INITIALIZATION_FAILED;
     VkVertexInputBindingDescription vb[32]; VkVertexInputAttributeDescription va[16]; VkVertexInputBindingDivisorDescriptionEXT vd[32]; uint32_t nvd = 0; uint32_t nvb = 0, nva = 0; uint32_t used = 0;
@@ -2413,6 +2430,7 @@ static int tf_capture(vshader *vs, const prog_t *pr, int pst, const p_draw *dw, 
         if (vkCreateFramebuffer(g_vk.dev, &fc, NULL, &g_null_fb) != VK_SUCCESS) return 0;
     }
     stage_textures(vs);
+    if (vs->pool) pool_sync();
     pipe_key k; memset(&k, 0, sizeof k); k.sh[0] = vs; k.tf = 1; k.rp = g_null_rp; k.topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; k.poly = D.poly; k.poly.cull = 0; k.color = D.color; k.color.logic_op = NVN_LOGIC_OP_COPY;   // no colour target: blending and logic ops do not apply
     memcpy(k.attr, D.attr, sizeof k.attr); memcpy(k.stream, D.stream, sizeof k.stream);
     pipe_t *pp = pipe_get(&k); if (!pp) return 0;
@@ -2438,6 +2456,7 @@ static int tf_capture(vshader *vs, const prog_t *pr, int pst, const p_draw *dw, 
     vkCmdBeginRenderPass(c, &rb, VK_SUBPASS_CONTENTS_INLINE); bf_reset();   // its pipeline, viewport and scissor are set behind the bind filter (bf_*): unknown to it
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->p);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, 0, 1, &set, vs->ndyn, dyn);
+    if (vs->pool && !pool_bind(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl)) { vkCmdEndRenderPass(c); cb_barrier(); bf_reset(); g_drawing = 0; return 0; }
     VkViewport v = {0, 0, 1, 1, 0, 1}; VkRect2D sc = {{0, 0}, {1, 1}}; vkCmdSetViewport(c, 0, 1, &v); vkCmdSetScissor(c, 0, 1, &sc);
     int ok = bind_vbufs(c, vs, dw->first, (int64_t)dw->first + dw->count, (uint32_t)dw->base_instance, 1);
     if (ok) vkCmdDraw(c, (uint32_t)dw->count, 1, 0, (uint32_t)dw->base_instance);   // gl_VertexIndex counts from 0: the vertex buffers start at the first vertex
@@ -2628,6 +2647,8 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     draw_view(k.sh, di, 1);   // what this draw reads of guest memory: pending GPU writes to it land first
     if (D.rast_discard) return tf_capture(k.sh[0], pprog[0], pst[0], dw, di);   // the vertex stage only: a capture, or nothing
     for (int i = 0; i < 4; i++) if (k.sh[i]) stage_textures(k.sh[i]);
+    int pool = (k.sh[0] && k.sh[0]->pool) || (k.sh[1] && k.sh[1]->pool) || (k.sh[2] && k.sh[2]->pool) || (k.sh[3] && k.sh[3]->pool);
+    if (pool) pool_sync();   // the IDs read since made, before the pass begins (their uploads would end it)
     if (!rp_prepare_((k.sh[0] && k.sh[0]->wlayer) || (k.sh[2] && k.sh[2]->wlayer) || (k.sh[3] && k.sh[3]->wlayer))) { g_drop[1]++; return 0; }
     g_drawing = 1;   // from here no chunk is closed (chunk_submit reports one)
     int prim = dw ? dw->prim : di->prim;
@@ -2649,6 +2670,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     occl_begin();
     bf_pipeline(c, pp->p);   // binds the command buffer already holds are left out (bf_*)
     for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], k.sh[i]->ndyn, dyn[i]);
+    if (pool && !pool_bind(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl)) { g_drop[3]++; return 0; }
     // dynamic state: the viewport (see the file header for the origin), the scissor, stencil, blend constants, depth bias
     float vx = 0, vy = 0, vw = (float)P.w, vh = (float)P.h; if (D.has_vp) { vx = D.vp[0][0]; vy = D.vp[0][1]; vw = D.vp[0][2]; vh = D.vp[0][3]; }
     float n = D.dr[0] < 0 ? 0 : D.dr[0] > 1 ? 1 : D.dr[0], f = D.dr[1] < 0 ? 0 : D.dr[1] > 1 ? 1 : D.dr[1];
@@ -2749,7 +2771,9 @@ static uint64_t g_dispatches;
 static cpipe_t *cpipe_get(vshader *s) {
     cpipe_t *cp = nvn_hm_get(&g_cpipes, &s); if (cp) return cp->p ? cp : NULL;
     cp = calloc(1, sizeof *cp); nvn_hm_put(&g_cpipes, &s, cp);
-    VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &s->dsl};
+    if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo ec = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; vkCreateDescriptorSetLayout(g_vk.dev, &ec, NULL, &g_empty_dsl); }
+    VkDescriptorSetLayout sl[POOL_SET + 1] = {s->dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl, g_pool_dsl};   // the pool set after empty ones (gfx_vk_pool.inc)
+    VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = s->pool ? POOL_SET + 1 : 1, .pSetLayouts = sl};
     if (vkCreatePipelineLayout(g_vk.dev, &lc, NULL, &cp->pl) != VK_SUCCESS) return NULL;
     VkComputePipelineCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = cp->pl,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = s->mod, .pName = "main"}};
@@ -2790,6 +2814,7 @@ static int vk_dispatch(const p_dispatch *dp) {
     if (!g[0] || !g[1] || !g[2]) return 1;
     cpipe_t *cp = cpipe_get(s); if (!cp) return 0;
     stage_textures(s);
+    if (s->pool) pool_sync();
     memcpy(g_cdim, g, sizeof g_cdim);
     VkDescriptorSet set; int ok; uint32_t dyn[18];
     for (int t = 0;; t++) {   // t 1: the set taken again from the chunk recorded now when a sync inside stage_set closed the one it came from (ds_moved)
@@ -2802,6 +2827,7 @@ static int vk_dispatch(const p_dispatch *dp) {
     cb_barrier();
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pl, 0, 1, &set, s->ndyn, dyn);
+    if (s->pool && !pool_bind(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pl)) return 0;
     int pr_i = -1;
     if (prof_on() && C->pq && C->npq + 2 <= 512 && g_nprof < 1024) { prof_rec *r = &g_prof[pr_i = g_nprof++]; memset(r, 0, sizeof *r); r->c = C; r->ncolor = -1; r->w = g[0]; r->h = g[1]; r->draws = (int)g[2]; r->seq = g_prof_seq++;
         r->s0 = C->npq++; vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->pq, (uint32_t)r->s0); }

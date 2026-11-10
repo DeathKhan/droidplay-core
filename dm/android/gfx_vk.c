@@ -27,6 +27,7 @@
 #include "gfx_vk.h"
 #include "spv_readonly.h"
 #include "spv_limits.h"
+#include "spv_pool.h"
 #include "nvn_fstep.h"   // FSTEP_FIT: the performance hint's target (hint_frame)
 #include "nvn_queue.h"   // the queue scheduler (hle_nvn.c nvn_queue.inc): event publication and GPU progress
 #include <stdatomic.h>
@@ -47,6 +48,8 @@ static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the d
 static int g_fmt_list;   // VK_KHR_image_format_list enabled (vt_create)
 static void pb_dump(void);   // gfx_vk_draw.inc: the pipelines being built, for a crash dump
 static int g_stencil_export;   // VK_EXT_shader_stencil_export enabled: a fragment shader writes the stencil test's value (gfx_vk_dscopy.inc)
+static int g_nonuni, g_null_desc;   // for the texture pool by ID (gfx_vk_pool.inc): VK_EXT_descriptor_indexing's non-uniform sampled image indexing; VK_EXT_robustness2's null descriptors
+static int g_pool_texn;   // the IDs of the game's texture pools in the host table (mtl_set_tex_pool_n, hle_nvn.c): the pool set's image count (gfx_vk_pool.inc)
 static vkb_ctx g_vk; static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT; static int g_vk_ok;
 #include "gfx_vk_rec.inc"   // the vkCmd* calls below go through its wrappers (DM_VK_RECORDER)
 // Query resets (the chunks' query pools, "Query resets" below). DM_VK_QRESET_USED=0 (env.txt): every pool is reset whole in the command buffer at every chunk begin, as before
@@ -85,7 +88,7 @@ static void vk_create(void) {
     if (g_vk.qf == nq) { LOG("[RED] [vk] no graphics queue"); return; }
     uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, NULL);
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
-    const char *dext[7]; uint32_t nde = 0;   // every extension below at once: swapchain, divisor, stencil export, format list, memory report, host query reset, device fault
+    const char *dext[9]; uint32_t nde = 0;   // every extension below at once: swapchain, divisor, stencil export, format list, memory report, host query reset, device fault, descriptor indexing, robustness2
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
     int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
@@ -98,6 +101,8 @@ static void vk_create(void) {
     int memreport = mr_want(de, nd);   // DM_VK_MEMREPORT (gfx_vk_memreport.inc)
     if (memreport) dext[nde++] = "VK_EXT_device_memory_report";
     int dfault = has_ext(de, nd, "VK_EXT_device_fault");   // a lost device's faults: their kind and address (gpu_fault_log)
+    // the texture pool by ID (gfx_vk_pool.inc): its indices differ between the lanes of a subgroup, and an ID not made yet reads 0 whatever type it is read as. DM_VK_POOL=0: neither
+    { const char *e = getenv("DM_VK_POOL"); int pool = !(e && *e == '0'); g_nonuni = pool && has_ext(de, nd, "VK_EXT_descriptor_indexing"); g_null_desc = pool && has_ext(de, nd, "VK_EXT_robustness2"); }
     free(de);
     VkPhysicalDeviceFeatures want = {.textureCompressionBC = f.textureCompressionBC, .textureCompressionASTC_LDR = f.textureCompressionASTC_LDR,
                                      .textureCompressionETC2 = f.textureCompressionETC2, .independentBlend = f.independentBlend, .geometryShader = f.geometryShader,
@@ -107,7 +112,8 @@ static void vk_create(void) {
                                      .shaderClipDistance = f.shaderClipDistance, .shaderCullDistance = f.shaderCullDistance, .shaderInt16 = f.shaderInt16, .shaderInt64 = f.shaderInt64,
                                      .shaderFloat64 = f.shaderFloat64, .vertexPipelineStoresAndAtomics = f.vertexPipelineStoresAndAtomics, .sampleRateShading = f.sampleRateShading,
                                      .shaderImageGatherExtended = f.shaderImageGatherExtended, .shaderStorageImageExtendedFormats = f.shaderStorageImageExtendedFormats,
-                                     .multiDrawIndirect = f.multiDrawIndirect, .largePoints = f.largePoints, .wideLines = f.wideLines, .occlusionQueryPrecise = f.occlusionQueryPrecise};
+                                     .multiDrawIndirect = f.multiDrawIndirect, .largePoints = f.largePoints, .wideLines = f.wideLines, .occlusionQueryPrecise = f.occlusionQueryPrecise,
+                                     .shaderSampledImageArrayDynamicIndexing = f.shaderSampledImageArrayDynamicIndexing};
     g_vk_feat = want;
     float pri = 1; VkDeviceQueueCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qf, .queueCount = 1, .pQueuePriorities = &pri};
     // translated shaders declare DrawParameters (Ryujinx's base instance / vertex): a Vulkan 1.1 feature of its own
@@ -115,11 +121,16 @@ static void vk_create(void) {
     VkPhysicalDeviceHostQueryResetFeaturesEXT hq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, .pNext = divisor ? &dv : NULL};
     VkPhysicalDeviceShaderDrawParametersFeatures dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hq : divisor ? (void *)&dv : NULL};
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .pNext = &dp};
-    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = dfault ? (void *)&ff : (void *)&dp};
+    void *qn = dfault ? (void *)&ff : (void *)&dp;
+    VkPhysicalDeviceRobustness2FeaturesEXT rbq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .pNext = qn}; if (g_null_desc) qn = &rbq;
+    VkPhysicalDeviceDescriptorIndexingFeaturesEXT diq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT, .pNext = qn}; if (g_nonuni) qn = &diq;
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = qn};
     if (VK_API_VERSION_MINOR(g_vk.props.apiVersion) >= 1 || VK_API_VERSION_MAJOR(g_vk.props.apiVersion) > 1) vkGetPhysicalDeviceFeatures2(g_vk.pd, &f2);
     hqr = hqr && hq.hostQueryReset;
     if (hqr) dext[nde++] = "VK_EXT_host_query_reset";
     if ((dfault = dfault && ff.deviceFault)) dext[nde++] = "VK_EXT_device_fault";
+    if ((g_nonuni = g_nonuni && diq.shaderSampledImageArrayNonUniformIndexing && f2.features.shaderSampledImageArrayDynamicIndexing)) dext[nde++] = "VK_EXT_descriptor_indexing";
+    if ((g_null_desc = g_null_desc && rbq.nullDescriptor)) dext[nde++] = "VK_EXT_robustness2";
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dve = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, .vertexAttributeInstanceRateDivisor = dv.vertexAttributeInstanceRateDivisor};
     VkPhysicalDeviceHostQueryResetFeaturesEXT hqe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, .pNext = divisor ? &dve : NULL, .hostQueryReset = VK_TRUE};
     VkPhysicalDeviceShaderDrawParametersFeatures dpe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hqe : divisor ? (void *)&dve : NULL, .shaderDrawParameters = dp.shaderDrawParameters};
@@ -127,7 +138,10 @@ static void vk_create(void) {
     if (!dp.shaderDrawParameters) LOG("[RED] [vk] no shaderDrawParameters: translated vertex shaders declare DrawParameters");
     if (memreport) dpe.pNext = mr_chain(dpe.pNext);
     VkPhysicalDeviceFaultFeaturesEXT ffe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .pNext = &dpe, .deviceFault = VK_TRUE};
-    VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = dfault ? (void *)&ffe : (void *)&dpe, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qc, .enabledExtensionCount = nde, .ppEnabledExtensionNames = dext,
+    void *en = dfault ? (void *)&ffe : (void *)&dpe;
+    VkPhysicalDeviceRobustness2FeaturesEXT rbe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .pNext = en, .nullDescriptor = VK_TRUE}; if (g_null_desc) en = &rbe;
+    VkPhysicalDeviceDescriptorIndexingFeaturesEXT die = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT, .pNext = en, .shaderSampledImageArrayNonUniformIndexing = VK_TRUE}; if (g_nonuni) en = &die;
+    VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = en, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qc, .enabledExtensionCount = nde, .ppEnabledExtensionNames = dext,
                              .pEnabledFeatures = &want};
     if (vkCreateDevice(g_vk.pd, &dc, NULL, &g_vk.dev) != VK_SUCCESS) { LOG("[RED] [vk] no Vulkan device"); return; }
     vkGetDeviceQueue(g_vk.dev, g_vk.qf, 0, &g_vk.q);
@@ -1417,7 +1431,7 @@ void mtl_reg_samp(int id, const samp_par *p) { reg_samp(id, p); }
 static _Atomic uint64_t g_prog_gen = 1;
 void mtl_prog_release(prog_t *p) { (void)p; atomic_fetch_add_explicit(&g_prog_gen, 1, memory_order_release); }
 void mtl_prog_keys_changed(const prog_t *p) { (void)p; atomic_fetch_add_explicit(&g_prog_gen, 1, memory_order_release); }
-void mtl_set_tex_pool_n(int n) { (void)n; }
+void mtl_set_tex_pool_n(int n) { g_pool_texn = n; }
 
 // ---------------- Copies ----------------
 static struct { int64_t row, img; } S;   // SetCopyRowStride / SetCopyImageStride
@@ -2123,6 +2137,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         (unsigned long long)g_q_queries, (unsigned long long)g_q_reports, (unsigned long long)g_ts_reports, (unsigned long long)atomic_load(&g_qr_host), (unsigned long long)g_qr_cmd,
         (unsigned long long)atomic_load(&g_pso_made), atomic_load(&g_pso_ns) / 1e6, (unsigned long long)atomic_load(&g_cpso_made), atomic_load(&g_cpso_ns) / 1e6, (unsigned long long)atomic_load(&g_mod_made), atomic_load(&g_mod_ns) / 1e6);
     LOG("[vk] draws not made: shader missing %llu, targets %llu, pipeline %llu, descriptors %llu, invalid binding %llu, pass %llu, vertex buffers %llu; dropped in all %llu, task / mesh draws skipped %llu; shaders whose descriptor set fits no pool %llu (cumulative)", (unsigned long long)g_drop[0], (unsigned long long)g_drop[1], (unsigned long long)g_drop[2], (unsigned long long)g_drop[3], (unsigned long long)g_drop[4], (unsigned long long)g_drop[5], (unsigned long long)g_drop[6], (unsigned long long)g_draws_dropped, (unsigned long long)g_mesh_skipped, (unsigned long long)g_ds_toobig);
+    pool_stats();
     LOG("[vk] read on the GPU from a dispatch's pending write: vertex streams %llu, other bindings %llu, written in place by a later dispatch %llu (cumulative; gfx_vk_draw.inc stream_fwd, buf_fwd)", (unsigned long long)g_fwd, (unsigned long long)g_buf_fwd[0], (unsigned long long)g_buf_fwd[1]);
     LOG("[vk] render passes with every layer of their targets attached (a draw writes the layer): %llu (cumulative; gfx_vk_draw.inc rp_prepare_)", (unsigned long long)g_layered_passes);
     if (stg_stat()) { static unsigned long long f0; static uint64_t a0, r0, s0; uint64_t a = atomic_load(&g_stg_allocs), r = atomic_load(&g_stg_frees), sl = g_sp_slices; double nf = frame > f0 ? (double)(frame - f0) : 1;

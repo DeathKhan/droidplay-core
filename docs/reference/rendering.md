@@ -1937,6 +1937,28 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   - GPU and picture unchanged.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
 
+### The texture pool read by ID on Vulkan (Android)
+
+- **Symptom:** Android, an NVN2 game: `[RED] [vk] shader …: one descriptor set of its layout is larger than a whole pool (an array of 1048576 elements): its draws are dropped`, and what those shaders draw is missing.
+- **Cause:** a texture handle the translator cannot trace to one slot indexes arrays sized to the whole ID ranges ([Texture handles from game memory index the pools](shaders.md#texture-handles-from-game-memory-index-the-pools)): 2^20 images per image type and 4,096 samplers. The replay made a descriptor set per shader and stage, and a set that size fits no descriptor pool, so `ds_fits` dropped those draws.
+- **Fix:** one descriptor set, at set 4, serves every such shader (`gfx_vk_pool.inc`). `spv_pool.h` rewrites each module when it is made.
+  - The set holds four bindings:
+    - 0: the texture pool's IDs as sampled images, as many as the game's texture pools have (33,792 for Ocarina of Time, about 2 MB of descriptors). Every image type of the shaders aliases this binding, and each element holds the view the reads asked for.
+    - 1: the sampler pool.
+    - 2: the same samplers made with comparison on, which a depth read takes.
+    - 3: the reads' marks.
+  - Indices are clamped to the binding and decorated `NonUniform` (`VK_EXT_descriptor_indexing`).
+  - Only the textures the shaders read are made, as on the Mac (`pool_gpu`). Each read sets its view type's bit in a word per ID; the word is read first and stored only when the bit is clear. A chunk's first pool draw makes the textures of the IDs marked since and looks again at every ID read so far, which picks up CPU rewrites and new registrations. An ID not made yet reads 0 (a null descriptor, `VK_EXT_robustness2`).
+  - The set is never written while a chunk that bound it may run. A change goes to a version no chunk in flight holds (3 at most), brought up to date with the elements changed since it was last written; a view that is dropped takes every version holding it out of use until it is rewritten.
+  - A fragment shader whose result the mark's store cannot change keeps its depth test before it runs (`EarlyFragmentTests`), as `dmsh_build.py` does on the Mac.
+  - `DM_VK_POOL=0` turns it off; `DM_VK_POOL_LOG=1` logs each ID as it is first read.
+- **Check:** `dm/tools/tests/test_spv_pool.py`; with `DM_SPV_DIR`, all 4,892 of Ocarina of Time's modules with pool arrays are rewritten and pass `spirv-val`, 3,759 of them with early depth tests added. Ocarina of Time's Kokiri Forest on a Galaxy Z Fold 8 (`bench_android.tsv` route `kokiri`, two runs each, `DM_VK_POOL=0` against on):
+  - before, the run's 103 pool shaders were refused and 49,592 of their draws dropped in its first minute in the forest; after, none refused or dropped, and 6,031 draws bound the set;
+  - the forest's draws read 12-15 IDs (the distant scenery's texture sets), and each chunk's sync took 0.33 ms on average;
+  - 1.6 → 1.7 fps, frame p50 640-650 → 593-611 ms, GPU p50 138.6-138.8 → 119.4-128.2 ms;
+  - the picture did not change there: the forest stays black for another cause, see the game's note.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#android) (Switch 2).
+
 ### Pipeline keys built from the state objects' fields
 
 - **Symptom:** new graphics pipelines made all through play, also in a level seen before (a few per frame, about 1 to 2 ms each on the Adreno); the start-up list of pipelines grew past 186,000 keys over a few sessions, and making it again took the fast cores for most of an hour.
