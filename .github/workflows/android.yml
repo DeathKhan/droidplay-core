@@ -58,7 +58,7 @@ jobs:
         # test's -Werror) rejects the one-line C the test writes, so cc is clang here as well
         run: |
           mkdir -p "$RUNNER_TEMP/cc" && ln -sf "$(command -v clang)" "$RUNNER_TEMP/cc/cc"
-          PATH="$RUNNER_TEMP/cc:$PATH" python -m unittest -v test_android_cli test_android_desktop test_romfs_image
+          PATH="$RUNNER_TEMP/cc:$PATH" python -m unittest -v test_android_cli test_android_desktop test_device_lock test_romfs_image
 
   # The same host build and packing tests on Windows, set up as a player's PC is (README, What you need): Python 3.14, since lz4 has no Windows wheel for 3.15 and a
   # player's PC has no compiler to build it, with UTF-8 mode on, since nxnative's scripts read and write text without naming UTF-8, which Python on Windows otherwise
@@ -100,4 +100,4 @@ jobs:
           & "$cm/ninja.exe" -C build dmhost_app dmhost_cli nxloader adrenotools hook_impl main_hook
       - name: Packing tests
         working-directory: dm/tools/tests
-        run: python -m unittest -v test_android_cli test_android_desktop
+        run: python -m unittest -v test_android_cli test_android_desktop test_device_lock

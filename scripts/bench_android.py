@@ -16,11 +16,15 @@
 # and the lock screen is dismissed before each start. A PIN or pattern lock cannot be dismissed over adb: set the test devices' screen lock to None or Swipe.
 # Out: <out>/<device>/<title ID>_<route>_r<N>/ (logcat.txt, log.txt, frames.tsv, the screenshots, result.json), and results.json and results.md for all runs.
 # Default <out>: bench/<date-time> in build_android_from_nsp.py's data folder (~/.local/share/nxnative/android on a Mac or Linux), beside its builds journal.
+# Each device it uses is locked for the whole run (dm/android/tools/device_lock.py): a device another bench or install holds is refused with who holds it, or waited
+#   for with --wait-device <s>. Without -s, busy devices are left out. NXNATIVE_DEVICE_HOLDER names this run in what others are told.
 import argparse, datetime, json, math, os, re, shlex, shutil, subprocess, sys, threading, time
 from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / 'dm/android/tools'))
+import device_lock   # noqa: E402
 PKG = 'org.nxnative.android'
 EXT = f'/storage/emulated/0/Android/data/{PKG}/files'
 GAME_PROC = PKG + ':game'
@@ -273,9 +277,17 @@ def main():
     ap.add_argument('--out'); ap.add_argument('--env', action='append', default=[], help='KEY=VALUE for every run (repeatable)')
     ap.add_argument('--cool-temp', type=float, default=38.0, help='start a run once the battery is at or under this many °C (default 38)')
     ap.add_argument('--cool-max', type=int, default=300, help='wait at most this many seconds to cool down (default 300)')
+    ap.add_argument('--wait-device', type=float, default=0, help='wait up to this many seconds for a device another bench or install holds (default: refuse at once)')
     args = ap.parse_args()
     serials = args.serial or ready_devices()
     if not serials: sys.exit('no adb device ready')
+    what = 'bench_android.py: ' + ', '.join(Path(f).expanduser().resolve().parent.name for f in args.folders) + (f' ({args.route})' if args.route else '')
+    for s in list(serials):   # each device for the whole run: another bench's or an install's force-stop and env.txt would void this one's runs, and the reverse
+        try: device_lock.acquire(s, what, args.wait_device, say=lambda m: print(m, flush=True))
+        except device_lock.DeviceBusy as e:
+            if args.serial: sys.exit(str(e))
+            print(f'left out: {e}', flush=True); serials.remove(s)
+    if not serials: sys.exit('every ready device is in use')
     out = Path(args.out or data_dir() / 'bench' / datetime.datetime.now().strftime('%Y%m%d-%H%M%S')); out.mkdir(parents=True, exist_ok=True)
     devices = [device_info(s) for s in serials]
     for d in devices: print(f"device {d['serial']}: {d['maker']} {d['model']}, {d['soc']}, Android {d['android']}, {d['ram_gb']} GB", flush=True)
