@@ -81,13 +81,16 @@ Screen captures from the test runs, taken on the device. The round button at the
 
 † Tested before DroidPlay Core merged nxnative's `main` (2026-11-08); not run since.
 
-Only games that draw with NVN, Nintendo's own graphics API, run on Android so far. A game that calls Vulkan or OpenGL itself, such as Hades, Super Mario Galaxy or Balatro, can't be built for Android yet: the build stops and says so. The [games table](dm/games/README.md#games) lists each game's graphics API.
-
 The first six rows are from the [Android baselines](dm/android/baselines.md) of 2026-11-08: the same scripted runs on each device, with frame times, the devices'
 drivers, and the known problems with what is known of their causes.
 
 Every other game in the [games table](dm/games/README.md#games) has a profile and can be packed the same way, but has not been run on Android. A game without a
 profile can still be packed as an *experimental build*: most likely it does not boot, but it is the starting point for porting it.
+
+The Android host replays NVN only. A game that draws with OpenGL or makes its own Vulkan calls (OpenGL or Vulkan in the games table's Graphics column) cannot
+draw on Android, since the OpenGL and Vulkan layers are the Mac's, on Metal: Balatro, Digimon Story Cyber Sleuth and Well Dweller (OpenGL), and Hades and both
+Super Mario Galaxy games (Vulkan). The packing script stops on such a game and says why, before the rewrite and the shaders. Super Mario 3D All-Stars still
+builds, since its launcher draws with NVN, but Super Mario 64 and Sunshine inside it call Vulkan and cannot draw.
 
 ## Testing and reporting
 
