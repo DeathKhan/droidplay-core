@@ -41,6 +41,7 @@ median GPU time per frame. Animal Crossing runs at 30 fps on the Switch too.
 | Link's Awakening, the overworld at the Ancient Ruins (a save) | 59.9–60 · 16.7 / 17.2–17.3 · GPU 4.1 | 31.3 · 33.2 / 34.7 · GPU 12.0 (the other run crashed at boot) | 34.7–36.0 · 32.8–33.0 / 34.5 · GPU 12.8 (2026-11-10, after problem 9's fix; the game falls to its 30 fps interval, problem 12) |
 | **The Legend of Zelda: Skyward Sword HD 1.0.1**, the opening movie (a fresh save) | 55.2–55.9 · 18.1–18.3 / 36.6–37.7 · GPU 2.3–2.4 | 59.9–60 · 16.7 / 24.5–25.1 · GPU 2.8 | 41.1–41.4 · 24.4–24.6 / 49.1–49.8 · GPU 3.7 |
 | Skyward Sword HD, Skyloft's plaza (a save) | 30.0–30.5 · 33.3 / 36.6–46.8 · GPU 4.8–4.9 | 30.0–34.0 · 30.6–32.9 / 44.4–46.5 · GPU 12.6–12.8 | Not measured: the game stops at its first save (see below) |
+| **The Legend of Zelda: Breath of the Wild 1.9.0**, the Shrine of Resurrection (the `outdoors` save, a 40 s window) | not run (the device held by another session) | **GPU lost** at the first frame in the field (problem 14); with the hanging draw skipped: 20.0 · 48.6–49.2 / 68–71 · GPU 22.3 on main, **30.0 · 33.1–33.4 / 38.2–38.9 · GPU 15.5–16.6** with droidplay-core#91, #93, #97 and #108 (BotW's defaults, held until it has run on a second device) | not run |
 
 Link's Awakening's numbers are for a wrong picture (problem 8): the 3D world never reaches the screen, so the overworld's frame rate leaves out part of
 its real work. Skyward Sword HD's Skyloft is drawn with grey terrain (problem 10).
@@ -144,6 +145,23 @@ Numbered in the order they were found, so links to a number stay right:
     though here the arena already takes the cached coherent type (type 4, flags `0xf`, of the types `0x11`): on this driver the CPU reads GPU-written memory slowly
     anyway. Not worked on yet.
 
+14. **Open: Breath of the Wild loses the GPU on the Pad 3** at its first frame in the field. Then `vkQueueSubmit` gives -4 (`VK_ERROR_DEVICE_LOST`), the loading screen stays up for good, and the GPU time reads 0.
+    - **What hangs.** One draw a frame hangs the GPU: vertex `2decd3e894b3736a`, fragment `26ae1640f3448ba4`, a fullscreen triangle sampling one 640×360 RGBA8 texture into another, the vertical pass of a blur whose horizontal pass runs fine just before it. The driver recovers each hang about 250 ms in (the chunk's fence signals, its end timestamp never written) until one runs past 3 s. `VK_EXT_device_fault` gives no address and no vendor record.
+    - **How it was found.** droidplay-core#90 logs such chunks with their draws, and a `vk_mid` file holding 1 cuts the chunks after every draw.
+    - **Still hangs with:**
+      - `DM_VK_UBWC=0`, `DM_VK_LAYERED=0`, `DM_VK_TBUF_RANGE=0`, `DM_VK_SAFE=1`, `DM_VK_GEOCACHE=0`, `DM_VK_BIND_FILTER=0`;
+      - robustBufferAccess;
+      - a full colour write mask (the draw's is 0xe);
+      - the zero stand-in texture in place of its source;
+      - the horizontal pass's fragment or vertex module in place of its own;
+      - `VK_EXT_depth_clip_control` instead of the `.z` vertex variant;
+      - its target cleared before the pass;
+      - draws that sample an attachment of their own pass skipped;
+      - duplicate colour attachments left unused.
+    - **What differs.** Its pipeline key is the horizontal pass's byte for byte but for the write mask, with the same D16 depth image. Only the target image differs: it is also the sixth colour target of the G-buffer passes.
+    - **Workaround for measuring.** Skipping the draw (a local test switch) keeps the GPU alive, and the game runs.
+    - **Not tried:** Turnip (needs a driver build for the Adreno 830); rendering that pass into another image and copying it over.
+
 ## Reading the numbers
 
 - **Cold pipelines.** Because of problem 5 (since fixed), every run here began without the driver binaries of the pipelines earlier runs made, most of all on
@@ -180,6 +198,8 @@ files):
 - Skyward Sword HD: soaresden's Checkpoint dump attached to GBAtemp thread 591874 (`20210726-014323 Soaresden.zip`; `wiiking2.sav` and `skip.dat` only), as
   `saves/skyloft`. Its file list has the autosave and three files; the route takes the third, a Hero Mode file at 31 hours that starts at Skyloft's bird
   statue. Made on 1.0.0; 1.0.1 loads it.
+
+- Breath of the Wild: `saves/outdoors`, the save the Mac's smoke route uses (`dm/games/01007EF00011E000/smoke.tsv`). It loads in the Shrine of Resurrection.
 
 Smash's battle and Odyssey's routes start from a fresh save.
 
