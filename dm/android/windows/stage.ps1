@@ -4,11 +4,13 @@
 # It makes:
 #   <folder>\runtime         Python (python-build-standalone, the build uv installs and the uv install of DroidPlay has run on) with the modules that
 #                            scripts\nxnative_android.py.lock pins, precompiled. A real python.exe beside pythonw.exe: the packing script starts Python
-#                            children everywhere (sys.executable scripts, a process pool, CMake's FindPython), which a frozen app would have to imitate
+#                            children everywhere (sys.executable scripts, a process pool, CMake's FindPython), which a frozen app would have to imitate.
+#                            Its site-packages load its OpenSSL by full path as each Python starts (_droidplay_dlls.py)
 #   <folder>\core            the tree of HEAD without docs\ and .github\, as a release's source archives have it, with VERSION (the phone app's version)
 #   <folder>\DroidPlay.ico   drawn by the app (--write-icon)
-# then checks it: --check's Python rows, the icon, and the window opened offscreen for a few seconds (-NoLaunch leaves that out: the window reads and
-# writes this user's DroidPlay settings, so leave it out on a computer someone uses). The sizes it prints are the ones the installer has to carry.
+# then checks it: --check's Python rows, the icon, the native modules under Setup's DLL policy (check_runtime_dlls.py), and the window opened offscreen
+# for a few seconds (-NoLaunch leaves that out: the window reads and writes this user's DroidPlay settings, so leave it out on a computer someone uses).
+# The sizes it prints are the ones the installer has to carry.
 param([Parameter(Mandatory = $true)] [string] $Out, [string] $Python = '3.14', [string] $Version = '', [switch] $NoLaunch)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
@@ -72,6 +74,10 @@ foreach ($p in 'include', 'libs', 'tcl', 'Lib\idlelib', 'Lib\tkinter', 'Lib\turt
                'Lib\site-packages\pip', 'Lib\site-packages\pip-*') {
     Get-ChildItem -Path (Join-Path $runtime $p) -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
 }
+# ---- the runtime's own OpenSSL, loaded by full path as each of its Pythons starts, ahead of a System32 copy (_droidplay_dlls.py says why)
+$site = Join-Path $runtime 'Lib\site-packages'
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot '_droidplay_dlls.py') -Destination $site
+[IO.File]::WriteAllText((Join-Path $site '_droidplay_dlls.pth'), "import _droidplay_dlls`n")
 Run $py -m compileall -q -j 0 --invalidation-mode unchecked-hash (Join-Path $runtime 'Lib')   # read-only: no source to check against at each start
 Remove-Item -LiteralPath $env:UV_PYTHON_INSTALL_DIR, $env:UV_PYTHON_BIN_DIR -Recurse -Force -ErrorAction SilentlyContinue
 foreach ($v in 'UV_PYTHON_INSTALL_DIR', 'UV_PYTHON_BIN_DIR', 'UV_PYTHON_PREFERENCE') { Remove-Item "Env:$v" }
@@ -92,6 +98,9 @@ if (-not $pyRows) { throw '--check listed no Python rows' }
 $bad = @($pyRows | Where-Object { -not $_.ok })
 if ($bad) { throw ('the runtime lacks: ' + (($bad | ForEach-Object { $_.name }) -join ', ')) }
 Say ('  ' + (($pyRows | ForEach-Object { $_.name -replace '^Python (module )?', '' }) -join ', ') + ': found')
+
+Say 'checks: native modules in a process started as Setup starts DroidPlay (prefer System32 images)'
+Run $py (Join-Path $PSScriptRoot 'check_runtime_dlls.py') $runtime
 
 if (-not $NoLaunch) {
     Say 'checks: the window, offscreen, for 10 s'
