@@ -28,7 +28,7 @@
 #      A one-game install of the same game (files/game, the layout before the launcher) is moved there instead of copied again, and its save is copied by the app
 # The picture comes from the Vulkan replay of NVN (dm/android/gfx_vk.c).
 # Needs: Python with lz4, capstone, fonttools and backports.zstd (not on Python 3.14), the .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (ANDROID_HOME or --sdk), adb, keytool (a JDK).
-import argparse, contextlib, datetime, functools, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time
+import argparse, atexit, contextlib, datetime, functools, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -403,18 +403,22 @@ def core_version():   # DroidPlay Core's version, for the launcher app's: the VE
     return (r.stdout.strip().removeprefix('v') or None) if r.returncode == 0 else None
 
 
-def make_apk(sdk, logs, env):   # the app with every host in the library → its path
+def make_apk(sdk, logs, env):   # the app with every host in the library → this run's own copy, which it installs; the library's nxnative.apk becomes the same app
     lib = data_dir(); hosts = library()
     loader, st = lib / 'loader' / 'libnxloader.so', lib / 'selftest'
     if not hosts or not loader.is_file() or not st.is_dir(): raise BuildError(f'no game host built on this computer yet ({lib}): build a game first')
     KEYSTORE.parent.mkdir(parents=True, exist_ok=True)
-    apk = lib / 'nxnative.apk'
+    # Packed under a name of this process's own: two builds in parallel (other sessions, other phones) packed and installed the one nxnative.apk, so a build's install
+    # could get the other's half-written file (apksigner failed with "offset (16777216) > source size (0)")
+    apk, own = lib / 'nxnative.apk', lib / f'nxnative.{os.getpid()}.apk'
+    atexit.register(own.unlink, missing_ok=True)
     bi.run([sys.executable, REPO / 'dm/android/tools/build_apk.py', '--sdk', sdk, '--loader', loader, *[x for so, _ in hosts.values() for x in ('--so', so)],
-            *[x for f in driver_libs(loader.parent) for x in ('--lib', f)], '--selftest', st, '--keystore', KEYSTORE, '-o', apk,
+            *[x for f in driver_libs(loader.parent) for x in ('--lib', f)], '--selftest', st, '--keystore', KEYSTORE, '-o', own,
             *(['--version-name', v] if (v := core_version()) else [])], logs / 'android_apk.log', env=env)
+    if own.is_file(): tmp = lib / f'.nxnative.{os.getpid()}.apk'; shutil.copyfile(own, tmp); os.replace(tmp, apk)   # whole or not at all, for anyone who takes it from there
     names = [m.get('name') or gid for gid, (_, m) in hosts.items()]
     say(f'app: {", ".join(names)} ({apk})')
-    return apk
+    return own
 
 
 # ---------------- The phone ----------------
@@ -1031,7 +1035,7 @@ def main(argv):
         return
     bi.PROG.stage('APK'); apk = make_apk(sdk, logs, env); bi.PROG.end(str(apk))
     if a.no_push:
-        say(f'done: {apk}. On the phone: install it, then copy {patched} to {REMOTE}/games/{g.id}/code and {bi.rfs.source(game)} to {REMOTE}/games/{g.id}/'); return
+        say(f'done: {data_dir() / "nxnative.apk"}. On the phone: install it, then copy {patched} to {REMOTE}/games/{g.id}/code and {bi.rfs.source(game)} to {REMOTE}/games/{g.id}/'); return
     bi.PROG.stage('install and copy to the phone')
     serial = serial or pick_device()
     with phone(serial, f'build_android_from_nsp.py: installing {label} ({g.id})'):
