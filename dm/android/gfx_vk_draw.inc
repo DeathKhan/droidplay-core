@@ -113,9 +113,12 @@ typedef struct { int binding, slot; uint32_t ext; } rb_cbuf;   // ext: bytes the
 typedef struct { int binding, slot, cb_slot, cb_off, flags; } rb_sbuf;
 typedef struct { int binding, type, cbuf_slot, handle, array, separate, flags; VkFormat fmt; int samp_slot; } rb_tex;   // fmt: an image's declared format (0: Unknown); cbuf_slot / samp_slot: the banks of the texture and sampler handles (rb_tex_read)
 enum { SH_VS, SH_PS, SH_GS, SH_TS, SH_CS };
+// constant buffers a shader may bind: up to 18 of banks 0 to 17, plus NVN2's push constants (c24, DMSH_PUSH_BANK) and the uniform slots' size table (c25,
+// DMSH_CBSIZE_BANK), which the translator adds to every shader that reads a uniform slot: a binding past the cap would be dropped without a word
+#define CB_MAX 20
 typedef struct {
     char key[17]; int stage, set, ok; VkShaderStageFlagBits vkstage; VkShaderModule mod, modz, modtf; uint32_t tf_stride[4]; VkDescriptorSetLayout dsl_tf;
-    int ncb, nsb, ntx, nim; rb_cbuf cb[18]; rb_sbuf sb[16]; rb_tex tx[64], im[16];
+    int ncb, nsb, ntx, nim; rb_cbuf cb[CB_MAX]; rb_sbuf sb[16]; rb_tex tx[64], im[16];
     VkDescriptorSetLayout dsl;
     char vin[16];   // vertex inputs' types: 'f' float, 'u' uint, 's' int (res.json "vin")
     int vid;   // a vertex shader reading gl_VertexIndex: its draws keep their vertex numbers (bind_vbufs lo 0)
@@ -125,7 +128,7 @@ typedef struct {
     int wlayer;   // a vertex, tessellation or geometry shader that writes the layer (spv_layer_out): its draws get every layer of their targets (rp_prepare)
     ds_list *dsf;   // its descriptor sets kept by each chunk, [2 chunk + tf] (dsl, dsl_tf): made at its first set (ds_get), never freed (as the shader)
     uint32_t ndesc;   // descriptors in dsl, an array's counted up to 1024 (what stage_set writes of it): DM_VK_SET_STATS=1 checks each stage_set writes them all
-    uint8_t dsbig;   // bit tf: one set of its layout (dsl, dsl_tf) did not fit an empty pool (ds_alloc_n, RED 93): ds_get gives none for it, without making another pool
+    uint8_t dsbig;   // bit tf: one set of its layout (dsl, dsl_tf) does not fit an empty pool (sh_get ds_fits, else ds_alloc_n, RED 93): ds_get gives none for it, without making another pool
     uint8_t cbdyn[18], ndyn;   // set_reuse: cb[i] a dynamic uniform buffer, its offset at cbdyn[i] of the bind's (0xff: a plain one, its offset in the set); ndyn of them
 } vshader;
 // Descriptor sets bound again instead of written again (stage_set, sr_find). Every draw copies its constant buffers to new arena offsets, so a set holding those offsets
@@ -219,7 +222,7 @@ static void spv_cb_ext(const uint32_t *w, size_t n, const rb_cbuf *cb, int ncb, 
         if (op == 71 && len >= 4 && w[i + 2] == 33 && w[i + 1] < bound) bind[w[i + 1]] = (int32_t)w[i + 3];   // OpDecorate id Binding b
         if (op == 43 && len == 4 && w[i + 2] < bound) { isc[w[i + 2]] = 1; cval[w[i + 2]] = (int32_t)w[i + 3]; }   // OpConstant (32-bit)
         i += len; }
-    int64_t mx[18]; int full[18]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = 0; }
+    int64_t mx[CB_MAX]; int full[CB_MAX]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = 0; }
     for (size_t i = 5; i < n; ) { uint32_t len = w[i] >> 16, op = w[i] & 0xffff; if (!len || i + len > n) break;
         if (op != 71 && op != 5 && op != 6 && op != 15 && op != 59) {   // decorations, names, entry points and the variable's own declaration are not uses
             for (uint32_t q = 1; q < len; q++) { uint32_t id = w[i + q]; if (id >= bound || bind[id] < 0) continue;
@@ -259,7 +262,7 @@ static void spv_cb_ext2(const uint32_t *w, size_t n, const rb_cbuf *cb, int ncb,
         else if (op == 59 && len >= 4 && w[i + 2] < bound) { t[w[i + 2]].op = op; t[w[i + 2]].a = w[i + 1]; t[w[i + 2]].b = w[i + 3]; }   // OpVariable type (result) class
         else if ((op >= 73 && op <= 75) || op == 67 || op == 70) give_up = 1;   // decoration groups, OpPtrAccessChain / OpInBoundsPtrAccessChain
         i += len; }
-    int64_t mx[18]; int full[18]; uint32_t alen[18]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = give_up; alen[k] = 0; }
+    int64_t mx[CB_MAX]; int full[CB_MAX]; uint32_t alen[CB_MAX]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = give_up; alen[k] = 0; }
     for (uint32_t v = 0; v < bound && !give_up; v++) {   // each buffer's variables: Uniform, vec4[L] at stride 16 as member 0 at offset 0
         if (t[v].op != 59 || t[v].bind < 0) continue;
         int k = cb_index(cb, ncb, t[v].bind); if (k == ncb) continue;
@@ -441,6 +444,22 @@ static VkDescriptorType tex_dtype(const rb_tex *t, int image) {
     int buf = (t->type & 0xff) == 2;
     return image ? (buf ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) : (buf ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 }
+// What each pool holds (ds_pool_add), by the descriptor types sh_get's layouts use
+static const VkDescriptorPoolSize g_ds_pool_sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16384}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 16384}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
+                                                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
+// Whether one set of a layout with these bindings fits an empty pool. A layout over it never gets a set, and it is known from the layout alone: tried in a pool, each such
+// shader made a pool of its own (ds_alloc_n's fresh pool, about 9.75 MB on Adreno 840) before its first draw was dropped. NVN2 shaders that read the texture pool by ID
+// (Ryujinx's handle fallback, <stage>_t_cb0_40000000: 2^20 elements; nvn_mtl.m pool_gpu on the Mac) are over it: Ocarina of Time's Kokiri Forest met 180 of them in 40 s,
+// 1.75 GB of pools no set was ever made from, beside the 4.6 GB the process held when the low-memory killer ended it (DM_VK_MEMREPORT)
+static int ds_fits(const VkDescriptorSetLayoutBinding *b, uint32_t nb) {
+    for (size_t i = 0; i < sizeof g_ds_pool_sz / sizeof *g_ds_pool_sz; i++) {
+        uint64_t n = 0;
+        for (uint32_t j = 0; j < nb; j++) if (b[j].descriptorType == g_ds_pool_sz[i].type) n += b[j].descriptorCount;
+        if (n > g_ds_pool_sz[i].descriptorCount) return 0;
+    }
+    return 1;
+}
+static uint64_t g_ds_toobig;   // shaders whose layout fits no pool (ds_fits): their draws are dropped
 static vshader *sh_get(const char *key) {
     char k[16]; memcpy(k, key, 16);
     vshader *s = nvn_hm_get(&g_sh, k); if (s) return s->ok ? s : NULL;
@@ -455,8 +474,8 @@ static vshader *sh_get(const char *key) {
     s->stage = !strcmp(sn, "ps") ? SH_PS : !strcmp(sn, "gs") ? SH_GS : !strcmp(sn, "cs") ? SH_CS : !strcmp(sn, "vs") ? SH_VS : SH_TS;
     s->vkstage = s->stage == SH_PS ? VK_SHADER_STAGE_FRAGMENT_BIT : s->stage == SH_GS ? VK_SHADER_STAGE_GEOMETRY_BIT : s->stage == SH_CS ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_VERTEX_BIT;
     s->set = js_int(&r, "set", s->stage == SH_PS ? 1 : s->stage == SH_GS ? 2 : 0);
-    const jv *a = js_get(&r, "cbufs"); uint32_t rext[18] = {0};   // rext: res.json's extents (cb_ext_pick)
-    for (int i = 0; a && i < a->n && s->ncb < 18; i++) { rext[s->ncb] = (uint32_t)js_int(&a->kid[i], "ext", 0); s->cb[s->ncb++] = (rb_cbuf){js_int(&a->kid[i], "binding", 0), js_int(&a->kid[i], "slot", 0), 0}; }
+    const jv *a = js_get(&r, "cbufs"); uint32_t rext[CB_MAX] = {0};   // rext: res.json's extents (cb_ext_pick)
+    for (int i = 0; a && i < a->n && s->ncb < CB_MAX; i++) { rext[s->ncb] = (uint32_t)js_int(&a->kid[i], "ext", 0); s->cb[s->ncb++] = (rb_cbuf){js_int(&a->kid[i], "binding", 0), js_int(&a->kid[i], "slot", 0), 0}; }
     a = js_get(&r, "sbufs");
     for (int i = 0; a && i < a->n && s->nsb < 16; i++) { const jv *o = &a->kid[i]; s->sb[s->nsb++] = (rb_sbuf){js_int(o, "binding", 0), js_int(o, "slot", 0), js_int(o, "cb_slot", 0), js_int(o, "cb_offset", 0), js_int(o, "flags", 0)}; }
     rb_tex_read(js_get(&r, "textures"), s->tx, &s->ntx, 64); rb_tex_read(js_get(&r, "images"), s->im, &s->nim, 16);
@@ -468,12 +487,12 @@ static vshader *sh_get(const char *key) {
     js_free(&r);
     snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key); s->mod = sh_module(p, &s->b0);
     { size_t nw = 0; uint32_t *w = spv_read(p, &nw);
-      if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); s->wlayer = s->stage != SH_PS && s->stage != SH_CS && spv_layer_out(w, nw); uint32_t ext[18]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
+      if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); s->wlayer = s->stage != SH_PS && s->stage != SH_CS && spv_layer_out(w, nw); uint32_t ext[CB_MAX]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
     if (s->stage == SH_VS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p, &s->b0); }
     if (s->tf_stride[0] | s->tf_stride[1] | s->tf_stride[2] | s->tf_stride[3]) { snprintf(p, sizeof p, "%s/%s.tf.spv", g_spv_dir, s->key); s->modtf = sh_module(p, &s->b0); }
     if (!s->mod) return NULL;
     // the set's layout: support buffer, constant buffers, storage buffers, textures, images
-    VkDescriptorSetLayoutBinding b[1 + 18 + 16 + 64 + 16 + 4]; uint32_t nb = 0;
+    VkDescriptorSetLayoutBinding b[1 + CB_MAX + 16 + 64 + 16 + 4]; uint32_t nb = 0;
     b[nb++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
     sh_dyn(s);
     for (int i = 0; i < s->ncb; i++) b[nb++] = (VkDescriptorSetLayoutBinding){(uint32_t)s->cb[i].binding, s->cbdyn[i] != 0xff ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
@@ -483,10 +502,14 @@ static vshader *sh_get(const char *key) {
     VkDescriptorSetLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = nb, .pBindings = b};
     if (vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &s->dsl) != VK_SUCCESS) { LOG("[RED] [vk] descriptor layout of shader %s failed", s->key); return NULL; }
     for (uint32_t i = 0; i < nb; i++) s->ndesc += b[i].descriptorCount > 1024 ? 1024 : b[i].descriptorCount;
+    if (!ds_fits(b, nb)) { s->dsbig |= 1; g_ds_toobig++;
+        uint32_t big = 0; for (uint32_t i = 0; i < nb; i++) if (b[i].descriptorCount > big) big = b[i].descriptorCount;
+        static int n; if (n++ < 4) LOG("[RED] [vk] shader %s: one descriptor set of its layout is larger than a whole pool (an array of %u elements): its draws are dropped", s->key, big); }
     if (s->modtf) {   // the capture variant's set: the same bindings and the feedback buffers
         for (int q = 0; q < 4; q++) if (s->tf_stride[q]) b[nb++] = (VkDescriptorSetLayoutBinding){100u + (uint32_t)q, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL};
         lc.bindingCount = nb;
         if (vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &s->dsl_tf) != VK_SUCCESS) s->modtf = VK_NULL_HANDLE;
+        if (!ds_fits(b, nb)) s->dsbig |= 2;
     }
     s->ok = 1;
     if (vk_debug()) LOG("[vk] shader %s stage %d: %d constant buffers, %d storage buffers, %d textures, %d images%s%s", s->key, s->stage, s->ncb, s->nsb, s->ntx, s->nim, s->modz ? ", depth -1..1 variant" : "", s->b0 ? ", reads the support buffer" : "");
@@ -1602,7 +1625,7 @@ static pipe_t *pipe_get(const pipe_key *k) {
 // A failed stage_set leaves its set unbound (the draw is dropped). A set handed out again may still name a texel buffer view or image view destroyed since its last use: Vulkan
 // allows writing over such a descriptor, and every one is written before the set is bound. DM_VK_SET_STATS=1 checks that each stage_set writes all of its layout's descriptors.
 // Memory: the pools are reset only once a chunk holds more than DS_CAP sets (DM_VK_SET_CAP=<n>), all of them, and the chunk's lists emptied (a set is not freed alone: the
-// pools have no FREE_DESCRIPTOR_SET_BIT). A layout one set of which does not fit an empty pool costs one pool, once (vshader dsbig, RED 93). DM_VK_SET_RECYCLE=0 (env.txt):
+// pools have no FREE_DESCRIPTOR_SET_BIT). A layout one set of which does not fit an empty pool gets none (sh_get ds_fits; else ds_alloc_n finds it: one pool, once; vshader dsbig, RED 93). DM_VK_SET_RECYCLE=0 (env.txt):
 // a new set for each stage and the pools reset when the chunk completes, as before
 enum { DS_CAP = 16384 };   // a chunk holds at most what each list gave in one recording, plus 3 from a batch: about 4,000 once warm on a dumped frame of Breath of the Wild (16.6k over 4 chunks), the whole frame's 7,500 if every window came to each
 static int g_ds_on = -1, g_ds_cap = DS_CAP, g_ds_stats;
@@ -1615,9 +1638,7 @@ static int ds_recycle(void) {   // the switches, read once (chunks_init: before 
 }
 static uint64_t g_ds_got, g_ds_reused, g_ds_made, g_ds_calls, g_ds_checked, g_ds_short; static _Atomic uint64_t g_ds_resets;   // sets handed out, of them from a list's free ones; sets made, in calls; DM_VK_SET_STATS
 static int ds_pool_add(void) {   // a new pool for the current chunk
-    VkDescriptorPoolSize sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16384}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 16384}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
-                                 {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
-    VkDescriptorPoolCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2048, .poolSizeCount = sizeof sz / sizeof *sz, .pPoolSizes = sz};
+    VkDescriptorPoolCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2048, .poolSizeCount = sizeof g_ds_pool_sz / sizeof *g_ds_pool_sz, .pPoolSizes = g_ds_pool_sz};
     if (C->ndp == C->cdp) { C->cdp = C->cdp ? 2 * C->cdp : 4; C->dp = realloc(C->dp, C->cdp * sizeof *C->dp); }
     if (vkCreateDescriptorPool(g_vk.dev, &pc, NULL, &C->dp[C->ndp]) != VK_SUCCESS) { RED_ONCE(90, "descriptor pool creation failed"); return 0; }
     C->ndp++; return 1;
@@ -1659,8 +1680,8 @@ static int ds_room(ds_list ***a, int n, int *cap) {   // room for one more list 
 static VkDescriptorSet ds_get(vshader *s, int tf) {
     VkDescriptorSetLayout l = tf ? s->dsl_tf : s->dsl;
     g_ds_got++;
+    if (s->dsbig >> !!tf & 1) return VK_NULL_HANDLE;   // no pool holds one (ds_fits, RED 93): ds_alloc would make pools until creation failed
     if (!ds_recycle()) return ds_alloc(l);
-    if (s->dsbig >> !!tf & 1) return VK_NULL_HANDLE;   // no pool holds one (RED 93)
     if (!cur() || (!s->dsf && !(s->dsf = calloc(2 * (size_t)g_nchunk, sizeof *s->dsf)))) return VK_NULL_HANDLE;
     ds_list *L = &s->dsf[2 * (C - g_ch) + !!tf];
     if (!L->used && !ds_room(&C->dt, C->ndt, &C->cdt)) return VK_NULL_HANDLE;   // the arrays grow before any set is made: a list holding sets is always in dl
@@ -2057,7 +2078,7 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
     int nst = nvn_stage_of(s->stage);
     VkDescriptorSet set = VK_NULL_HANDLE; *pset = VK_NULL_HANDLE;   // the writes name their set once it is known (below)
     // one write per binding; every element of an array is written (an unwritten descriptor is undefined)
-    VkWriteDescriptorSet wr[1 + 18 + 16 + 64 + 16]; VkDescriptorBufferInfo bi[1 + 18 + 16]; VkDescriptorImageInfo *ii; VkBufferView *bvs; uint32_t nw = 0, nbi = 0, nii = 0, nbv = 0;
+    VkWriteDescriptorSet wr[1 + CB_MAX + 16 + 64 + 16]; VkDescriptorBufferInfo bi[1 + CB_MAX + 16]; VkDescriptorImageInfo *ii; VkBufferView *bvs; uint32_t nw = 0, nbi = 0, nii = 0, nbv = 0;
     uint8_t c2buf[C2_SIZE]; const uint8_t *c2 = c2_bank(nst, c2buf);   // NULL: handle words read with c2_word, the whole bank made only for a c2 constant buffer (below)
     // support buffer: render scale 1, the viewport's inverse and size. Written only for a stage whose modules read it (sh_get spv_b0_used): a descriptor no instruction of the
     // pipeline uses need not be valid (Vulkan: VUID-vkCmdDraw-None-08114, valid "if they are statically used"), so binding 0 stays in the layout, unwritten. Breath of the Wild
@@ -2078,6 +2099,10 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
         if (slot == 0) { bank_c0(nst, bank, base_inst); src = bank; n = 0x800; }
         else if (slot == 2) { if (!c2) bank_c2(nst, bank); src = c2 ? c2 : bank; n = C2_SIZE; }
         else if (slot == DMSH_PUSH_BANK) { src = D.push[nst == 5]; n = DMSH_PUSH_SIZE; }   // NVN2 push constants: compute's block or the graphics stages' (OP_PUSH_CONST)   // c2 read as a constant buffer: 81 of Breath of the Wild's 19,592 shaders, none of a measured frame's
+        else if (slot == DMSH_CBSIZE_BANK) {   // the uniform slots' bound sizes in bytes (nvn_mtl.m NVN_RB_CBSIZE), which the translator's uniform reads compare with: past its slot's size a read gives 0, as Maxwell's constant buffers do
+            memset(bank, 0, 16 * ((DMSH_CBSIZE_SLOTS + 3) / 4));
+            for (int r = 0; r < DMSH_CBSIZE_SLOTS; r++) { const p_bind_buf *u = &D.ubo[nst][r]; uint32_t v = u->addr ? (u->size < 65536 ? (uint32_t)u->size : 65536) : 0; memcpy(bank + 4 * r, &v, 4); }
+            src = bank; n = 16 * ((DMSH_CBSIZE_SLOTS + 3) / 4); }
         else if (slot == 1) {   // the shader's own constant segment, in its code memory: its bounds were read from the control section at SetShaders (gone by now: Danganronpa V3's movie shader read zeros)
             const NVNshaderData *sd = pr && prog_stage >= 0 ? &pr->sd[prog_stage] : NULL; uint32_t o = 0, e = 0; int c1m;
             if (sd && sd->data && ((c1m = c1_memo(pr, prog_stage, &o, &e)) >= 0 ? c1m : prog_c1(pr, (unsigned)prog_stage, &o, &e)) && e > o && e - o <= 0x10000) { src = (const void *)(uintptr_t)(sd->data + o); n = e - o; }
@@ -2736,6 +2761,20 @@ static cpipe_t *cpipe_get(vshader *s) {
     if (vk_debug()) LOG("[vk] compute pipeline for shader %s", s->key);
     return cp;
 }
+// nn::ndve's movie network (Movie/Ndve/Ndve-Nvn2-vid_seq5.dat, a model any game linking the library may ship; nvn_ndve.inc runs it with host kernels on the Mac): of a movie
+// frame's 14 dispatches, the eleven of its U-Net are left out on Vulkan. Translated, its convolutions are SPIR-V modules of up to 2.2 MB (e6be82d835fbe4d3: 139,000 lines
+// of emulated HMMA), and Qualcomm's compiler (Adreno 840, driver 0x8034a013) was still building that one minutes later: the replay thread waited in it and Ocarina of
+// Time's title never came. The colour conversion before them and the last convolution and resampler after them still run, so the movie's picture is shown without the
+// network's enhancement (the last convolution adds its correction to the picture). Banana Native skips them on Qualcomm's driver for its compiler too. DM_VK_NDVE=1
+// (env.txt) runs them
+static int ndve_unet(const char *key) {
+    static const char k[][17] = {"ba079f68ae288dba", "a8b4fb48fee0ccf8", "e2eebd7ba18fe35f", "e6be82d835fbe4d3", "9442573ee4ace011", "0a56002cdc7e1fce", "d15370a382630d4e", "7f7ff0f36b54d90f"};
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NDVE"); on = e && *e == '1'; }
+    if (on) return 0;
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) if (!memcmp(key, k[i], 16)) return 1;
+    return 0;
+}
+static uint64_t g_ndve_skipped;
 static int vk_dispatch(const p_dispatch *dp) {
     if (!g_d_init) draw_state_reset();
     rp_end(); tc_clear();
@@ -2743,6 +2782,7 @@ static int vk_dispatch(const p_dispatch *dp) {
     vshader *s = NULL; int pst = -1;
     for (unsigned i = 0; i < pr->nstage && i < 6 && !s; i++) { uint8_t key[8]; char hx[17]; if (!prog_key(pr, i, key)) continue; key_hex(key, hx); vshader *x = sh_get(hx); if (x && x->stage == SH_CS) { s = x; pst = (int)i; } }
     if (!s) { RED_ONCE(107, "compute program without a translated compute shader"); return 0; }
+    if (ndve_unet(s->key)) { if (!g_ndve_skipped++) LOG("[vk] nn::ndve movie network: its eleven U-Net dispatches are left out (Qualcomm's compiler does not finish them; DM_VK_NDVE=1 runs them): first %s", s->key); return 1; }
     uint32_t g[3] = {(uint32_t)dp->x, (uint32_t)dp->y, (uint32_t)dp->z};
     { vshader *sh[4] = {s, NULL, NULL, NULL}; rd_rng r[1] = {{(uintptr_t)dp->ind, (uintptr_t)dp->ind + 12}};   // what the dispatch reads of guest memory lands first (draw_view), not everything pending
       if (dp->ind) ranges_view(r, 1); draw_view(sh, NULL, 0); }

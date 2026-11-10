@@ -39,6 +39,7 @@
 static int vk_debug(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_DEBUG") != NULL; return v; }   // DM_VK_DEBUG=1: a log line per upload and texture-to-buffer copy
 #define RED_ONCE(id, ...) do { static int once_; if (!once_) { once_ = 1; LOG("[RED] [vk] " __VA_ARGS__); } } while (0)   // a flag: a counter (!once_++) overflowed on a path taken every draw
 static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one thread's at a time: submissions, CPU reads, texture lifetimes
+static __thread int t_bk_sub;   // this thread holds g_bk for a submission (mtl_sub_begin to mtl_sub_commit): see BK_LOCK
 
 // ---------------- The device ----------------
 static uint32_t g_sg_stages = VK_SHADER_STAGE_ALL;   // the stages that run subgroup operations (subgroupSupportedStages; spv_limits.h); all when not known
@@ -55,6 +56,7 @@ static int qr_host_env(void) { static int v = -1; if (v < 0) { const char *e = g
 static PFN_vkResetQueryPoolEXT g_qreset;   // vkResetQueryPoolEXT, through vkGetDeviceProcAddr (the instance is Vulkan 1.1, and the android-29 libvulkan.so stub has no vkResetQueryPool); NULL: no host resets
 static PFN_vkGetDeviceFaultInfoEXT g_fault_info;   // VK_EXT_device_fault enabled: what the driver says of a lost device (gpu_fault_log); NULL: not offered
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
+#include "gfx_vk_memreport.inc"   // DM_VK_MEMREPORT: the driver's memory reports, by object type
 static void vk_create(void) {
     pthread_mutex_init(&g_vk.qmu, NULL);
     if (!vk_driver_load()) return;
@@ -83,7 +85,7 @@ static void vk_create(void) {
     if (g_vk.qf == nq) { LOG("[RED] [vk] no graphics queue"); return; }
     uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, NULL);
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
-    const char *dext[6]; uint32_t nde = 0;
+    const char *dext[7]; uint32_t nde = 0;   // every extension below at once: swapchain, divisor, stencil export, format list, memory report, host query reset, device fault
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
     int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
@@ -93,6 +95,8 @@ static void vk_create(void) {
     // colour images name the formats they are viewed in (vt_create: Adreno's framebuffer compression); core only from Vulkan 1.2, and the instance asks for 1.1
     if ((g_fmt_list = has_ext(de, nd, "VK_KHR_image_format_list"))) dext[nde++] = "VK_KHR_image_format_list";
     int hqr = qr_host_env() && has_ext(de, nd, "VK_EXT_host_query_reset");   // the completion thread resets the queries a chunk used (Query resets below); core only from Vulkan 1.2
+    int memreport = mr_want(de, nd);   // DM_VK_MEMREPORT (gfx_vk_memreport.inc)
+    if (memreport) dext[nde++] = "VK_EXT_device_memory_report";
     int dfault = has_ext(de, nd, "VK_EXT_device_fault");   // a lost device's faults: their kind and address (gpu_fault_log)
     free(de);
     VkPhysicalDeviceFeatures want = {.textureCompressionBC = f.textureCompressionBC, .textureCompressionASTC_LDR = f.textureCompressionASTC_LDR,
@@ -121,6 +125,7 @@ static void vk_create(void) {
     VkPhysicalDeviceShaderDrawParametersFeatures dpe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hqe : divisor ? (void *)&dve : NULL, .shaderDrawParameters = dp.shaderDrawParameters};
     g_divisor = divisor && dv.vertexAttributeInstanceRateDivisor;
     if (!dp.shaderDrawParameters) LOG("[RED] [vk] no shaderDrawParameters: translated vertex shaders declare DrawParameters");
+    if (memreport) dpe.pNext = mr_chain(dpe.pNext);
     VkPhysicalDeviceFaultFeaturesEXT ffe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .pNext = &dpe, .deviceFault = VK_TRUE};
     VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = dfault ? (void *)&ffe : (void *)&dpe, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qc, .enabledExtensionCount = nde, .ppEnabledExtensionNames = dext,
                              .pEnabledFeatures = &want};
@@ -911,6 +916,7 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     return 1;
 }
 void vt_drop_pool(const void *pool);   // below, with the textures
+void mtl_arch_save(int wait_ms, int ending) { (void)wait_ms; (void)ending; }   // Metal's pipeline archive (nvn_mtl.m); the Vulkan pipeline cache is written at pause (front_android.c) and during play
 void mtl_alias_drop_pool(const void *pool) { vt_drop_pool(pool); }
 
 // ---------------- Formats ----------------
@@ -1374,8 +1380,32 @@ void mtl_tex_release(tex_t *t) {
     if (!t->serial || tex_pinned_release(t->serial)) return;   // a queued job or the bound targets still name it: dropped at its last unpin
     pthread_mutex_lock(&g_bk); tex_drop(t->serial); pthread_mutex_unlock(&g_bk);
 }
-void mtl_tex_cpu_written(const tex_t *t) { pthread_mutex_lock(&g_bk); if (!nvn_hm_get(&g_cpuw, &t->serial)) nvn_hm_put(&g_cpuw, &t->serial, (void *)1); pthread_mutex_unlock(&g_bk); }
-int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_bk); vtex *v = nvn_hm_get(&g_tex, &serial); int r = v && !v->pkg; pthread_mutex_unlock(&g_bk); return r; }
+// nvn_queue.inc polls the CPU's texture rewrites (nvn_ft_poll, tex_dirty_upload) between mtl_sub_begin and mtl_sub_commit, on the replay thread, which holds g_bk all that
+// time: these answers take g_bk only when the calling thread does not hold it already. Taken again, it deadlocked the replay at the first rewrite the poll saw: Ocarina of
+// Time's first submission never ran, and the game waited on its fence with a black screen
+#define BK_LOCK() int bk_own_ = !t_bk_sub; if (bk_own_) pthread_mutex_lock(&g_bk)
+#define BK_UNLOCK() do { if (bk_own_) pthread_mutex_unlock(&g_bk); } while (0)
+void mtl_tex_cpu_written(const tex_t *t) { BK_LOCK(); if (!nvn_hm_get(&g_cpuw, &t->serial)) nvn_hm_put(&g_cpuw, &t->serial, (void *)1); BK_UNLOCK(); }
+int mtl_tex_gpu_owned(uint64_t serial) { BK_LOCK(); vtex *v = nvn_hm_get(&g_tex, &serial); int r = v && !v->pkg; BK_UNLOCK(); return r; }
+// nvn_ft_poll (tex_dirty_upload, hle_nvn.c): the CPU rewrote a registered texture's pages after its first use. As nvn_mtl.m's rule (nxnative PR #1558): a texture whose
+// storage can be where its content comes from is uploaded from it, unless it is an uncompressed 2D one the GPU has drawn into, whose content lives in its Vulkan image (this
+// replay writes no block-linear target back to its storage): that one stays the GPU's until the CPU rewrites it again. The rest: the GPU's if it is a GPU-only image, else
+// uploaded. Ocarina of Time rewrites its terrain tiles' height (R32F), blend and hole (RGBA8) maps as tile slots are reused; the nxnative merge (b547f1e2) moved the poll
+// to this question, which the replay did not answer yet, so a host with tex_dirty_upload did not link
+int mtl_tex_cpu_rewritten(const tex_t *t) {
+    int f = (int)t->d.format, comp = (f >= 0x41 && f <= 0x50) || (f >= 0x79 && f <= 0x94), unc = !comp && t->d.target != NVN_TEXTURE_TARGET_3D;   // nvn_mtl.m fmt_compressed, tex_unc
+    int ok = t->mem && t->pool && !t->has_layout && t->d.samples <= 1 && t->d.target != NVN_TEXTURE_TARGET_BUFFER
+          && !(unc && ((f >= 0x31 && f <= 0x36) || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE))))   // depth / stencil, display, video decode
+          && !(t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))
+          && !(t->d.flags & (NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))
+          && !((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !comp);
+    if (ok) {
+        if (unc) { BK_LOCK(); vtex *v = nvn_hm_get(&g_tex, &t->serial); int drawn = v && !v->pkg && v->rt_last; BK_UNLOCK(); if (drawn) return MTL_REWRITE_GPU_NOW; }
+        mtl_tex_cpu_written(t); return MTL_REWRITE_UPLOADED;
+    }
+    if (mtl_tex_gpu_owned(t->serial)) return MTL_REWRITE_GPU;
+    mtl_tex_cpu_written(t); return MTL_REWRITE_UPLOADED;
+}
 static void reg_tex(int id, const tex_t *t, const view_t *v); static void reg_samp(int id, const samp_par *p);   // gfx_vk_draw.inc
 void mtl_reg_tex(int id, const tex_t *t, const view_t *vw) { reg_tex(id, t, vw); }
 void mtl_reg_samp(int id, const samp_par *p) { reg_samp(id, p); }
@@ -1675,7 +1705,7 @@ static int rc_skips(void) {   // the clear or draw at hand is dropped
     return 1;
 }
 void mtl_sub_begin(void) {
-    pthread_mutex_lock(&g_bk); hint_note();
+    pthread_mutex_lock(&g_bk); t_bk_sub = 1; hint_note();
     static __thread int placed; if (!placed) { placed = 1; void dm_android_place_thread(int done); dm_android_place_thread(0); }
     if (place_log_on()) { int c = sched_getcpu(); g_place_cpu[c >= 0 && c < 16 ? c : 15]++; g_place_n++; }
 }
@@ -1799,9 +1829,9 @@ static void bound_preserve(void);   // below, with the queue scheduler's hooks
 uint64_t mtl_sub_commit(void) {
     bound_preserve();
     uint64_t f = atomic_fetch_add(&g_fence, 1) + 1;
-    if (!cur()) { pthread_mutex_unlock(&g_bk); return f; }
+    if (!cur()) { t_bk_sub = 0; pthread_mutex_unlock(&g_bk); return f; }
     chunk_submit(f);
-    pthread_mutex_unlock(&g_bk);
+    t_bk_sub = 0; pthread_mutex_unlock(&g_bk);
     return f;
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
@@ -2004,6 +2034,7 @@ int mtl_pso_prebuild_tool(void) { return 0; }
 // ---------------- Statistics the interface layer reads ----------------
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
+uint64_t mtl_pkg_copy_absorbs(void) { return 0; }   // Metal's packaged-texture copies taken as written (nvn_mtl.m pkg_copy_absorb): none here
 uint64_t mtl_pkg_miss(void) { return 0; }
 uint64_t mtl_upload_bytes(void) { return g_up_bytes; }
 void mtl_vbuf_stats(uint64_t *a, uint64_t *b, uint64_t *c, uint64_t *d, uint64_t *e, uint64_t *f) { *a = *b = *c = *d = *e = *f = 0; }
@@ -2091,7 +2122,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     LOG("[vk] occlusion queries %llu, samples-passed reports %llu, timestamp reports %llu, queries reset on the host %llu / in command buffers %llu, graphics pipelines made %llu (%.0f ms), compute pipelines %llu (%.0f ms), shader modules %llu (%.0f ms) (cumulative)",
         (unsigned long long)g_q_queries, (unsigned long long)g_q_reports, (unsigned long long)g_ts_reports, (unsigned long long)atomic_load(&g_qr_host), (unsigned long long)g_qr_cmd,
         (unsigned long long)atomic_load(&g_pso_made), atomic_load(&g_pso_ns) / 1e6, (unsigned long long)atomic_load(&g_cpso_made), atomic_load(&g_cpso_ns) / 1e6, (unsigned long long)atomic_load(&g_mod_made), atomic_load(&g_mod_ns) / 1e6);
-    LOG("[vk] draws not made: shader missing %llu, targets %llu, pipeline %llu, descriptors %llu, invalid binding %llu, pass %llu, vertex buffers %llu; dropped in all %llu, task / mesh draws skipped %llu (cumulative)", (unsigned long long)g_drop[0], (unsigned long long)g_drop[1], (unsigned long long)g_drop[2], (unsigned long long)g_drop[3], (unsigned long long)g_drop[4], (unsigned long long)g_drop[5], (unsigned long long)g_drop[6], (unsigned long long)g_draws_dropped, (unsigned long long)g_mesh_skipped);
+    LOG("[vk] draws not made: shader missing %llu, targets %llu, pipeline %llu, descriptors %llu, invalid binding %llu, pass %llu, vertex buffers %llu; dropped in all %llu, task / mesh draws skipped %llu; shaders whose descriptor set fits no pool %llu (cumulative)", (unsigned long long)g_drop[0], (unsigned long long)g_drop[1], (unsigned long long)g_drop[2], (unsigned long long)g_drop[3], (unsigned long long)g_drop[4], (unsigned long long)g_drop[5], (unsigned long long)g_drop[6], (unsigned long long)g_draws_dropped, (unsigned long long)g_mesh_skipped, (unsigned long long)g_ds_toobig);
     LOG("[vk] read on the GPU from a dispatch's pending write: vertex streams %llu, other bindings %llu, written in place by a later dispatch %llu (cumulative; gfx_vk_draw.inc stream_fwd, buf_fwd)", (unsigned long long)g_fwd, (unsigned long long)g_buf_fwd[0], (unsigned long long)g_buf_fwd[1]);
     LOG("[vk] render passes with every layer of their targets attached (a draw writes the layer): %llu (cumulative; gfx_vk_draw.inc rp_prepare_)", (unsigned long long)g_layered_passes);
     if (stg_stat()) { static unsigned long long f0; static uint64_t a0, r0, s0; uint64_t a = atomic_load(&g_stg_allocs), r = atomic_load(&g_stg_frees), sl = g_sp_slices; double nf = frame > f0 ? (double)(frame - f0) : 1;
