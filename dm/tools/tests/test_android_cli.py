@@ -135,6 +135,18 @@ class Setup(unittest.TestCase):   # --setup (dm/android/tools/host_setup.py): wh
             self.hs.add_tool_paths(self.tools, self.sdk)
             self.assertEqual(os.environ['PATH'].split(os.pathsep), [str(self.sdk / 'platform-tools'), '/opt/homebrew/bin', '/usr/bin'])
 
+    def test_the_macs_default_sdk_is_found(self):   # Android Studio's folder on a Mac, where no ANDROID_HOME is set
+        (self.tmp / 'Library/Android/sdk/platform-tools').mkdir(parents=True)
+        with mock.patch.dict(os.environ, {'HOME': str(self.tmp), 'USERPROFILE': str(self.tmp), 'LOCALAPPDATA': str(self.tmp / 'none')}):
+            for k in ('ANDROID_HOME', 'ANDROID_SDK_ROOT'): os.environ.pop(k, None)
+            self.assertEqual(ba.sdk_dir(None), self.tmp / 'Library/Android/sdk')
+
+    def test_the_sdk_option_puts_its_adb_on_path(self):   # adb is run by name: --sdk's platform-tools, which the import-time lookup did not know
+        (self.sdk / 'platform-tools').mkdir(parents=True)
+        with mock.patch.dict(os.environ, {'PATH': '/usr/bin'}), mock.patch.object(ba, 'data_dir', lambda: self.tmp / 'data'):
+            ba.tool_paths(str(self.sdk))
+            self.assertEqual(os.environ['PATH'].split(os.pathsep), ['/usr/bin', str(self.sdk / 'platform-tools')])
+
     def test_each_step_runs_with_what_the_steps_before_it_installed(self):   # sdkmanager needs the JDK unpacked a moment earlier, in the same run
         seen = {}
         def jdk(tools, work, prog): (tools / 'jdk/bin').mkdir(parents=True); return tools / 'jdk'
