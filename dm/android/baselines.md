@@ -55,6 +55,20 @@ Time from launch to the first frame, warm: about 1.3 s (Odyssey), 3.2–4.3 s (B
 Diamond's first frame took 33 s on the Pad 3's first launch. On the Galaxy S25 Edge: 1.0–1.2 s (Odyssey), 1.2–1.4 s (Animal Crossing), 1.6–1.9 s
 (Smash), 0.4–0.5 s (Link's Awakening), 1.0–1.1 s (Skyward Sword HD), 0.5–0.6 s (Final Fantasy Resonance).
 
+## Switch 2: The Legend of Zelda: Ocarina of Time on a Galaxy Z Fold 8
+
+The first Switch 2 game measured on Android (2026-11-10, #76's branch with #82-#87 and #94, chain 5 shaders), on a fourth device: a Galaxy Z Fold 8 (SM-F971U1, SM8850 / Snapdragon 8 Elite
+Gen 5, Adreno 840, Qualcomm's driver 0x8034a013, Vulkan 1.4.295, Android 17, 11.3 GB of RAM), folded, on its cover display. `scripts/bench_android.py`, route `title`,
+two runs without a warm-up (the pipeline cache warm from earlier runs):
+
+| Game, scene | Galaxy Z Fold 8 |
+|---|---|
+| **Ocarina of Time v131072**, the title and its menu (a fresh save) | 29.6-31.1 · 33.2-33.3 / 35.1-48.2 · GPU 26.7 |
+| Ocarina of Time, Kokiri Forest (a Mac save, by taps) | about 2 fps (frame about 540 ms, GPU about 165 ms), the forest not drawn (texture pool shaders); runs, at 2.9 GB of graphics memory (killed 15-60 s in before #94) |
+
+The title's GPU frame is nn::ndve's last convolution (36.8 ms in a `prof_now` frame). Kokiri Forest's memory (`DM_VK_MEMREPORT`, #95), its black picture and what is open: the game's note,
+[Android](../games/0400486024DEC000/README.md#android).
+
 ## Known problems
 
 Numbered in the order they were found, so links to a number stay right:
