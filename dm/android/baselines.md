@@ -18,8 +18,9 @@ write-backs on that device's driver for every game (problem 13); with the copy o
 | Retroid Pocket 5 | SM8250 (Snapdragon 865) | Adreno 650, V@0746.0, 1.1.128 | 13 | 8 GB |
 | Samsung Galaxy S25 Edge | SM8750 (Snapdragon 8 Elite for Galaxy) | Adreno 830, V@0800.40.1, 1.3.284 | 16 | 12 GB |
 | Google Pixel 9 Pro XL ([Mali](#mali-super-mario-odyssey-on-a-pixel-9-pro-xl)) | Tensor G4 | Mali-G715, Arm's driver 0xd803000, 1.4.343 | 17 | 16 GB |
+| Samsung Galaxy Z Flip 7 ([Xclipse](#xclipse-brilliant-diamond-on-a-galaxy-z-flip-7)) | Exynos 2500 | Xclipse 950, Samsung's driver 24.0.533 (0x6000215), 1.3.279 | 16 | 12 GB |
 
-All five use 4 KB pages. The Odin 2 and the Retroid Pocket 5 have built-in controls; the Pad 3, the S25 Edge and the Pixel 9 Pro XL show the on-screen controls over the game.
+All six use 4 KB pages. The Odin 2 and the Retroid Pocket 5 have built-in controls; the Pad 3, the S25 Edge, the Pixel 9 Pro XL and the Z Flip 7 show the on-screen controls over the game.
 The Pixel 9 Pro XL, the first GPU outside Adreno, is not in the Results table: it has [a section of its own](#mali-super-mario-odyssey-on-a-pixel-9-pro-xl).
 
 The RAM column is the device's installed capacity, not a measurement of how much memory a game uses. These baselines report frame rates and frame
@@ -112,6 +113,41 @@ pipelines cached, made 398 graphics pipelines in 9.5 s and measured 57.1 fps, wi
 - **"draws not made: pipeline N"** in the stats line counts the draws left out while pipelines met for the first time are built in the background (`DM_VK_ASYNC_PIPE`:
   [rendering.md](../../docs/reference/rendering.md#pipelines-met-for-the-first-time-built-in-the-background)), not pipelines that failed (`0 failed`, no red line). It was 718 in
   the cutscene's first run, and 9 and 0 in the warm ones.
+
+## Xclipse: Brilliant Diamond on a Galaxy Z Flip 7
+
+The first Samsung Xclipse GPU (2026-11-10): a Galaxy Z Flip 7 (SM-F766U1, Exynos 2500, Xclipse 950, an AMD RDNA design; Samsung's driver 24.0.533, 0x6000215; Vulkan 1.3.279,
+Android 16, 12 GB of RAM), open, on its inner screen. Brilliant Diamond was packed from `main` at 648a3758 by `build_android_from_nsp.py`, the first DroidPlay install on this
+phone, and boots with no change: the picture is right (the language menu, Eterna City's buildings, paving, cloud shadows and people), and the log has no red line.
+`scripts/bench_android.py`, two runs each, the pipeline cache warm from earlier runs:
+
+| Game, scene | Galaxy Z Flip 7 |
+|---|---|
+| **Pokémon Brilliant Diamond 1.3.0**, language menu (a fresh save) | 53.3–59.6 · 16.7 / 18.1–18.2 · GPU 0.5–0.6 (the first run's window caught the game's load, its first frame at 17.9 s); 60.0 · 16.7 / 17.9–18.0 with #144 |
+| Pokémon Brilliant Diamond, Eterna City (a save) | 60.0 · 16.6 / 18.7–19.5 · GPU 10.8, the route's presses 7 s later (below); 59.6–60.0 · 16.5–16.6 / 19.2–20.6 · GPU 10.5–10.6 with #144 on the route as it is |
+
+Where this GPU differs from the Adreno above:
+
+- **Start-up:** the first frame comes at 9.7–17.9 s with a warm cache (3.2–4.3 s on the Pad 3), and at 99.4 s on the first launch after the install (33 s on the Pad 3).
+  - **Warm:** Samsung's driver does a compile's work in `vkCreateShaderModule` (0.8–0.9 ms a module, about 0.1 on the Adreno 830), which its pipeline cache does not keep. The game's
+    8,844 modules took 6.1–9.6 s of every start, its 2,982 pipelines 0.2–0.4 s. #144 makes a module only for a pipeline the cache lacks (`VK_EXT_shader_module_identifier`):
+    the first frame at 3.2–3.3 s.
+  - **First launch:** the pipelines' compile is 74.5–74.8 s (25 ms a pipeline) either way; with #144, 79.7 s, since only 5,672 of the modules are ever made.
+  - **The `eterna` route:** its A presses at 16–25 s come during the game's 10–11 s load after the first frame (a 9.6 s frame on the Pad 3 too), so on `main` the game stays
+    at the title. The table's runs used a local copy of the route with the presses at 23 s and the window at 42–72 s. With #144 the route as it is reaches Eterna City at 27.7 s.
+- **Memory:** PSS 2.6 GB at the language menu and 3.4 GB in Eterna City, measured near each window's end. The driver keeps what it made of every module: with #144,
+  1.4 and 2.1 GB.
+- **No BC textures** (`BC decoded on the CPU`), as on the Pixel: Brilliant Diamond draws right, without either of the symptoms #133 fixes.
+- **64-lane subgroups in every stage** (stages 0x3d3f, sizes 32 to 64, a required size in compute only): `spv_wide` rewrote Brilliant Diamond's 23 `fwidth` fragment shaders.
+  No vertex shader of the nine games packed for Android on the Mac uses subgroup operations. Compute shaders in Final Fantasy Resonance (1,199) and Mario Kart World (184) do, and stay as
+  translated, with `spv_wide`'s red line; neither game has run on this phone.
+- **The cover screen:** folding the phone while the game plays puts it in the background (focus states 2 and 3, audio suspended) and shows Samsung's own cover home on the cover
+  screen. The game process keeps running, and nothing crashes. Opening the phone brings back its lock screen first. Not seen:
+  - the game's return after unlocking (the next install stopped it);
+  - the game on the cover screen, Samsung's per-app setting, with the window size change it would bring (`sc_follow_window`).
+
+  The fold was simulated with `cmd device_state`, which locks a phone that has a secure screen lock.
+- **The benchmark's screenshots:** `screencap` needs a display on a phone with two screens; without one, every shot was unreadable before #132.
 
 ## Known problems
 
