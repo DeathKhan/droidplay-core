@@ -60,9 +60,9 @@ endforeach()
 
 # Host sources: every dm/host/*.c, as the Mac Makefile's wildcard, less the ones Android replaces
 file(GLOB HOST_C ${DM}/host/*.c)
-list(REMOVE_ITEM HOST_C ${DM}/host/hle_movie_avc.c)   # VideoToolbox: media_android.c (MediaCodec)
-# Not on Android yet, stubbed in apple_stubs.c: AV1 movies (VideoToolbox, or dav1d, which is not built here), the cheat engine (blocks and dispatch queues)
-list(REMOVE_ITEM HOST_C ${DM}/host/hle_movie_av1.c ${DM}/host/hle_cheats.c)
+list(REMOVE_ITEM HOST_C ${DM}/host/hle_movie_avc.c ${DM}/host/hle_movie_av1.c)   # VideoToolbox / dav1d: media_android.c and av1_android.c (MediaCodec)
+# Not on Android yet, stubbed in apple_stubs.c: the cheat engine (blocks and dispatch queues)
+list(REMOVE_ITEM HOST_C ${DM}/host/hle_cheats.c)
 # Graphics: the NVN interface layer and texture code (the Metal replay layer, the Vulkan and GL layers are Objective-C on Metal: backend_*.c stand in)
 file(GLOB GFX_C ${DM}/gfx/*.c ${DM}/gfx/nvn/*.c ${DM}/gfx/tex/*.c)
 file(GLOB_RECURSE VPX_C ${DM}/third_party/libvpx/*.c)
@@ -71,8 +71,10 @@ file(GLOB_RECURSE VPX_C ${DM}/third_party/libvpx/*.c)
 set(DM_GFX vk CACHE STRING "NVN replay backend: vk or null")
 set(ANDROID_C
   ${CMAKE_CURRENT_SOURCE_DIR}/plat_android.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/pac_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/coreaudio_aaudio.c
   ${CMAKE_CURRENT_SOURCE_DIR}/media_android.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/av1_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/haptics_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/apple_stubs.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk_driver.c
