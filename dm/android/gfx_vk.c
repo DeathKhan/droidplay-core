@@ -1971,6 +1971,11 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         ext_check() ? "; DM_VK_EXT_CHECK on" : "");
     if (ext_check()) LOG("[vk] DM_VK_EXT_CHECK: %llu constant buffer bindings copied whole with NaN past their extents (cumulative)", (unsigned long long)g_ext_checked);
     LOG("[vk] support buffer: %llu stages wrote it, %llu left it unwritten (no module reads binding 0) (cumulative; gfx_vk_draw.inc stage_set)", (unsigned long long)g_sup_written, (unsigned long long)g_sup_skipped);
+    if (set_reuse()) { static unsigned long long f0; static uint64_t h0, m0;   // per frame since the last line
+        if (frame > f0) { double nf = (double)(frame - f0), h = (double)(g_sr_hit - h0) / nf, m = (double)(g_sr_miss - m0) / nf;
+            LOG("[vk] descriptor sets a frame over the last %llu frames: %.0f bound again with the same descriptors, %.0f written (%.1f%% bound again); %llu too large to keep "
+                "(cumulative; DM_VK_SET_REUSE, gfx_vk_draw.inc sr_find)", frame - f0, h, m, h + m > 0 ? 100.0 * h / (h + m) : 0.0, (unsigned long long)g_sr_long); }
+        f0 = frame; h0 = g_sr_hit; m0 = g_sr_miss; }
     if (g_ds_stats) { static unsigned long long f0; static uint64_t h0, r0, m0, k0; uint64_t h = g_ds_got, r = g_ds_reused, m = g_ds_made, k = g_ds_calls;   // DM_VK_SET_STATS=1
         if (frame > f0) { double nf = (double)(frame - f0); char sets[16 * NCHUNK_MAX], pools[16 * NCHUNK_MAX]; size_t ns = 0, np = 0; sets[0] = pools[0] = 0;
             for (int i = 0; i < g_nchunk; i++) { ns += (size_t)snprintf(sets + ns, sizeof sets - ns, i ? " %d" : "%d", g_ch[i].nds); np += (size_t)snprintf(pools + np, sizeof pools - np, i ? " %d" : "%d", g_ch[i].ndp); }
