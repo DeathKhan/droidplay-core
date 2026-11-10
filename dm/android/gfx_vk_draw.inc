@@ -947,7 +947,7 @@ static VkRenderPass rp_get(const rp_key *k) {
     nvn_hm_put(&g_rps, k, rp);
     return rp;
 }
-static struct { int active, layered; VkRenderPass rp; rp_key key; uint32_t w, h; VkFramebuffer fb; vtex *cv[8], *dv; uint32_t clv[8], cly[8];
+static struct { int active, layered; VkRenderPass rp; rp_key key; uint32_t w, h, layers; VkFramebuffer fb; vtex *cv[8], *dv; uint32_t clv[8], cly[8];
                 uint8_t *snap[8]; size_t snap_cap[8], snap_n[8]; uint8_t *snap_dst[8]; VkImage snap_img[8]; } P;   // snap: a linear target's guest bytes at rp_prepare (lsnap_take), until its write-back takes them
 static uint64_t g_passes;
 // DM_VK_DUMP=<frame>: every render pass of that frame (counted in presents from 1) has its colour targets copied out when it ends, written to
@@ -1304,7 +1304,7 @@ static int rp_prepare_(int layered) {
         if (vkCreateFramebuffer(g_vk.dev, &fc, NULL, &fb) != VK_SUCCESS) { RED_ONCE(85, "framebuffer %ux%u failed", w, h); lsnap_drop_all(); return 0; }
         nvn_hm_put(&g_fbs, &fk, fb);
     }
-    P.rp = rp; P.key = k; P.w = w; P.h = h; P.fb = fb; P.layered = layered; if (layers > 1) g_layered_passes++;
+    P.rp = rp; P.key = k; P.w = w; P.h = h; P.layers = layers; P.fb = fb; P.layered = layered; if (layers > 1) g_layered_passes++;
     return 1;
 }
 static int rp_prepare(void) { return rp_prepare_(0); }
@@ -3017,6 +3017,12 @@ static int clear_in_pass(const vtex *v, unsigned level, int depth) {
     if (!rp_prepare() || (depth && !P.key.depth)) return 0;
     return (v->w >> level ? v->w >> level : 1) == P.w && (v->h >> level ? v->h >> level : 1) == P.h;
 }
+// A clear in the pass covers every layer of its framebuffer: NVN clears the whole bound target, and in a layered pass (a 3D or array target attached whole for a draw
+// that writes the layer, rp_prepare) a rect of layer 0 alone left the other slices with what earlier frames drew. A full clear of a 3D target is in the pass whenever its
+// size matches (its one array layer: gfx_vk.c clear_color), so a volume drawn slice by slice and cleared each frame was cleared at slice 0 only: Final Fantasy Resonance
+// adds its lights into 32x32x32 volumes with additive blending, and in shirai91/nx2android's replay the fog boxes that read them changed every frame on its first road
+// (37c76f613 there). The masked clears below are a draw of layer 0, which a layered pass cannot widen without a layer-writing shader: a red line says when one meets it
+static VkClearRect clear_rect_layers(VkRect2D r) { return (VkClearRect){r, 0, P.layers ? P.layers : 1}; }
 // A colour clear of target idx limited by the scissor and / or a channel mask (gfx_vk.c clear_color takes the full ones)
 static void clear_color_pass(const p_clear_color *cc) {
     bf_reset();   // its pipeline and dynamic state are set behind the bind filter (bf_*)
@@ -3025,9 +3031,10 @@ static void clear_color_pass(const p_clear_color *cc) {
     int ci = dup_slot(cc->index); VkFormat f = P.key.color[ci];
     if ((cc->mask & 0xf) == 0xf) {
         VkClearAttachment at = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)ci, {.color = clear_value(f, cc->rgba)}};
-        VkClearRect cr = {r, 0, 1}; vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
+        VkClearRect cr = clear_rect_layers(r); vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
     }
     if (is_int_fmt(f)) { RED_ONCE(109, "masked clear of an integer target (format %d): not done", f); return; }
+    if (P.layers > 1) RED_ONCE(171, "masked clear in a layered pass of %u layers: layer 0 alone is cleared", P.layers);
     cpk_t k; memset(&k, 0, sizeof k); k.rp = P.rp; k.ncolor = P.key.ncolor; k.idx = (uint32_t)ci; k.mask = (uint32_t)cc->mask & 0xf; k.samples = P.key.samples;
     VkPipeline p = clear_pipe(&k); if (!p) return;
     float pc[5] = {cc->rgba[0], cc->rgba[1], cc->rgba[2], cc->rgba[3], 0};
@@ -3043,8 +3050,9 @@ static void clear_ds_pass(const p_clear_ds *cd, VkImageAspectFlags a) {
     uint32_t sm = (uint32_t)cd->stencil_mask & 0xff;
     if (!(a & VK_IMAGE_ASPECT_STENCIL_BIT) || sm == 0xff) {
         VkClearAttachment at = {a, 0, {.depthStencil = {cd->depth, (uint32_t)cd->stencil}}};
-        VkClearRect cr = {r, 0, 1}; vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
+        VkClearRect cr = clear_rect_layers(r); vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
     }
+    if (P.layers > 1) RED_ONCE(171, "masked clear in a layered pass of %u layers: layer 0 alone is cleared", P.layers);
     cpk_t k; memset(&k, 0, sizeof k); k.rp = P.rp; k.ncolor = P.key.ncolor; k.idx = 99; k.samples = P.key.samples; k.stencil_mask = sm; k.depth = (a & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
     VkPipeline p = clear_pipe(&k); if (!p) return;
     float pc[5] = {0, 0, 0, 0, cd->depth};
