@@ -44,13 +44,14 @@ Linux desktop apps on Android ([#40](https://github.com/enjoyerofslop/droidplay-
 <!-- The "status" anchor keeps links made before the rename working: DroidPlay's README links to #status. -->
 ## <a id="status"></a>Game Status
 
-Screen captures from the test runs, taken on the device. The round button at the top is DroidPlay's menu, the line at the bottom Android's gesture bar.
+Screen captures from the test runs, taken on the device. The round button at the top is DroidPlay's menu, the line at the bottom Android's gesture bar. On a
+phone, DroidPlay's on-screen controls are drawn over the game.
 
 <table>
 <tr>
 <td align="center" valign="top" width="33%"><img src="docs/images/android/pokemon-brilliant-diamond-odin-2.jpg" width="256" alt="Pokémon Brilliant Diamond in Eterna City on an Ayn Odin 2"><br><small><b><a href="dm/games/0100000011D90000/README.md">Pokémon Brilliant Diamond</a></b><br>Ayn Odin 2: Eterna City, 60 fps</small></td>
 <td align="center" valign="top" width="33%"><img src="docs/images/android/animal-crossing-new-horizons-odin-2.jpg" width="256" alt="Animal Crossing: New Horizons outside the player's house on an Ayn Odin 2"><br><small><b><a href="dm/games/01006F8002326000/README.md">Animal Crossing: New Horizons</a></b><br>Ayn Odin 2: outside the player's house, 30 fps</small></td>
-<td align="center" valign="top" width="33%"><img src="docs/images/android/super-mario-odyssey-retroid-pocket-5.jpg" width="256" alt="Super Mario Odyssey's opening cutscene on a Retroid Pocket 5"><br><small><b><a href="dm/games/0100000000010000/README.md">Super Mario Odyssey</a></b><br>Retroid Pocket 5: the opening cutscene, 38 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/super-mario-odyssey-retroid-pocket-5.jpg" width="256" alt="Super Mario Odyssey's opening cutscene on a Retroid Pocket 5"><br><small><b><a href="dm/games/0100000000010000/README.md">Super Mario Odyssey</a></b><br>Retroid Pocket 5: the opening cutscene, 59 fps</small></td>
 </tr>
 <tr>
 <td align="center" valign="top" width="33%"><img src="docs/images/android/super-smash-bros-ultimate-odin-2.jpg" width="256" alt="A Super Smash Bros. Ultimate battle on an Ayn Odin 2"><br><small><b><a href="dm/games/01006A800016E000/README.md">Super Smash Bros. Ultimate</a></b><br>Ayn Odin 2: a battle, 40–59 fps</small></td>
@@ -58,41 +59,56 @@ Screen captures from the test runs, taken on the device. The round button at the
 <td align="center" valign="top" width="33%"><img src="docs/images/android/zelda-skyward-sword-hd-odin-2.jpg" width="256" alt="The Legend of Zelda: Skyward Sword HD in Skyloft's plaza on an Ayn Odin 2, Link at the bird statue"><br><small><b><a href="dm/games/01002DA013484000/README.md">The Legend of Zelda: Skyward Sword HD</a></b><br>Ayn Odin 2: Skyloft at 60 fps</small></td>
 </tr>
 <tr>
-<td align="center" valign="top" width="33%"><img src="docs/images/android/zelda-breath-of-the-wild-odin-2.jpg" width="256" alt="The Legend of Zelda: Breath of the Wild on the Great Plateau on an Ayn Odin 2"><br><small><b><a href="dm/games/01007EF00011E000/README.md">The Legend of Zelda: Breath of the Wild</a></b><br>Ayn Odin 2: the Great Plateau, about 20 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/final-fantasy-resonance-odin-2.jpg" width="256" alt="Final Fantasy Resonance's first field at night on an Ayn Odin 2, its flames missing"><br><small><b><a href="dm/games/0100606026F12000/README.md">Final Fantasy Resonance</a></b><br>Ayn Odin 2: the first field, 42 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/pokemon-shield-galaxy-s25-edge.jpg" width="256" alt="Pokémon Shield on a Samsung Galaxy S25 Edge: the player at the front door of the house in Postwick, under the on-screen controls"><br><small><b><a href="dm/games/01008DB008C2C000/README.md">Pokémon Shield</a></b><br>Samsung Galaxy S25 Edge: outside the player's house in Postwick, 30 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/frostpunk-galaxy-s25-edge.jpg" width="256" alt="Frostpunk's city on a Samsung Galaxy S25 Edge: the snow and the crater drawn, the Generator missing but for its shadow"><br><small><b><a href="dm/games/0100B1C0249B4000/README.md">Frostpunk</a></b><br>Samsung Galaxy S25 Edge: the city, 30 fps</small></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/divinity-original-sin-2-odin-2.jpg" width="256" alt="Divinity: Original Sin 2 on an Ayn Odin 2: the player's character in the Merryweather's hold"><br><small><b><a href="dm/games/010027400CDC6000/README.md">Divinity: Original Sin 2 - Definitive Edition</a></b><br>Ayn Odin 2: the Merryweather's hold, 30 fps</small></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/zelda-breath-of-the-wild-odin-2.jpg" width="256" alt="The Legend of Zelda: Breath of the Wild on an Ayn Odin 2: Link in the Shrine of Resurrection"><br><small><b><a href="dm/games/01007EF00011E000/README.md">The Legend of Zelda: Breath of the Wild</a></b><br>Ayn Odin 2: the Shrine of Resurrection, 30 fps</small></td>
 <td align="center" valign="top" width="33%"><img src="docs/images/android/mario-kart-world-odin-2.jpg" width="256" alt="Mario Kart World's world map on an Ayn Odin 2"><br><small><b><a href="dm/games/0400C3F00006E000/README.md">Mario Kart World</a></b><br>Ayn Odin 2: the world map, about 55 fps</small></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/android/zelda-ocarina-of-time-galaxy-z-fold-8.jpg" width="256" alt="The Legend of Zelda: Ocarina of Time's title screen on a Samsung Galaxy Z Fold 8's cover display, the movie behind the logo black"><br><small><b><a href="dm/games/0400486024DEC000/README.md">The Legend of Zelda: Ocarina of Time</a></b><br>Samsung Galaxy Z Fold 8: the title, about 30 fps</small></td>
+<td></td>
 <td></td>
 </tr>
 </table>
 
 | Game | Device | State |
 |---|---|---|
-| Pokémon Brilliant Diamond 1.3.0 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Playable: 60 fps in Eterna City's overworld. On a Retroid Pocket 5 it no longer crashes at launch, but Eterna City runs at 15 fps on its own driver (58 with [Turnip](#another-vulkan-driver-turnip)) |
-| Animal Crossing: New Horizons 3.0.3 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Runs at 30 fps (as on the Switch) in the new game's airport and outside the player's house on all three; not played through |
-| Super Mario Odyssey 1.4.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | The Start menu at 60 fps, the opening cutscene at 60 (38 on the Retroid Pocket 5), and play in the Cap Kingdom at 60 on the Odin 2, past the hint video that used to crash it (the host's AVC decoder, fixed) |
-| Super Smash Bros. Ultimate 13.0.5 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Boots to its opening movie at 60 fps on all three, with the hinted shared font the packer now ships (Android's Roboto made it crash); battles at 40–59 fps on the Odin 2, 13–30 fps on the other two (pipelines built during play) |
-| The Legend of Zelda: Link's Awakening 1.1.0 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | Plays with its picture right at 60 fps on the Odin 2, 31 on the Pad 3 and 35 on the Retroid Pocket 5. The boot crash it had on every launch on the Retroid Pocket 5 and now and then on the Pad 3 is fixed (checked on the Retroid Pocket 5) |
-| The Legend of Zelda: Skyward Sword HD 1.0.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5 | The opening movie at 55–60 fps (41 on the Retroid Pocket 5); Skyloft plays at 59–60 fps on the Odin 2 and Pad 3 and at 43 on the Retroid Pocket 5, its terrain in colour on all three |
-| Final Fantasy Resonance 1.0.1 | Ayn Odin 2, OnePlus Pad 3 | From a new game's opening into the first field at about 42 fps on both, with the field drawn right (10–16 fps before 0.6.0). On the Odin 2 the field's flames are missing. Not played past the first field; not tried on the Retroid Pocket 5 |
+| Pokémon Brilliant Diamond 1.3.0 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5, Samsung Galaxy S25 Edge | Playable: 60 fps in Eterna City's overworld on all four. The Retroid Pocket 5 no longer crashes at launch, and its own driver now runs Eterna City at 59–60 fps, as [Turnip](#another-vulkan-driver-turnip) does (15 fps before) |
+| Animal Crossing: New Horizons 3.0.3 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5, Samsung Galaxy S25 Edge | Runs at 30 fps (as on the Switch) in the new game's airport and outside the player's house on all four; not played through |
+| Super Mario Odyssey 1.4.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5, Samsung Galaxy S25 Edge, Google Pixel 9 Pro XL | The Start menu and the opening cutscene at 59–60 fps on all five (the cutscene ran at 38 on the Retroid Pocket 5 on 2026-11-08), and play in the Cap Kingdom at 60 on the Odin 2, past the hint video that used to crash it (the host's AVC decoder, fixed; the video plays on the Pad 3 too). The crash now and then while it loads is fixed. The Pixel 9 Pro XL's Mali-G715, the first GPU outside Adreno, has no BC textures, so they are decoded on the CPU (2.2 GB resident in the cutscene, against 1.64 GB) |
+| Super Smash Bros. Ultimate 13.0.5 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5, Samsung Galaxy S25 Edge | Boots to its opening movie at 60 fps on all four, with the hinted shared font the packer now ships (Android's Roboto made it crash); the crash in about one boot in five is fixed too. Battles at 60 fps on the S25 Edge, 40–59 on the Odin 2 and 28–56 on the Pad 3, by stage and fighter; 13–19 on the Retroid Pocket 5 (2026-11-08, before the pipeline cache was kept during play; not measured since) |
+| The Legend of Zelda: Link's Awakening 1.1.0 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5, Samsung Galaxy S25 Edge | Plays with its picture right at 60 fps on the Odin 2, 38–45 on the S25 Edge, and 31–32 on the Pad 3 and the Retroid Pocket 5, where the game drops to its 30 fps interval. The boot crash it had on every launch on the Retroid Pocket 5 and now and then on the Pad 3 is fixed (checked on the Retroid Pocket 5) |
+| The Legend of Zelda: Skyward Sword HD 1.0.1 | Ayn Odin 2, OnePlus Pad 3, Retroid Pocket 5, Samsung Galaxy S25 Edge | The opening movie at 55–60 fps (41 on the Retroid Pocket 5); Skyloft plays at 59–60 fps on the Odin 2, the Pad 3 and the S25 Edge and at 43 on the Retroid Pocket 5, its terrain in colour on all four |
+| Final Fantasy Resonance 1.0.1 | Ayn Odin 2, OnePlus Pad 3, Samsung Galaxy S25 Edge | From a new game's opening into the first field at about 42 fps on the Odin 2 and the Pad 3 and 30–33 on the S25 Edge, with the field drawn right (10–16 fps before 0.6.0). On the Odin 2 the field's flames are missing. Not played past the first field; not tried on the Retroid Pocket 5 |
 | Pokémon Shield 1.3.2 | Samsung Galaxy S25 Edge | Plays at 30 fps (as on the Switch) from a new game through the opening into Postwick, with sound, saves and Continue working. Not played to the first battle or the Wild Area; not tried on the other devices |
 | Frostpunk 1.0.1 | Samsung Galaxy S25 Edge | Runs at 30 fps from the title through A New Home's intro into the city, with sound, but the Generator, the buildings and the props are invisible: their shaders read raw global memory, which the Vulkan replay doesn't have yet. Not played past the first minutes |
-| The Legend of Zelda: Breath of the Wild 1.9.0 | Ayn Odin 2 | Runs with a correct picture at about 20 fps (CPU-bound in the Vulkan replay) † |
+| Divinity: Original Sin 2 - Definitive Edition 1.0.3.1 | Ayn Odin 2, OnePlus Pad 3 | Plays at the game's 30 fps from a new game through character creation and the opening cinematic into the Merryweather's hold and the cabin deck, with sound, Quick Save and Continue. On the Pad 3 it runs at 40 or 60 fps with a setting, the game moving by real time at each ([its note](dm/games/010027400CDC6000/README.md#frame-rate)). Not played as far as Fort Joy |
+| The Legend of Zelda: Breath of the Wild 1.9.0 | Ayn Odin 2, OnePlus Pad 3, Samsung Galaxy S25 Edge, Samsung Galaxy Z Fold 8 | 30 fps in the Shrine of Resurrection on the Odin 2, the Pad 3 and the S25 Edge with its Android defaults (descriptor sets bound again, the command recorder, a 30 fps target); 24 on the Galaxy Z Fold 8, whose GPU takes 30 ms a frame. On the Pad 3 it lost the GPU at its first frame in the field, and on both Adreno 830s it drew the Shrine dark: both are fixed (the picture checked on the S25 Edge; on the Pad 3 only in a local test). 60 fps needs the replay's CPU time and the GPU's to come down |
 | Super Mario Bros. Wonder 1.2.1 | POCO X5 5G (Adreno 619) | Playable: about 30 fps at render scale 0.8 † |
 | Super Mario 3D World + Bowser's Fury 1.2.2 | POCO X5 5G | Bowser's Fury runs with correct colours; one launch stopped at a black loading screen † |
 | Danganronpa V3 Anniversary Edition 1.0.2, The Binding of Isaac: Afterbirth+ 1.7.9b | POCO X5 5G | Run from provisional profiles; not played through † |
 | **Mario Kart World 1.8.0 (Switch 2)** | Ayn Odin 2 | **Boots and draws:** the world map at about 55 fps, the attract drive at about 3.4 fps. Open: sparse textures (the terrain is untextured), virtual memory pools, constant-buffer copies in the replay, no mesh shaders on the device |
+| **The Legend of Zelda: Ocarina of Time v131072 (Switch 2)** | Samsung Galaxy Z Fold 8 | **Reaches Kokiri Forest:** the title at about 30 fps (the movie behind the logo black), the Load screen, and Kokiri Forest at about 1.7 fps with the forest black: 2,247 of the game's shaders read raw global memory, which the Vulkan replay doesn't have yet. Open: raw global memory, then the CPU's 460 ms a frame and the memory (10.2 GB of the phone's 11.3) |
 
 † Tested before DroidPlay Core merged nxnative's `main` (2026-11-08); not run since.
 
-The first six rows are from the [Android baselines](dm/android/baselines.md) of 2026-11-08: the same scripted runs on each device, with frame times, the devices'
-drivers, and the known problems with what is known of their causes.
+The rows for the first six games, Final Fantasy Resonance and Breath of the Wild are from the [Android baselines](dm/android/baselines.md): the same scripted runs on
+each device, with frame times, the devices' drivers, and the known problems with what is known of their causes. The first were measured on 2026-11-08 on the Odin
+2, the Pad 3 and the Retroid Pocket 5. On 2026-11-10 the Galaxy S25 Edge's column and the rows for Final Fantasy Resonance and Breath of the Wild were added, and
+the Retroid Pocket 5's rows were measured again; Ocarina of Time on the Galaxy Z Fold 8 and Super Mario Odyssey on the Pixel 9 Pro XL have sections of their own
+there. The other rows are from the games' own notes, which the [games table](dm/games/README.md#games) links.
 
 Every other game in the [games table](dm/games/README.md#games) has a profile and can be packed the same way, but has not been run on Android. A game without a
 profile can still be packed as an *experimental build*: most likely it does not boot, but it is the starting point for porting it.
 
 The Android host replays NVN only. A game that draws with OpenGL or makes its own Vulkan calls (OpenGL or Vulkan in the games table's Graphics column) cannot
-draw on Android, since the OpenGL and Vulkan layers are the Mac's, on Metal: Balatro, Digimon Story Cyber Sleuth and Well Dweller (OpenGL), and Hades and both
-Super Mario Galaxy games (Vulkan). The packing script stops on such a game and says why, before the rewrite and the shaders. Super Mario 3D All-Stars still
-builds, since its launcher draws with NVN, but Super Mario 64 and Sunshine inside it call Vulkan and cannot draw.
+draw on Android, since the OpenGL and Vulkan layers are the Mac's, on Metal: Balatro, Digimon Story Cyber Sleuth, Street Fighter 30th Anniversary Collection and
+Well Dweller (OpenGL), and Hades and both Super Mario Galaxy games (Vulkan). The packing script stops on such a game and says why, before the rewrite and the
+shaders. Super Mario 3D All-Stars still builds, since its launcher draws with NVN, but Super Mario 64 and Sunshine inside it call Vulkan and cannot draw.
 
 ## Testing and reporting
 
