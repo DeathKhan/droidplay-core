@@ -1937,6 +1937,21 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   - GPU and picture unchanged.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
 
+### A render pass with colour slot 0 empty hangs a later pass on the Adreno 830 (Android)
+
+- **Symptom:** Breath of the Wild loses the GPU on a OnePlus Pad 3 (Adreno 830, driver 0x8032004a) at its first frame in the field: `vkQueueSubmit` gives -4 and the loading screen stays up. Before that, one submission a frame takes 250–340 ms on the GPU with its end timestamp never written: the driver's hang recovery. The hang report names one draw, a vertical blur into a 640×360 RGBA8 target (vertex `2decd3e894b3736a`, fragment `26ae1640f3448ba4`). An Ayn Odin 2 (Adreno 740) runs the same frames.
+- **Cause:** an earlier pass of the frame binds that target alone in colour slot 5, with slots 0–4 empty (`VK_ATTACHMENT_UNUSED`).
+  - That pass itself runs. The later pass that draws into the target as slot 0 is the one that hangs.
+  - The hanging draw's pipeline, shaders, textures and depth image are the healthy horizontal pass's, so only the target and its history differ ([Android baselines](../../dm/android/baselines.md) problem 14 lists what was ruled out).
+  - Skipping the first pass's draws doesn't help, because its clear still begins it.
+  - An empty slot 6 below a used slot 7 (a G-buffer pass) needs nothing. Only an empty slot 0 does.
+- **Fix:** on Adreno 8xx such a pass gets a scratch RGBA8 target in slot 0 (`gfx_vk_draw.inc` `slot0_fill_on`, `slot0_scratch`).
+  - One image serves every pass, since an attachment may be larger than the framebuffer. It is made again larger when a pass is larger, and the earlier ones are kept, because cached framebuffers name their views.
+  - Layered and multisample passes keep slot 0 empty, with a red line.
+  - `DM_VK_SLOT0_FILL=1` turns it on for any GPU, `0` off.
+- **Check:** Breath of the Wild on the Pad 3, the `outdoors` save. With the fix it runs into the field with no hang report. With `DM_VK_SLOT0_FILL=0` it hangs and loses the GPU as before. Filling every empty slot below a used one also stops it; filling only the slot 7 pass's slot 6, or zeroing the write masks of empty slots, doesn't.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
+
 ### Pipeline keys built from the state objects' fields
 
 - **Symptom:** new graphics pipelines made all through play, also in a level seen before (a few per frame, about 1 to 2 ms each on the Adreno); the start-up list of pipelines grew past 186,000 keys over a few sessions, and making it again took the fast cores for most of an hour.
