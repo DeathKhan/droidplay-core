@@ -117,13 +117,14 @@ enum { SH_VS, SH_PS, SH_GS, SH_TS, SH_CS };
 // DMSH_CBSIZE_BANK), which the translator adds to every shader that reads a uniform slot: a binding past the cap would be dropped without a word
 #define CB_MAX 20
 typedef struct {
-    char key[17]; int stage, set, ok; VkShaderStageFlagBits vkstage; VkShaderModule mod, modz, modtf; uint32_t tf_stride[4]; VkDescriptorSetLayout dsl_tf;
+    char key[17]; int stage, set, ok; VkShaderStageFlagBits vkstage; struct lmod *mod, *modz, *modtf;   // modz, modtf: NULL without a .z / .tf variant (gfx_vk_lmod.inc)
+    uint32_t tf_stride[4]; VkDescriptorSetLayout dsl_tf;
     int ncb, nsb, ntx, nim; rb_cbuf cb[CB_MAX]; rb_sbuf sb[16]; rb_tex tx[64], im[16];
     VkDescriptorSetLayout dsl;
     char vin[16];   // vertex inputs' types: 'f' float, 'u' uint, 's' int (res.json "vin")
     int vid;   // a vertex shader reading gl_VertexIndex: its draws keep their vertex numbers (bind_vbufs lo 0)
     uint32_t io_in, io_out;   // the locations of its user-defined inputs and outputs (bit n: location n)
-    struct { uint32_t miss; VkShaderModule m; } var[4]; int nvar;   // fragment shaders: variants with unwritten inputs made constants (ps_variant)
+    struct { uint32_t miss; struct lmod *m; } var[4]; int nvar;   // fragment shaders: variants with unwritten inputs made constants (ps_variant)
     int b0;   // a module of its set (.spv, .z.spv, .tf.spv; ps_variant only makes inputs private) reads binding 0, the support buffer (spv_b0_used): stage_set writes it only then
     int wlayer;   // a vertex, tessellation or geometry shader that writes the layer (spv_layer_out): its draws get every layer of their targets (rp_prepare)
     ds_list *dsf;   // its descriptor sets kept by each chunk, [2 chunk + tf] (dsl, dsl_tf): made at its first set (ds_get), never freed (as the shader)
@@ -414,42 +415,17 @@ static size_t spv_fit(const uint32_t *code, size_t nw, const char *what, uint32_
 }
 static size_t spv_pool_fit(const uint32_t *code, size_t nw, const char *what, uint32_t **out);   // gfx_vk_pool.inc
 static int pool_on(void); static void pool_note_shader(vshader *s, int info); static void pool_drop_view(VkImageView iv);
-static __thread int t_pool_info;   // what spv_pool did to the modules sh_module_code made since sh_get cleared it
-static VkShaderModule sh_module_code(const uint32_t *code, size_t nw, const char *what) {
-    uint32_t *pf = NULL; size_t pn = spv_pool_fit(code, nw, what, &pf); if (pn) { code = pf; nw = pn; }   // the texture pool by ID moved into the pool set
-    uint32_t *fit = NULL; size_t fn = spv_fit(code, nw, what, &fit); if (fn) { code = fit; nw = fn; }
-    VkShaderModule m = VK_NULL_HANDLE; VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = code};
-    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-    if (vkCreateShaderModule(g_vk.dev, &ci, NULL, &m) != VK_SUCCESS) { LOG("[RED] [vk] shader module %s refused by the driver", what); m = VK_NULL_HANDLE; }
-    atomic_fetch_add(&g_mod_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_mod_made, 1);
-    free(fit); free(pf);
-    return m;
-}
-static VkShaderModule ps_variant(vshader *s, uint32_t miss) {
+#include "gfx_vk_lmod.inc"   // shader modules made when a pipeline needs them: lmod, lm_new, lm_pipeline
+static lmod *ps_variant(vshader *s, uint32_t miss) {
     for (int i = 0; i < s->nvar; i++) if (s->var[i].miss == miss) return s->var[i].m;
     char p[700]; snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key);
-    size_t n = 0, on = 0; uint32_t *w = spv_read(p, &n), *v = w ? spv_drop_inputs(w, n, miss, &on) : NULL;
-    VkShaderModule m = v ? sh_module_code(v, on, p) : VK_NULL_HANDLE;
-    { const char *d = getenv("DM_DUMP_DIR"); if (v && d) { char q[700]; mkdir(d, 0777); snprintf(q, sizeof q, "%s/var_%s_%x.spv", d, s->key, miss); FILE *f = fopen(q, "wb"); if (f) { fwrite(v, 4, on, f); fclose(f); } } }   // for spirv-val
+    lmod *m = lm_new(p, miss, NULL);
     LOG("[vk] fragment shader %s: inputs at locations %#x are written by no earlier stage of a pipeline: a variant reads them as zero%s", s->key, miss, m ? "" : " [RED] (variant failed: the pipeline keeps the shader as it is)");
-    free(w); free(v);
     if (!m) m = s->mod;
     if (s->nvar < 4) { s->var[s->nvar].miss = miss; s->var[s->nvar++].m = m; }
     return m;
 }
-static VkShaderModule sh_module(const char *path, int *b0) {   // *b0 |= the module reads the support buffer (spv_b0_used)
-    size_t n = 0; uint32_t *code = spv_read(path, &n); if (!code) return VK_NULL_HANDLE;
-    *b0 |= spv_b0_used(code, n);
-    if (!g_vk_feat.vertexPipelineStoresAndAtomics) {   // the Mali-G76: the vertex pipeline's storage resources must be NonWritable (spv_readonly.h)
-        size_t cap = n + 3 * (size_t)code[3], on = 0; int wr = 0;
-        uint32_t *s = malloc(2 * (size_t)code[3] * 4), *o = malloc(cap * 4);
-        if (s && o && (on = spv_readonly(code, n, s, o, cap, &wr))) { free(code); code = o; n = on; o = NULL; }
-        if (wr) LOG("[RED] [vk] %s writes %d storage resource(s) from the vertex pipeline: the GPU has no vertexPipelineStoresAndAtomics, the driver may refuse it", path, wr);
-        free(s); free(o);
-    }
-    VkShaderModule m = sh_module_code(code, n, path);
-    free(code); return m;
-}
+static lmod *sh_module(const char *path, int *b0) { return lm_new(path, 0, b0); }   // *b0 |= the module reads the support buffer (spv_b0_used)
 // Ryujinx's TextureFormat names (an image's declared format) → Vulkan, with the texel size
 static const struct { const char *n; VkFormat f; int bytes; } DECL_FMT[] = {
     {"R8Unorm", VK_FORMAT_R8_UNORM, 1}, {"R8Snorm", VK_FORMAT_R8_SNORM, 1}, {"R8Uint", VK_FORMAT_R8_UINT, 1}, {"R8Sint", VK_FORMAT_R8_SINT, 1},
@@ -557,7 +533,7 @@ static vshader *sh_get(const char *key) {
     if (s->modtf) {   // the capture variant's set: the same bindings and the feedback buffers
         for (int q = 0; q < 4; q++) if (s->tf_stride[q]) b[nb++] = (VkDescriptorSetLayoutBinding){100u + (uint32_t)q, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL};
         lc.bindingCount = nb;
-        if (vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &s->dsl_tf) != VK_SUCCESS) s->modtf = VK_NULL_HANDLE;
+        if (vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &s->dsl_tf) != VK_SUCCESS) s->modtf = NULL;
         if (!ds_fits(b, nb)) s->dsbig |= 2;
     }
     s->ok = 1;
@@ -1573,12 +1549,13 @@ static void pb_dump(void) {   // crash.c, on the crashing thread, after its back
 static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t *onva, VkPrimitiveTopology *otp) {
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &g_empty_dsl); }
     VkDescriptorSetLayout sets[POOL_SET + 1] = {g_empty_dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl}; uint32_t nset = 1;
-    VkPipelineShaderStageCreateInfo st[4]; uint32_t ns = 0;
+    VkPipelineShaderStageCreateInfo st[4]; lmod *lms[4]; uint32_t ns = 0;
     for (int i = 0; i < 4; i++) { vshader *s = k->sh[i]; if (!s) continue;
         sets[s->set & 3] = k->tf ? s->dsl_tf : s->dsl; if ((uint32_t)(s->set & 3) + 1 > nset) nset = (uint32_t)(s->set & 3) + 1;
-        VkShaderModule mod = k->tf ? s->modtf : s->stage == SH_VS && k->z && s->modz ? s->modz : s->mod;
+        lmod *mod = k->tf ? s->modtf : s->stage == SH_VS && k->z && s->modz ? s->modz : s->mod;
         if (s->stage == SH_PS) { const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0; if (miss) mod = ps_variant(s, miss); }   // see spv_drop_inputs
-        st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .module = mod, .pName = "main"};
+        if (!mod) return VK_ERROR_INITIALIZATION_FAILED;
+        lms[ns] = mod; st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .pName = "main"};   // its module: lm_pipeline
         if (s->pool) { sets[POOL_SET] = g_pool_dsl; nset = POOL_SET + 1; } }
     VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nset, .pSetLayouts = sets};
     if (vkCreatePipelineLayout(g_vk.dev, &lc, NULL, &pp->pl) != VK_SUCCESS) return VK_ERROR_INITIALIZATION_FAILED;
@@ -1641,13 +1618,13 @@ static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t
     const char *pbk[4]; uint32_t miss = 0; for (int i = 0; i < 4; i++) { pbk[i] = k->sh[i] ? k->sh[i]->key : NULL;
         if (k->sh[i] && k->sh[i]->stage == SH_PS) { const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; miss = pv ? k->sh[i]->io_in & ~pv->io_out : 0; } }
     int pb = pb_begin('g', pbk, (uint8_t)tp, (uint8_t)k->ncolor, (uint8_t)(k->z != 0), miss);
-    VkResult pr = vkCreateGraphicsPipelines(g_vk.dev, pcache(), 1, &pc, NULL, &pp->p);
+    VkResult pr = lm_pipeline(&pc, NULL, st, lms, ns, &pp->p);
     pb_end(pb);
     atomic_fetch_add(&g_pso_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_pso_made, 1);
     *ons = ns; *onva = nva; *otp = tp;
     return pr;
 }
-static VkShaderModule pipe_ps_mod(const pipe_key *k, vshader *s) {   // the fragment shader's module: a variant when the earlier stage leaves inputs unwritten (spv_drop_inputs)
+static lmod *pipe_ps_mod(const pipe_key *k, vshader *s) {   // the fragment shader's module: a variant when the earlier stage leaves inputs unwritten (spv_drop_inputs)
     const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0;
     return miss ? ps_variant(s, miss) : s->mod;
 }
@@ -2888,9 +2865,9 @@ static cpipe_t *cpipe_get(vshader *s) {
     VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = s->pool ? POOL_SET + 1 : 1, .pSetLayouts = sl};
     if (vkCreatePipelineLayout(g_vk.dev, &lc, NULL, &cp->pl) != VK_SUCCESS) return NULL;
     VkComputePipelineCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = cp->pl,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = s->mod, .pName = "main"}};
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main"}};   // its module: lm_pipeline
     const char *pbk[4] = {s->key, NULL, NULL, NULL}; int pb = pb_begin('c', pbk, 0, 0, 0, 0);
-    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); VkResult pr = vkCreateComputePipelines(g_vk.dev, pcache(), 1, &pc, NULL, &cp->p);
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); VkResult pr = lm_pipeline(NULL, &pc, &pc.stage, &s->mod, 1, &cp->p);
     pb_end(pb);
     atomic_fetch_add(&g_cpso_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_cpso_made, 1);
     if (pr != VK_SUCCESS) { static int n; if (n++ < 16) LOG("[RED] [vk] compute pipeline of shader %s failed", s->key); cp->p = VK_NULL_HANDLE; return NULL; }
