@@ -35,14 +35,14 @@ median GPU time per frame. Animal Crossing runs at 30 fps on the Switch too.
 | **Pokémon Brilliant Diamond 1.3.0**, language menu (a fresh save) | 60 · 16.7 / 19.2–19.4 | 60 · 16.6–16.7 / 18.5–18.8 | 60 · 16.6–16.7 / 18.1–19.4 (2026-11-10, after problem 2's fix) | not run |
 | Pokémon Brilliant Diamond, Eterna City (a save) | 60 · 16.6 / 18.1–18.2 · GPU 8.1 | 58.9–59.7 · 16.6–16.8 / 18.8–19.7 · GPU 10.7 | 54.6–60.0 · 16.6–18.2 / 18.5–21.3 · GPU 13.5–15.0 (2026-11-10, after problem 13's fix; 24.0–24.6 before) | not run |
 | **Animal Crossing: New Horizons 3.0.3**, the new game's airport (a fresh save) | 30 · 33.3 / 34.7–35.4 · GPU 5.3 | 30 · 33.3 / 35.7–35.8 · GPU 7.1 | 30 · 33.4 / 36.5–36.7 · GPU 15.8 | 30 · 33.4 / 35.8–35.9 · GPU 15.8 |
-| Animal Crossing, outside the player's house (a save) | 30 · 33.3–33.4 / 35.7–35.8 · GPU 9.4–9.7 | 29.9 · 33.3–33.4 / 38.0–38.1 · GPU 15.5–15.9 | Not measured: the game stops at its first save (see below) | 30 · 33.2–33.4 / 35.6–36.3 · GPU 22.7–23.1 |
+| Animal Crossing, outside the player's house (a save) | 30 · 33.3–33.4 / 35.7–35.8 · GPU 9.4–9.7 | 29.9 · 33.3–33.4 / 38.0–38.1 · GPU 15.5–15.9 | 30.0 · 33.3 / 36.3–36.5 · GPU 21.8–22.3 (2026-11-10, after the save fix below) | 30 · 33.2–33.4 / 35.6–36.3 · GPU 22.7–23.1 |
 | **Super Smash Bros. Ultimate 13.0.5**, boot with Android's Roboto as the shared font (fixed: problem 3) | **Crashes** 2–4 s in | **Crashes** | **Crashes** | not run (fixed before) |
 | Smash, the opening movie (with a hinted shared font, now packed with the game) | 60 · 12.0 / 33.9 | 59.9 · 13.1–13.4 / 34.7–35.1 | 59.7 · 13.5–13.9 / 35.5–36.0 | 60 · 9.8–12.4 / 33.5–33.7 · GPU 1.9–2.1 |
 | Smash, a battle (a fuller shared font; stage and CPU fighter vary) | 39.7–59.3 fps | 16.8–29.7 fps, frames up to 215 ms | 13.4–19.3 fps, frames up to 368 ms | 59.9 fps, frames up to 52 ms · GPU 6.3–6.6 |
 | **The Legend of Zelda: Link's Awakening 1.1.0**, the opening movie (a fresh save) | 59.8–59.9 · 16.7 / 17.6–17.7 · GPU 2.3–2.4 | 59.7 · 16.7 / 16.8 · GPU 4.5 (the other run crashed at boot) | 57.4–58.9 · 16.7 / 17.0–18.6 · GPU 5.6–6.4 (10 runs, 2026-11-10, after problem 9's fix) | 60 · 16.7 / 16.8 · GPU 4.9 |
 | Link's Awakening, the overworld at the Ancient Ruins (a save) | 59.9–60 · 16.7 / 17.2–17.3 · GPU 4.1 | 31.3 · 33.2 / 34.7 · GPU 12.0 (the other run crashed at boot) | 34.7–36.0 · 32.8–33.0 / 34.5 · GPU 12.8 (2026-11-10, after problem 9's fix; the game falls to its 30 fps interval, problem 12) | 38.1–44.6 · 16.8–32.5 / 33.8–34.1 · GPU 13.0–13.7 |
 | **The Legend of Zelda: Skyward Sword HD 1.0.1**, the opening movie (a fresh save) | 55.2–55.9 · 18.1–18.3 / 36.6–37.7 · GPU 2.3–2.4 | 59.9–60 · 16.7 / 24.5–25.1 · GPU 2.8 | 41.1–41.4 · 24.4–24.6 / 49.1–49.8 · GPU 3.7 | 60 · 16.6 / 18.0–18.1 · GPU 2.5 |
-| Skyward Sword HD, Skyloft's plaza (a save) | 30.0–30.5 · 33.3 / 36.6–46.8 · GPU 4.8–4.9 | 30.0–34.0 · 30.6–32.9 / 44.4–46.5 · GPU 12.6–12.8 | Not measured: the game stops at its first save (see below) | 60 · 16.6–16.7 / 20.6–20.7 · GPU 9.8–9.9 |
+| Skyward Sword HD, Skyloft's plaza (a save) | 30.0–30.5 · 33.3 / 36.6–46.8 · GPU 4.8–4.9 | 30.0–34.0 · 30.6–32.9 / 44.4–46.5 · GPU 12.6–12.8 | 43.2–43.3 · 17.7 / 34.9–35.2 · GPU 8.5 (2026-11-10, after the save fix below; terrain and sky in colour) | 60 · 16.6–16.7 / 20.6–20.7 · GPU 9.8–9.9 |
 | **Final Fantasy Resonance 1.0.1**, the Lancarse logo and the Brightness screen (a fresh save) | 59.6–59.7 · 16.8 / 18.7 · GPU 1.8 | not measured here | not run | 59.6 · 16.8 / 21.3–21.5 · GPU 5.8 |
 | Final Fantasy Resonance, the first field (a save made by its `tofield` route) | 42.2–42.6 · 23.3–23.6 / 27.1–27.4 · GPU 12.5–12.7 | not measured here | not run | 30.1–33.3 · 29.7–33.0 / 40.9–42.8 · GPU 20.2–22.7 |
 | **The Legend of Zelda: Breath of the Wild 1.9.0**, the Shrine of Resurrection (the `outdoors` save, a 40 s window) | no GPU hang: 30.0–30.5 · 33.0–33.3 / 37.5–38.2 · GPU 13.2–15.3 on main (the frame step tries 60 and fails), **29.9 · 33.2 / 36.2–36.6 · GPU 14.3** with droidplay-core#108 | **30.0 · 33.2–33.3 / 37.9–38.4 · GPU 16.5–16.7** on main with BotW's defaults and the empty slot 0 filled (problem 14, fixed; the picture is still dark, problem 15). Before that fix the GPU was lost at the first frame in the field; with the hanging draw skipped: 20.0 · 48.6–49.2 / 68–71 · GPU 22.3 on main | not run | not run |
@@ -59,12 +59,12 @@ Diamond's first frame took 33 s on the Pad 3's first launch. On the Galaxy S25 E
 
 The first Switch 2 game measured on Android (2026-11-10, #76's branch with #82-#87 and #94, chain 5 shaders), on a fourth device: a Galaxy Z Fold 8 (SM-F971U1, SM8850 / Snapdragon 8 Elite
 Gen 5, Adreno 840, Qualcomm's driver 0x8034a013, Vulkan 1.4.295, Android 17, 11.3 GB of RAM), folded, on its cover display. `scripts/bench_android.py`, route `title`,
-two runs without a warm-up (the pipeline cache warm from earlier runs):
+two runs without a warm-up (the pipeline cache warm from earlier runs; Kokiri Forest on main with the texture pool set, route `kokiri`):
 
 | Game, scene | Galaxy Z Fold 8 |
 |---|---|
 | **Ocarina of Time v131072**, the title and its menu (a fresh save) | 29.6-31.1 · 33.2-33.3 / 35.1-48.2 · GPU 26.7 |
-| Ocarina of Time, Kokiri Forest (a Mac save, by taps) | about 2 fps (frame about 540 ms, GPU about 165 ms), the forest not drawn (texture pool shaders); runs, at 2.9 GB of graphics memory (killed 15-60 s in before #94) |
+| Ocarina of Time, Kokiri Forest (a Mac save, route `kokiri`) | 1.7 fps · frame p50 593-611 / p95 683-691 · GPU 119.4-128.2, PSS 8.5 GB; the forest black (not the texture pool, whose draws run now; 1.6 fps and GPU 138.7 with `DM_VK_POOL=0`) |
 
 The title's GPU frame is nn::ndve's last convolution (36.8 ms in a `prof_now` frame). Kokiri Forest's memory (`DM_VK_MEMREPORT`, #95), its black picture and what is open: the game's note,
 [Android](../games/0400486024DEC000/README.md#android).
@@ -197,13 +197,14 @@ Numbered in the order they were found, so links to a number stay right:
   the Pad 3.
 - **GPU time is at the clock the driver chose.** The Pad 3 shows longer GPU times than the Odin 2 in light scenes although its GPU is faster: it keeps its
   clocks low when the work is light. Compare the GPU column within one device, not across devices.
-- **The Retroid Pocket 5 can't run a route whose game saves early.** The benchmark keeps each run's save in the app's external files, and on the Retroid
-  Pocket 5 that storage cannot swap two folders atomically (`renameat2` with `RENAME_EXCHANGE` fails with `EINVAL`), which the host's save commit needs:
-  `[RED] save commit: atomic swap failed errno=22`. Animal Crossing saves as soon as the island loads, so it stopped with its "an error occurred" screen,
-  which it drew at 30 fps, and the first published version of this page counted that as the island. A player's saves are in the app's internal storage,
-  which can swap, so play is not affected; only this route on this device is. Brilliant Diamond crashes there earlier, and Smash's saves did not fail.
-  Skyward Sword HD saves while its file list loads, and crashes (`main+0xf2b210`, `addr=0x20`) when it reads the save back after the failed commit, so its
-  Skyloft route is not measured there either; its boot route survives the failed commit. Link's Awakening's routes survive theirs too (five or six a run).
+- **Fixed: the Retroid Pocket 5 couldn't run a route whose game saves early.** The benchmark keeps each run's save in the app's external files. On the
+  Retroid Pocket 5 (kernel 4.19) that folder is sdcardfs, which cannot swap two folders atomically (`renameat2` with `RENAME_EXCHANGE` fails with `EINVAL`)
+  and has no extended attributes, so every save commit failed: `[RED] save commit: atomic swap failed errno=22`. Animal Crossing saves as soon as the island
+  loads, so it stopped with its "an error occurred" screen, which it drew at 30 fps, and the first published version of this page counted that as the island.
+  Skyward Sword HD saves while its file list loads, and crashed (`main+0xf2b210`, `addr=0x20`) when it read the save back after the failed commit. A player's
+  saves are in the app's internal storage (f2fs), which can swap, so play was never affected. The host now swaps with plain renames where `RENAME_EXCHANGE`
+  is refused, and the save's mount puts back a swap that a kill cut short ([services reference](../../docs/reference/services.md#android-a-save-folder-on-sdcardfs)).
+  Both routes now run there with every commit made (18 a run in Skyward Sword HD, one in Animal Crossing), and a restart on the committed save loads it.
 - **The Pad 3's logcat drops lines from a game that logs fast.** Android 16 rate-limits an app's log, and Link's Awakening logs every file open, so the
   line that marks it ready never reached logcat. The benchmark now takes it from the host's own `log.txt` when logcat lacks it.
 - **Smash's battles are a range, not a baseline.** The route picks Random stage and a random CPU fighter (D-pad moves on the stage grid did not land on the

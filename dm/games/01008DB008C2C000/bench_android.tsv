@@ -1,0 +1,5 @@
+# Android benchmark routes for scripts/bench_android.py: name <TAB> DM_KEYS or - <TAB> save or - <TAB> window start s <TAB> window length s <TAB> ready pattern or - <TAB> description [<TAB> KEY=VALUE;KEY=VALUE]
+# postwick: the save is the bedroom one of the Mac routes (the Bag taken, before Hop's talk outside), made on the phone; the walk out is Sword's route_out.sh.
+# ready (postwick): Postwick's outdoor area loads (a_0101; the house is a_t0101_i0101), DM_FS=1 logs it
+postwick	f660:A,32:LDown~0.8,33:LLeft~2.5,35.8:LRight~0.5,36.5:LDown~2.5,39.2:LLeft~0.3,39.7:LDown~2	saves/bedroom	50	30	field/area/other/a_0101\.gfpak	Continue from a save in the bedroom with the Bag, out of the front door, then the player standing outside the house in Postwick (the garden, the thatched roof, the sky)
+boot	-	-	20	30	-	a fresh save: the boot, then the language menu idling; no input

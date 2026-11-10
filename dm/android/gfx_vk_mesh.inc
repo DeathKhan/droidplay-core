@@ -31,6 +31,8 @@ static int vk_mesh_draw_(const p_draw *dw) {
     if (!k.sh[0]) { RED_ONCE(160, "DrawMeshTasks with no mesh shader bound: draw skipped"); return 0; }
     draw_view(k.sh, NULL, 0);   // what the stages read of guest memory: pending GPU writes to it land first (no vertex streams)
     for (int i = 0; i < 4; i++) if (k.sh[i]) stage_textures(k.sh[i]);
+    int pool = (k.sh[0] && k.sh[0]->pool) || (k.sh[1] && k.sh[1]->pool) || (k.sh[2] && k.sh[2]->pool);   // the texture pool by ID (gfx_vk_pool.inc), as vk_draw_
+    if (pool) pool_sync();
     if (!rp_prepare_(0)) { g_drop[1]++; return 0; }
     g_drawing = 1;
     pipe_key_build(&k, DM_PRIM_MESH_TASKS);   // the mesh shader reads no vertex attribute (io_in 0): the key has none
@@ -50,6 +52,7 @@ static int vk_mesh_draw_(const p_draw *dw) {
     occl_begin();
     bf_pipeline(c, pp->p);
     for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], k.sh[i]->ndyn, dyn[i]);
+    if (pool && !pool_bind(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl)) { g_drop[3]++; return 0; }
     VkViewport v; VkRect2D sc; draw_dyn_state(c, &v, &sc); (void)v; (void)sc;
     // a task shader's workgroups are the draw's; with none, the mesh shader's. Past the device's X limit (65,535 on the Adreno 840) the draw goes in parts, each with its own first
     uint32_t first = (uint32_t)dw->first, left = (uint32_t)dw->count, mx = g_mesh_max[k.sh[2] ? 0 : 1];

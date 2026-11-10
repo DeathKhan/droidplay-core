@@ -213,6 +213,9 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         g_mnt[g_nmnt].txn_root = g_mnt[k].txn_root;
     } else if (txn) {
         char work[1100], neu[1100]; snprintf(work, sizeof work, "%s.work", dir); snprintf(neu, sizeof neu, "%s.new", dir);
+#ifdef __ANDROID__
+        dm_android_swap_recover(dir); dm_android_swap_recover(work);   // a swap of plain renames (plat_android.c: sdcardfs has no RENAME_EXCHANGE) that a kill cut short
+#endif
         mkdir(dir, 0755);
         save_old_names(dir, dir);   // after the cloud's save came in (it may hold such names too), and under the locks the cloud sender's clone takes (dm_fs_clone_committed)
         const char *why = NULL;
