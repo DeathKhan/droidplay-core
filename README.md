@@ -87,6 +87,11 @@ drivers, and the known problems with what is known of their causes.
 Every other game in the [games table](dm/games/README.md#games) has a profile and can be packed the same way, but has not been run on Android. A game without a
 profile can still be packed as an *experimental build*: most likely it does not boot, but it is the starting point for porting it.
 
+The Android host replays NVN only. A game that draws with OpenGL or makes its own Vulkan calls (OpenGL or Vulkan in the games table's Graphics column) cannot
+draw on Android, since the OpenGL and Vulkan layers are the Mac's, on Metal: Balatro, Digimon Story Cyber Sleuth and Well Dweller (OpenGL), and Hades and both
+Super Mario Galaxy games (Vulkan). The packing script stops on such a game and says why, before the rewrite and the shaders. Super Mario 3D All-Stars still
+builds, since its launcher draws with NVN, but Super Mario 64 and Sunshine inside it call Vulkan and cannot draw.
+
 ## Testing and reporting
 
 Help with packing and playing, and reports of how a game runs on your device, go to the [DroidPlay Discord](https://discord.gg/4wNHX3uqSU): #help

@@ -529,7 +529,8 @@ static void key_hex(const uint8_t k[8], char out[17]) { static const char *hx = 
 // type, cached and coherent (types 0 and 6: flags 0x1 and 0xf), so the arena was cached there all along. Mesa's Turnip lists a write-combined type first (types 0 to 2:
 // 0x7, then 0xf), which the arena took: Pokémon Brilliant Diamond's write-backs held the completion thread about 37 ms a frame, the replay waited for free chunks (cur)
 // and the game ran at 20 fps; 60 fps in the cached type, GPU time unchanged (5.9 against 6.1 ms). DM_VK_ARENA_CACHED=0 (env.txt): the first host-visible coherent type,
-// as before (the A/B of this alone)
+// as before (the A/B of this alone). A type's flags do not say how the CPU maps it: the Retroid Pocket 5's driver maps its cached coherent type uncached, and the write-backs
+// are then read through a cached copy (gfx_vk_readback.inc)
 static uint32_t ar_mem_type(uint32_t bits) {
     static int cached = -1, logged;
     if (cached < 0) { const char *e = getenv("DM_VK_ARENA_CACHED"); cached = !(e && *e == '0'); }
@@ -539,13 +540,13 @@ static uint32_t ar_mem_type(uint32_t bits) {
                        cached ? "" : " (DM_VK_ARENA_CACHED=0: the first host-visible coherent type)");
     return mt;
 }
+#define AR_USAGE (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | \
+                  VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)   // also gfx_vk_readback.inc rb_speed
 // the current chunk's (gfx_vk.c): blocks kept and reused when it completes
 static int ar_new(VkDeviceSize n) {
     if (C->nar == C->car) { C->car = C->car ? 2 * C->car : 8; C->ar = realloc(C->ar, C->car * sizeof *C->ar); }
     arena_blk *a = &C->ar[C->nar]; memset(a, 0, sizeof *a);
-    VkBufferCreateInfo bc = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
+    VkBufferCreateInfo bc = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = AR_USAGE};
     if (vkCreateBuffer(g_vk.dev, &bc, NULL, &a->b) != VK_SUCCESS) return 0;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, a->b, &mr);
     uint32_t mt = ar_mem_type(mr.memoryTypeBits);
@@ -1131,6 +1132,30 @@ static uint32_t rt_layers(const vtex *v, const view_t *cv, uint32_t lv, uint32_t
     n = cv && cv->set_layers && cv->nlayers ? cv->nlayers : tot - ly;
     return n > tot - ly ? tot - ly : n ? n : 1;
 }
+// A render pass with colour slot 0 empty below a used slot, on Adreno 8xx: Breath of the Wild lost the GPU on a OnePlus Pad 3 (Adreno 830, driver 0x8032004a) at its first
+// frame in the field. One pass binds a 640x360 target in slot 5 alone (slots 0-4 VK_ATTACHMENT_UNUSED); the pass itself runs, but a later pass drawing into that target as
+// slot 0 then hung the GPU every frame (the driver's recovery about 250 ms in) until one hang ran past its 3 s and the device was lost (dm/android/baselines.md problem 14).
+// Skipping the first pass's draws did not help (its clear still begins it); a scratch target in slot 0 alone stops it, slots 1-4 left empty, and an empty slot 6 below a
+// used slot 7 needs nothing. The Odin 2's Adreno 740 runs the same frames without it. One RGBA8 image serves every such pass (an attachment may be larger than the
+// framebuffer), made again larger when a pass is larger; the earlier ones are kept, as cached framebuffers name their views. DM_VK_SLOT0_FILL: 1 on any GPU, 0 off
+static uint64_t g_slot0_fills;
+static int slot0_fill_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_VK_SLOT0_FILL"); v = e ? *e == '1' : g_vk.props.vendorID == 0x5143 && !strncmp(g_vk.props.deviceName, "Adreno (TM) 8", 13);
+                 LOG("[vk] a render pass with colour slot 0 empty below a used slot: %s", v ? "a scratch target in slot 0 (DM_VK_SLOT0_FILL)" : "slot 0 left empty"); }
+    return v;
+}
+static vtex *slot0_scratch(uint32_t w, uint32_t h) {
+    static vtex *sv[8]; static int n;
+    vtex *v = n ? sv[n - 1] : NULL;
+    if (v && v->w >= w && v->h >= h) return v;
+    if (n == 8) { RED_ONCE(152, "the scratch target for an empty colour slot 0 was made larger 8 times: passes larger than %ux%u keep slot 0 empty", v->w, v->h); return NULL; }
+    tex_t t; memset(&t, 0, sizeof t); t.magic = MAGIC('T', 'E', 'X', 0); t.serial = ~0ull - 1 - (uint64_t)n; t.d.target = NVN_TEXTURE_TARGET_2D; t.d.format = NVN_FORMAT_RGBA8;
+    t.d.width = v && v->w > w ? v->w : w; t.d.height = v && v->h > h ? v->h : h; t.d.depth = 1; t.d.levels = 1;
+    if (!(v = vt_create(&t))) return NULL;
+    LOG("[vk] scratch target for an empty colour slot 0: %ux%u", v->w, v->h);
+    return sv[n++] = v;
+}
 static int rp_prepare_(int layered) {
     layered = layered && layered_on();
     if (P.active && (P.layered || !layered)) return 1;
@@ -1139,6 +1164,7 @@ static int rp_prepare_(int layered) {
     if (!R.has_rt) { RED_ONCE(83, "draw with no render target set"); return 0; }
     memset(P.cv, 0, sizeof P.cv); P.dv = NULL; memset(g_bcrt_pend, 0, sizeof g_bcrt_pend);
     rp_key k; memset(&k, 0, sizeof k); VkImageView views[9]; memset(views, 0, sizeof views); uint32_t nv = 0, w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX; k.samples = 1;
+    VkImageView cvw[8] = {0}, dvw = VK_NULL_HANDLE;   // by slot, then the depth view: views[] in attachment order once slot 0 may be filled (slot0_fill_on)
     k.ncolor = (uint32_t)(R.rt.n > 8 ? 8 : R.rt.n);
     for (uint32_t i = 0; i < k.ncolor; i++) {
         if (!R.rt.color[i]) continue;
@@ -1150,7 +1176,7 @@ static int rp_prepare_(int layered) {
             VkCommandBuffer c = cb(); if (!c) continue;
             bcrt_copy(v, sh, lv, ly, 0);
             VkImageView iv = view_get(sh, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT, NULL); if (!iv) continue;
-            k.color[i] = sh->fmt; k.samples = sh->samples; views[nv++] = iv; P.cv[i] = sh; P.clv[i] = 0; P.cly[i] = 0; rt_note(sh);
+            k.color[i] = sh->fmt; k.samples = sh->samples; cvw[i] = iv; nv++; P.cv[i] = sh; P.clv[i] = 0; P.cly[i] = 0; rt_note(sh);
             g_bcrt_pend[i].base = v; g_bcrt_pend[i].sh = sh; g_bcrt_pend[i].lv = lv; g_bcrt_pend[i].ly = ly;
             if (sh->w < w) w = sh->w; if (sh->h < h) h = sh->h;
             continue;
@@ -1161,7 +1187,7 @@ static int rp_prepare_(int layered) {
         uint32_t nl = layered ? rt_layers(v, cv, lv, ly) : 1;
         g_view_slice = 1; VkImageView iv = view_get(v, nl > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, nl, VK_IMAGE_ASPECT_COLOR_BIT, NULL); g_view_slice = 0; g_view_fmt = VK_FORMAT_UNDEFINED; if (!iv) continue;
         if (nl < layers) layers = nl;
-        k.color[i] = af; k.samples = v->samples; views[nv++] = iv; P.cv[i] = v; P.clv[i] = lv; P.cly[i] = ly; rt_note(v);
+        k.color[i] = af; k.samples = v->samples; cvw[i] = iv; nv++; P.cv[i] = v; P.clv[i] = lv; P.cly[i] = ly; rt_note(v);
         lsnap_take((int)i, v, lv, ly);   // a linear target: its guest bytes now, which its write-back diffs against
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh;
     }
@@ -1173,11 +1199,20 @@ static int rp_prepare_(int layered) {
             uint32_t nl = layered ? rt_layers(v, dv, lv, ly) : 1;
             g_view_slice = 1; VkImageView iv = view_get(v, nl > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, ly, nl, v->aspect, NULL); g_view_slice = 0;
             if (iv && nl < layers) layers = nl;
-            if (iv) { k.depth = v->fmt; k.samples = v->samples; views[nv++] = iv; P.dv = v; rt_note(v); uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh; }
+            if (iv) { k.depth = v->fmt; k.samples = v->samples; dvw = iv; nv++; P.dv = v; rt_note(v); uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh; }
         }
     }
     if (!nv || w == UINT32_MAX) { RED_ONCE(84, "render targets without an image"); lsnap_drop_all(); return 0; }
     if (layers == UINT32_MAX) layers = 1;   // only BC shadows: one layer
+    if (!cvw[0] && k.ncolor > 1 && slot0_fill_on()) {
+        int used = 0; for (uint32_t i = 1; i < k.ncolor; i++) used |= cvw[i] != VK_NULL_HANDLE;
+        if (used && (layers > 1 || k.samples > 1)) RED_ONCE(153, "a layered or multisample render pass with colour slot 0 empty below a used slot: slot 0 left empty (slot0_fill_on)");
+        vtex *sv = used && layers == 1 && k.samples == 1 ? slot0_scratch(w, h) : NULL;
+        VkImageView iv = sv ? view_get(sv, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT, NULL) : VK_NULL_HANDLE;
+        if (iv) { cvw[0] = iv; k.color[0] = sv->fmt; nv++; g_slot0_fills++; }
+    }
+    nv = 0; for (uint32_t i = 0; i < k.ncolor; i++) if (cvw[i]) views[nv++] = cvw[i];
+    if (dvw) views[nv++] = dvw;
     VkRenderPass rp = rp_get(&k); if (!rp) { lsnap_drop_all(); return 0; }
     struct { VkImageView v[9]; uint32_t w, h, l; } fk; memset(&fk, 0, sizeof fk); memcpy(fk.v, views, sizeof views); fk.w = w; fk.h = h; fk.l = layers;
     VkFramebuffer fb = nvn_hm_get(&g_fbs, &fk);
