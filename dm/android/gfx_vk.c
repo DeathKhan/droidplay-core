@@ -29,6 +29,7 @@
 #include "spv_limits.h"
 #include "spv_pool.h"
 #include "spv_wide.h"
+#include "ds_texels.h"   // depth / stencil readbacks rebuilt in NVN's layouts (mtl_read_texels, copy_t2b)
 #include "spv_narrow.h"   // each subgroup of a GPU narrower than 32 lanes a warp of its own (gfx_vk_draw.inc spv_fit_narrow)
 #include "nvn_fstep.h"   // FSTEP_FIT: the performance hint's target (hint_frame)
 #include "nvn_queue.h"   // the queue scheduler (hle_nvn.c nvn_queue.inc): event publication and GPU progress
@@ -218,7 +219,10 @@ typedef struct { int st; size_t off, row_bytes, rows, src_pitch, dst_pitch; uint
                  // snapshot kept only for the revert check (DM_VK_LINWB_SNAP=0 with DM_VK_WB_REVERT=1); snap_cap: snap / dsnap is a pooled buffer of that size (snap_give), 0: malloc'd;
                  // the texture's serial, image, NVN format, texel block bytes, size and storage size
                  // rb: its GPU copy's offset in the chunk's readback buffer + 1 (gfx_vk_readback.inc rb_record), 0: read from its source
-                 int lin; uint8_t *dsnap; size_t snap_cap; uint64_t ser, img; uint32_t fmt, bpb, w, h; uint64_t tsize; size_t rb; } wb_t;
+                 int lin; uint8_t *dsnap; size_t snap_cap; uint64_t ser, img; uint32_t fmt, bpb, w, h; uint64_t tsize; size_t rb;
+                 // a depth / stencil readback (ds_wb): ds_n texels a row of NVN format ds_fmt rebuilt from the aspects' planes (ds_texels.h); the depth plane at the source
+                 // (ds_dkind's bytes a texel, rows of ds_n texels), the stencil plane ds_soff bytes after it (1 byte a texel) when ds_soff; ds_n 0: a plain write-back
+                 uint32_t ds_n, ds_fmt; int ds_dkind; size_t ds_soff; } wb_t;
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize n, used; } arena_blk;
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; uint64_t q0, q1; } post_op;   // kind 1 event, 2 counter, 3 samples passed (occlusion queries q0..q1)
 typedef struct { int kind; uint64_t h; } dead_t;
@@ -801,6 +805,13 @@ static size_t wb_row_diff(uint8_t *d, const uint8_t *g, const uint8_t *o, size_t
 }
 // → whether it wrote (and prepared) anything
 static int wb_apply(const wb_t *w, const uint8_t *s) {
+    if (w->ds_n) {   // a depth / stencil readback: NVN's texels rebuilt from the aspects' planes, row by row (ds_wb)
+        dm_guest_write_prepare(w->dst, w->dst_pitch * (w->rows ? w->rows - 1 : 0) + w->row_bytes);
+        size_t db = ds_depth_bytes(w->ds_dkind);
+        for (size_t y = 0; y < w->rows; y++)
+            ds_texels((int)w->ds_fmt, w->ds_dkind, db ? s + y * w->ds_n * db : NULL, w->ds_soff ? s + w->ds_soff + y * w->ds_n : NULL, w->ds_n, w->dst + y * w->dst_pitch);
+        return 1;
+    }
     size_t y0 = 0, y1 = w->rows;
     if (!w->snap || !lsnap_on()) dm_guest_write_prepare(w->dst, w->dst_pitch * (w->rows ? w->rows - 1 : 0) + w->row_bytes);   // pages the dirty tracker protected become writable (and dirty) first
     else {   // only the span from the first byte the GPU changed to the last is prepared and written (DM_VK_LINWB_SNAP); none: nothing at all
@@ -1476,11 +1487,43 @@ static int tex_level_layer(const vtex *v, const view_t *vw, int has, unsigned *l
     *level = has && vw->set_levels ? vw->base_level : 0; *layer0 = has && vw->set_layers ? vw->min_layer : 0;
     return *level < v->levels;
 }
-// A readback of a combined depth-stencil image copies its depth aspect alone: 4 bytes a texel, tightly packed (D32_SFLOAT_S8_UINT: the float; D24_UNORM_S8_UINT, the fallback:
-// D24 in the low 24 bits, the top 8 undefined), into a slice sized by the guest's texel: 8 bytes for DEPTH32F_STENCIL8 (0x36), so the copy leaves the second half of each
-// layer's region unwritten, and a D24 copy may leave every fourth byte. wb_apply writes the whole region to guest memory: a buffer of its own read as zeros there (fresh
-// pages), a pool slice holds an earlier slice's bytes (another texture's upload or readback), so it is zeroed first (before the chunk is submitted, coherent memory: the
-// copy's writes land over it) and the guest gets what a buffer of its own gave. NVN's 8-byte layout itself (depth, stencil, padding) is still not rebuilt: open, as before
+// A readback of a depth / stencil image (ReadTexels, a texture → buffer copy) copies each aspect the image and the guest's format have into a plane of its own, tightly
+// packed (Vulkan's layout for an aspect: depth 2 or 4 bytes a texel, stencil 1), and the completion thread rebuilds NVN's texels from them into guest memory (wb_apply,
+// ds_texels.h). The depth aspect alone was copied before, at the guest's texel size: DEPTH32F_STENCIL8's rows are 8 bytes a texel, so every row after the first read
+// another row's depths and the rest of the region was left as the slice held it; the stencil was never read; DEPTH24_STENCIL8 and DEPTH24, kept as D32_SFLOAT (S8), came
+// back as float bits instead of 24-bit unorm. Colour images are copied as before. → 0: not a depth / stencil image of a format ds_texels knows (copied as before)
+static int ds_dkind(const vtex *v) {
+    if (!(v->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return DS_NONE;
+    switch (v->fmt) {
+        case VK_FORMAT_D16_UNORM: return DS_D16;
+        case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT: return DS_D32F;
+        case VK_FORMAT_D24_UNORM_S8_UINT: case VK_FORMAT_X8_D24_UNORM_PACK32: return DS_D24;
+        default: return DS_NONE;
+    }
+}
+static int ds_wb(vtex *v, uint32_t nvn_format, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
+    if (!(v->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) || !ds_texel_bytes((int)nvn_format)) return 0;
+    int dkind = nvn_format == 0x31 ? DS_NONE : ds_dkind(v), sten = (v->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && (nvn_format == 0x31 || nvn_format == 0x35 || nvn_format == 0x36);
+    if (nvn_format != 0x31 && !dkind) return 0;
+    size_t n = (size_t)r->width * (size_t)r->height, db = ds_depth_bytes(dkind), soff = sten ? (n * db + 3) & ~(size_t)3 : 0, per = ((sten ? soff + n : n * db) + 3) & ~(size_t)3;
+    int is3d = v->type == VK_IMAGE_TYPE_3D, nz = r->depth ? r->depth : 1;
+    stg_sl s = stg_take(per * nz, 4); VkCommandBuffer cbuf = cb(); if (!s.p || !cbuf) return 1;
+    for (int z = 0; z < nz; z++) {
+        for (int a = 0; a < 2; a++) {   // the depth plane, then the stencil plane
+            if (a ? !sten : !dkind) continue;
+            VkBufferImageCopy rc = {.bufferOffset = s.off + (size_t)z * per + (a ? soff : 0), .imageSubresource = {a ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, level, is3d ? 0 : layer0 + (unsigned)r->zoffset + (unsigned)z, 1},
+                                    .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
+            vkCmdCopyImageToBuffer(cbuf, v->img, VK_IMAGE_LAYOUT_GENERAL, s.b, 1, &rc);
+        }
+        size_t rb = (size_t)r->width * ds_texel_bytes((int)nvn_format);
+        wb_t *w = wb_add(); if (!w) continue;
+        *w = (wb_t){s.st, (size_t)s.off + (size_t)z * per, rb, (size_t)r->height, rb, row, dst + (size_t)z * img, NULL};
+        w->ds_n = (uint32_t)r->width; w->ds_fmt = nvn_format; w->ds_dkind = dkind; w->ds_soff = soff;
+    }
+    return 1;
+}
+// The plain copy of a depth-stencil image that ds_wb does not take (a format it does not know) copies the depth aspect alone into a slice sized by the guest's texel, which
+// leaves part of each row unwritten: a pool slice holds an earlier slice's bytes, so it is zeroed first and the guest gets what a buffer of its own gave (zeros)
 static void stg_zero_ds(stg_sl s, VkDeviceSize n, const vtex *v) { if (s.p && s.st >= SP_ST && v->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) memset(s.p, 0, n); }
 static void copy_b2t(const p_copy_b2t *c) {
     vtex *v = vt_get(c->tex); if (!v) return;
@@ -1513,6 +1556,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     size_t row = S.row ? (size_t)S.row : rb, img = S.img ? (size_t)S.img : row * rows;
     int is3d = v->type == VK_IMAGE_TYPE_3D, nz = c->r.depth ? c->r.depth : 1;
     if (!mtl_addr(c->src, img * (nz - 1) + row * (rows - 1) + rb, NULL, NULL)) { RED_ONCE(43, "texture→buffer copy destination is in no memory pool"); return; }
+    if (ds_wb(v, (uint32_t)c->tex->d.format, level, layer0, &c->r, (uint8_t *)c->src, row, img)) { cb_barrier(); return; }   // depth / stencil: each aspect apart, rebuilt
     stg_sl s = stg_take(rb * rows * nz, bpb); stg_zero_ds(s, rb * rows * nz, v); VkCommandBuffer cbuf = cb(); if (!s.p || !cbuf) return;
     if (vk_debug()) LOG("[vk] t2b ser=%llu pkg %d level %u layer %u region %d,%d %dx%dx%d row %zu img %zu -> %#llx", (unsigned long long)v->serial, v->pkg, level, layer0, c->r.xoffset, c->r.yoffset, c->r.width, c->r.height, nz, row, img, (unsigned long long)c->src);
     for (int z = 0; z < nz; z++) {
@@ -1595,6 +1639,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     }
     vtex *v = vt_get(t);
     if (!v || v->conv) { pthread_mutex_unlock(&g_bk); for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memset(dst + (size_t)z * img + y * row, 0, wb); return; }
+    if (ds_wb(v, (uint32_t)t->d.format, level, layer0, r, dst, row, img)) { submit_wait(); pthread_mutex_unlock(&g_bk); return; }   // depth / stencil: each aspect apart, rebuilt
     stg_sl s = stg_take(wb * hb * nz, bpb); stg_zero_ds(s, wb * hb * nz, v); VkCommandBuffer cbuf = cb();
     if (s.p && cbuf) {
         for (int z = 0; z < nz; z++) {
