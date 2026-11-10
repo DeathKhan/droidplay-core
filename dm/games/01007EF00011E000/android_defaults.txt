@@ -1,0 +1,5 @@
+# Switches this game gets on Android (build_android_from_nsp.py puts them in the game's defaults.txt; env.txt and the settings screen still win)
+# DM_VK_MID_DRAWS: a chunk goes to the GPU after 512 draws in the middle of a pass instead of 64 (gfx_vk.c mid_poll). About 3,600 draws a frame in long passes: on a
+# OnePlus Pad 3 the replay took 30.6 ms of CPU a frame instead of 32.2 (fewer submissions) and the GPU 18.7 ms instead of 21.6 (fewer passes begun again with their targets
+# loaded), the Shrine of Resurrection save, 2026-11-10
+DM_VK_MID_DRAWS=512

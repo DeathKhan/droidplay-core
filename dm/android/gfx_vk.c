@@ -1624,9 +1624,14 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); return nvn_timestamp_
 enum { EARLY_DRAWS = 48, MID_DRAWS = 64 };   // MID_DRAWS: a chunk that long goes to the GPU before the next draw, in the middle of a pass (the pass is begun again with its targets
 // loaded): Super Mario Bros. Wonder draws most of a frame in two passes of about 140 draws, which reached the GPU only when each ended, and the game then waited for the GPU
 // (SyncWait 12.5 ms a wait) after recording 23 ms of draws
-// g_mid_draws: MID_DRAWS, or a file named vk_mid beside $DM_DUMP_DIR holding a number, read every 30 presents (a test of the split's cost: each piece loads and stores the pass's targets)
+// g_mid_draws: MID_DRAWS, DM_VK_MID_DRAWS=<n> (env.txt, or a game's android_defaults.txt), or a file named vk_mid beside $DM_DUMP_DIR holding a number, read every 30 presents
+// (a test of the split's cost: each piece loads and stores the pass's targets). A game whose passes are long and whose GPU is not waited for draw by draw is better
+// with fewer cuts: Breath of the Wild on a OnePlus Pad 3 (about 3,600 draws a frame) at 512 instead of 64 took 1.5 ms less of the replay's CPU a frame (30.6 against
+// 32.2: fewer submissions and command buffer ends) and 2.9 ms less GPU time (18.7 against 21.6: fewer passes ended and begun again with their targets loaded)
 static int g_mid_draws = MID_DRAWS;
 static void mid_poll(uint64_t presents) {
+    static int init; if (!init) { init = 1; const char *e = getenv("DM_VK_MID_DRAWS"); int v = e ? atoi(e) : 0;
+        if (v > 0) { g_mid_draws = v; LOG("[vk] chunks sent in the middle of a pass after %d draws (DM_VK_MID_DRAWS)", v); } }
     const char *dir = getenv("DM_DUMP_DIR"); if (!dir || presents % 30) return;
     char p[700]; snprintf(p, sizeof p, "%s/../vk_mid", dir); FILE *f = fopen(p, "r"); if (!f) return;
     int v = 0; if (fscanf(f, "%d", &v) == 1 && v > 0 && v != g_mid_draws) { LOG("[vk] chunks sent in the middle of a pass after %d draws (was %d)", v, g_mid_draws); g_mid_draws = v; }
