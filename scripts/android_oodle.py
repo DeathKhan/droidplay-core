@@ -12,6 +12,7 @@ from pathlib import Path
 
 JOB_SECS = 600   # the longest a job may take: FINAL FANTASY RESONANCE's 5,919 shader groups (707 MB decoded) took three jobs of 2 to 3 s each on a OnePlus Pad 3, the boot up to nnMain included
 CHUNK = 256 << 20   # decoded bytes per job, so neither the phone's free space nor this computer's memory holds more than about that at once
+SPARE = 64 << 20   # left free on the phone beyond a job's file and its output, for Android and the game's log
 
 
 def oodle_head(b):   # whether the bytes start as an Oodle LZ block does (header byte: low nibble 0xC, bits 4-5 clear; bit 6 uncompressed, bit 7 decoder restart)
@@ -26,13 +27,27 @@ def job_bytes(records):   # hle_oodle.c's job file: "DMOJ", u32 count, then per 
 
 def read_out(path, count):   # its output: "DMOR", u32 count, then per record u32 decoded length (0: failed) and the bytes → [bytes or None]
     b = Path(path).read_bytes()
-    if b[:4] != b'DMOR' or struct.unpack_from('<I', b, 4)[0] != count: raise ValueError(f'{path}: not the output of a {count}-record Oodle job')
+    if len(b) < 8 or b[:4] != b'DMOR' or struct.unpack_from('<I', b, 4)[0] != count: raise ValueError(f'{path}: not the output of a {count}-record Oodle job')
     o, out = 8, []
-    for _ in range(count):
-        n = struct.unpack_from('<I', b, o)[0]; o += 4
-        out.append(b[o:o + n] if n else None); o += n
+    for i in range(count):
+        n = struct.unpack_from('<I', b, o)[0] if o + 4 <= len(b) else -1
+        # a file that ends inside a record was not written whole: the phone's storage filled up as the job wrote it, or the copy from the phone was cut (issue #111)
+        if n < 0 or o + 4 + n > len(b): raise ValueError(f'{path} is cut short: it ends at {len(b):,} bytes, inside record {i + 1} of {count}')
+        o += 4; out.append(b[o:o + n] if n else None); o += n
     if o != len(b): raise ValueError(f'{path}: {len(b) - o} bytes left after its {count} records')
     return out
+
+
+def out_size(records):   # the most a job's output can take: its header, then each record's length word and decoded bytes (a failed record takes only its word)
+    return 8 + sum(4 + n for _, n in records)
+
+
+def free_bytes(df_k):   # bytes available, from the last line of `df -k <folder>` (Filesystem, 1K-blocks, Used, Available, ...); None when it cannot be read
+    f = df_k.strip().splitlines()[-1].split() if df_k.strip() else []
+    return int(f[3]) * 1024 if len(f) >= 4 and f[3].isdigit() else None
+
+
+def mb(n): return f'{n / 1048576:,.0f} MB'
 
 
 class Rounds:
@@ -77,6 +92,11 @@ class Phone:
         self.jobs += 1; t0 = time.time()
         local = self.work / 'tmp' / 'oodle_phone.job'; local.parent.mkdir(parents=True, exist_ok=True); local.write_bytes(job_bytes(records))
         rjob, rlog, renv = f'{self.remote}/oodle.job', f'{self.remote}/log.txt', f'{self.remote}/env.txt'
+        # the job writes its whole output next to its file, and the game's host does not stop when a write fails: on a phone short of space the output came back cut (issue #111)
+        need, free = local.stat().st_size + out_size(records) + SPARE, free_bytes(self.sh(f'df -k {self.remote}', check=False))
+        if free is not None and free < need:
+            local.unlink(missing_ok=True)
+            raise ValueError(f'the phone has {mb(free)} free, and decoding the game\'s Unreal shaders there needs about {mb(need)} at a time: free up space on the phone, then build again')
         env_before = self.sh(f'cat {renv} 2>/dev/null', check=False)   # the player's env.txt, put back after the job
         try:
             self.sh(f'am force-stop {self.pkg}; rm -f {rjob} {rjob}.out {rlog}')
@@ -94,8 +114,17 @@ class Phone:
                 if time.time() - t0 > 20 and not self.sh(f'pidof {self.pkg}:game', check=False).strip() and 'records decoded' not in log: fail = log or 'the game stopped before it decoded anything'; break
             (self.logs / f'oodle_phone_{self.jobs}.log').write_text(self.sh(f'cat {rlog} 2>/dev/null', check=False), encoding='utf-8', errors='replace')
             if not done: raise ValueError(f'the Oodle job on the phone did not finish ({(fail or f"no answer in {JOB_SECS} s").strip()[-400:]}); its log: {self.logs / f"oodle_phone_{self.jobs}.log"}')
-            res = self.work / 'tmp' / 'oodle_phone.job.out'; self.adb(self.serial, 'pull', f'{rjob}.out', res)
-            got = read_out(res, len(records)); res.unlink()
+            res = self.work / 'tmp' / 'oodle_phone.job.out'; size = self.sh(f'stat -c %s {rjob}.out', check=False).strip()
+            for _ in range(2):   # a copy that came over shorter than the phone's file is made again, once
+                self.adb(self.serial, 'pull', f'{rjob}.out', res)
+                if not size.isdigit() or res.stat().st_size == int(size): break
+            else: raise ValueError(f'the Oodle job\'s output came over from the phone as {res.stat().st_size:,} of its {int(size):,} bytes, twice: check the USB cable, then build again')
+            try: got = read_out(res, len(records))
+            except ValueError as e:
+                free = free_bytes(self.sh(f'df -k {self.remote}', check=False))
+                raise ValueError(f'{e}. The phone wrote it so ({size or "?"} bytes there), and has {mb(free) if free is not None else "an unknown amount"} free now: '
+                                 f'if that is little, free up space on the phone and build again; its log: {self.logs / f"oodle_phone_{self.jobs}.log"}') from None
+            res.unlink()
         finally:
             self.sh(f'am force-stop {self.pkg}; rm -f {rjob} {rjob}.out', check=False)
             if env_before.strip():

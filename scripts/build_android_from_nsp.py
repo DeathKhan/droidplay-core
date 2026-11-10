@@ -786,6 +786,18 @@ def setup(sdk_arg, accept):   # --setup: what check() finds missing, installed (
     for r in still: say(f'{r["name"]} is missing: {r["fix"]}')
 
 
+GRAPHICS_NAMES = {'nvn': 'NVN', 'vulkan': 'Vulkan', 'gl': 'OpenGL'}
+
+
+def unsupported_graphics(gfx, name):   # why a game cannot be built for Android, from profile_guess.build_sources' (graphics API, reason); None for an NVN game
+    # The Android host replays NVN on Vulkan (dm/android/gfx_vk.c) and has nothing for a game that calls Vulkan or OpenGL itself: the host's layers for those are
+    # Metal (dm/gfx/vk/hle_vk.m, the GL layer). Built anyway, such a game stopped at launch on its first unimplemented vk* import (Hades, issue #112)
+    api, why = gfx
+    if api == 'nvn': return None
+    return (f'{name} draws with {GRAPHICS_NAMES.get(api, api)}, not NVN ({why}). DroidPlay Core on Android runs NVN games only so far, '
+            f'so this game cannot be built for Android yet')
+
+
 def games_table():   # {title ID: {engine, graphics, build, sdk}} from dm/games/README.md's Games table
     out = {}
     for line in (REPO / 'dm/games/README.md').read_text(encoding='utf-8').splitlines():
@@ -989,6 +1001,9 @@ def main(argv):
             if kind == 'folder': return bi.extract_dump(ex, v, u or b, app)
             return bi.extract(nx, keys, ex, v, b, u, None, logs, g, app)
         game = extract(pkg_ver)
+        why = unsupported_graphics(bi.pg.build_sources(game / 'ExeFS', bi.rfs.source(game), g.words('modules') or ['main'])['graphics'],
+                                   nacp.name(game / 'control.nacp') or g.get('name', '') or g.id)
+        if why: raise BuildError(why)   # before the rewrite and the shaders, which take minutes and make an app that cannot start
         bad = [] if derived or prov else bi.build_mismatch(game, pkg_ver, g)
         if bad:   # files of another build under a registered version's tag: packed like any other version
             derived = f'not the builds game profile {g.id} registers: {"; ".join(bad)}'; sv = [pkg_ver]

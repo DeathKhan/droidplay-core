@@ -1822,6 +1822,32 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   60.0 fps after (submit+present 13.4 ms, `vk-done` 27%), GPU time 6.1 → 5.9 ms. On the system driver both settings take type 6: 60.0 fps either way.
 - **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md).
 
+### Storage buffer write-backs read from memory the CPU maps uncached
+
+- **Symptom:** Android only, on Qualcomm's own driver on a Retroid Pocket 5 (Adreno 650, V@0746.0): a quarter of Turnip's frame rate, `vk-done` busy.
+  `NVN submit+present` is most of the frame and `vk-done` on a CPU most of the time (`top -H`), although `[vk] arena: memory type` names a cached coherent type;
+  simpleperf puts `vk-done`'s time on `wb_apply`'s loads and `memcpy`, as in [the entry above](#storage-buffer-write-backs-read-from-cached-memory-on-vulkan).
+- **Cause:** a memory type's flags do not say how the CPU maps it. The driver lists type 4 as `0xf` (device-local, host-visible, coherent, cached), the only host-visible
+  type it allows a buffer of the arena's usage, and the arena takes it; but the CPU reads it at 1.3 GB/s whether the GPU or the CPU wrote it, and a 1 MB buffer read a
+  second time is no faster, where malloc'd memory reads at 11–13 GB/s: it is mapped uncached. Wider loads do not help (NEON 64-byte loads 1.4 GB/s), and `wb_apply` is
+  slower still (its 8-byte compares 0.45 GB/s, its byte loop over changed bytes 0.17 GB/s). The driver's type 2 (`0xb`: cached, not coherent) reads at 12–15 GB/s after
+  `vkInvalidateMappedMemoryRanges` (0.05 ms a MB), and it is offered to a buffer only when the buffer is a transfer destination and not a transfer source (memory type
+  bits `0x15` against `0x11`), which the arena cannot be: texture uploads read it. An AHardwareBuffer reads at 1.3 GB/s through gralloc's mapping too, and the driver has
+  no `VK_EXT_external_memory_host`. (A standalone probe on the phone measured each of these.)
+- **Fix:** `gfx_vk_readback.inc`: at a submission's end, after its closing barrier, the GPU copies each of the chunk's arena write-backs (storage buffers, buffer images,
+  transform feedback) into a buffer of the chunk's own in such a type (`rb_record`: one `vkCmdCopyBuffer` per arena block, then a transfer-to-host barrier), and
+  `chunk_done` invalidates the copied range once and reads the write-backs from there. Whether a driver needs it is measured, not taken from the flags: the first
+  submission with arena write-backs times a CPU read of 256 KB in the arena's type and in the readback type, and copies only where the arena's is under a third of the
+  other's speed; the log gives both (`[vk] arena write-backs: the arena's memory type 4 reads at …`), and the memory line every 300 frames counts them
+  (`[vk] arena write-backs (…), frames …`). `DM_VK_WB_READBACK=0` reads from the arena as before; `=1` copies wherever such a type exists.
+- **Check:** Pokémon Brilliant Diamond's `eterna` route (`scripts/bench_android.py`) on a Retroid Pocket 5, `main` at `4743c9da` and the fix installed in turn on the same
+  game files: 24.0, 24.6 and 24.6 fps on `main` (frame p50 40.4–41.3 ms, GPU 16.8–17.0 ms), 60.0, 54.6, 60.0 and 60.0 with the fix (frame p50 16.6–18.2 ms, GPU
+  13.5–15.0 ms; the 54.6 run GPU-bound at 15.0 ms), the same 1,068 draws and the same picture. In the fix's own build the six write-backs a frame (494 KB) took the
+  completion thread 26.2 ms a frame with `DM_VK_WB_READBACK=0` (25.2 fps), 1.7 ms through the copy. The probe read 1.5–1.6 GB/s from the arena's type and 28–34 GB/s
+  from type 2. The `boot` route held 60.0 fps. On a OnePlus Pad 3 (Adreno 830, V@0800.74) the probe read 49.3 GB/s from the arena's type 6 and 48.9 GB/s from type 3
+  and kept reading the arena: 60.0 fps on `main` and with the change, two runs each (GPU 10.1–10.4 ms), and with `DM_VK_WB_READBACK=0`.
+- **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) ([Android baselines](../../dm/android/baselines.md), problem 13).
+
 ### Linear render targets written back to guest memory
 
 - **Symptom:** Android only: what a game reads on the CPU from textures it draws into is zeros or stale. Breath of the Wild: Link sinks into grass up to his knees while he stands still, and the grass presses in a pass dump carry the presser's world height (`c3[3].z` about 200–270 instead of below 1) with a flat slope.
@@ -1958,6 +1984,21 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
   - 1.6 → 1.7 fps, frame p50 640-650 → 593-611 ms, GPU p50 138.6-138.8 → 119.4-128.2 ms;
   - the picture did not change there: the forest stays black for another cause, see the game's note.
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#android) (Switch 2).
+
+### A render pass with colour slot 0 empty hangs a later pass on the Adreno 830 (Android)
+
+- **Symptom:** Breath of the Wild loses the GPU on a OnePlus Pad 3 (Adreno 830, driver 0x8032004a) at its first frame in the field: `vkQueueSubmit` gives -4 and the loading screen stays up. Before that, one submission a frame takes 250–340 ms on the GPU with its end timestamp never written: the driver's hang recovery. The hang report names one draw, a vertical blur into a 640×360 RGBA8 target (vertex `2decd3e894b3736a`, fragment `26ae1640f3448ba4`). An Ayn Odin 2 (Adreno 740) runs the same frames.
+- **Cause:** an earlier pass of the frame binds that target alone in colour slot 5, with slots 0–4 empty (`VK_ATTACHMENT_UNUSED`).
+  - That pass itself runs. The later pass that draws into the target as slot 0 is the one that hangs.
+  - The hanging draw's pipeline, shaders, textures and depth image are the healthy horizontal pass's, so only the target and its history differ ([Android baselines](../../dm/android/baselines.md) problem 14 lists what was ruled out).
+  - Skipping the first pass's draws doesn't help, because its clear still begins it.
+  - An empty slot 6 below a used slot 7 (a G-buffer pass) needs nothing. Only an empty slot 0 does.
+- **Fix:** on Adreno 8xx such a pass gets a scratch RGBA8 target in slot 0 (`gfx_vk_draw.inc` `slot0_fill_on`, `slot0_scratch`).
+  - One image serves every pass, since an attachment may be larger than the framebuffer. It is made again larger when a pass is larger, and the earlier ones are kept, because cached framebuffers name their views.
+  - Layered and multisample passes keep slot 0 empty, with a red line.
+  - `DM_VK_SLOT0_FILL=1` turns it on for any GPU, `0` off.
+- **Check:** Breath of the Wild on the Pad 3, the `outdoors` save. With the fix it runs into the field with no hang report. With `DM_VK_SLOT0_FILL=0` it hangs and loses the GPU as before. Filling every empty slot below a used one also stops it; filling only the slot 7 pass's slot 6, or zeroing the write masks of empty slots, doesn't.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md).
 
 ### Pipeline keys built from the state objects' fields
 

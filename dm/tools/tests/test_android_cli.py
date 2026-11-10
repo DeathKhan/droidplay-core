@@ -52,6 +52,14 @@ class Json(unittest.TestCase):
         self.assertEqual(t[GID]['graphics'], 'NVN')
         self.assertTrue(all(len(k) == 16 for k in t))
 
+    def test_only_nvn_games_build(self):   # issue #112: Hades (Vulkan) was built, then stopped at launch on its first vk* import
+        self.assertIsNone(ba.unsupported_graphics(('nvn', 'main imports nvnBootstrapLoader'), 'Odyssey'))
+        why = ba.unsupported_graphics(('vulkan', 'main imports 40 Vulkan functions and not nvnBootstrapLoader'), 'Hades')
+        self.assertIn('Hades draws with Vulkan, not NVN', why); self.assertIn('NVN games only', why)
+        self.assertIn('with OpenGL', ba.unsupported_graphics(('gl', 'main imports eglCreateWindowSurface'), 'Digimon'))
+        t = ba.games_table()   # no game played on Android is one the table lists as drawing without NVN
+        self.assertEqual([g for g in ba.ANDROID_TESTED if g in t and 'NVN' not in t[g]['graphics']], [])
+
     def test_games_played_on_android_have_profiles(self):   # a mistyped title ID would leave its game shown as not played on Android
         t = ba.games_table()
         self.assertTrue(ba.ANDROID_TESTED)

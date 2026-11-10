@@ -74,9 +74,58 @@ class FormatTest(unittest.TestCase):
             self.assertEqual(ao.read_out(p, 2), [b'abc', None])
             with self.assertRaises(ValueError): ao.read_out(p, 3)
 
+    def test_a_cut_output_is_named(self):   # issue #111: the phone's file ended inside a record, and struct.error was all the build said
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'job.out'
+            p.write_bytes(b'DMOR' + struct.pack('<I', 2) + struct.pack('<I', 3) + b'abc' + struct.pack('<I', 100) + b'x' * 40)
+            with self.assertRaises(ValueError) as e: ao.read_out(p, 2)
+            self.assertIn('cut short', str(e.exception)); self.assertIn('record 2 of 2', str(e.exception))
+            p.write_bytes(b'DMOR' + struct.pack('<I', 2) + struct.pack('<I', 3) + b'abc' + b'\0\0')   # ends inside the second record's length word
+            with self.assertRaises(ValueError) as e: ao.read_out(p, 2)
+            self.assertIn('cut short', str(e.exception))
+
+    def test_sizes(self):
+        self.assertEqual(ao.out_size([(b'', 3), (b'', 100)]), 8 + 4 + 3 + 4 + 100)
+        self.assertEqual(ao.free_bytes('Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/fuse 239313768 220000000 19313768 92% /storage/emulated\n'), 19313768 * 1024)
+        self.assertIsNone(ao.free_bytes(''))
+        self.assertIsNone(ao.free_bytes('df: /x: No such file or directory'))
+
     def test_oodle_head(self):
         for b in (0x0C, 0x4C, 0x8C, 0xCC): self.assertTrue(ao.oodle_head(bytes([b, 0x0A])))
         for b in (0x00, 0x1C, 0x8D, 0x78): self.assertFalse(ao.oodle_head(bytes([b, 0x0A])))
+
+
+class PhoneTest(unittest.TestCase):
+    """Phone.job against a stand-in for adb: what it runs on the phone, and what it does with the answers"""
+    def run_job(self, df_free_k, pulled, size_word=None):
+        calls = []
+        def adb(serial, *args, check=True):
+            calls.append(args)
+            cmd = args[1] if args[0] == 'shell' else ''
+            if cmd.startswith('df -k'): return f'Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/fuse 1000000 0 {df_free_k} 0% /storage/emulated\n'
+            if 'grep -E' in cmd: return 'DM_OODLE_JOB: 1 records decoded'
+            if cmd.startswith('stat -c'): return str(size_word if size_word is not None else len(pulled[0]))
+            if args[0] == 'pull': Path(args[2]).write_bytes(pulled.pop(0) if len(pulled) > 1 else pulled[0])
+            return ''
+        with tempfile.TemporaryDirectory() as d:
+            ph = ao.Phone(adb, 'SERIAL', '0100606026F12000', '/sdcard/x', 'org.nxnative.android', d, d, lambda s: None)
+            try: return ph.job([(stream(b'abc'), 3)]), calls
+            except ValueError as e: return e, calls
+
+    def test_too_little_space_stops_before_the_job(self):
+        r, calls = self.run_job(1024, [b''])
+        self.assertIsInstance(r, ValueError); self.assertIn('free up space', str(r))
+        self.assertFalse([c for c in calls if c[0] in ('push', 'pull')])
+
+    def test_a_short_copy_is_made_again(self):
+        good = b'DMOR' + struct.pack('<I', 1) + struct.pack('<I', 3) + b'abc'
+        r, calls = self.run_job(10 << 20, [good[:-1], good], size_word=len(good))
+        self.assertEqual(r, [b'abc']); self.assertEqual(len([c for c in calls if c[0] == 'pull']), 2)
+
+    def test_a_cut_file_on_the_phone_names_its_space(self):
+        cut = b'DMOR' + struct.pack('<I', 1) + struct.pack('<I', 3) + b'ab'
+        r, _ = self.run_job(10 << 20, [cut])
+        self.assertIsInstance(r, ValueError); self.assertIn('cut short', str(r)); self.assertIn('free now', str(r))
 
 
 if __name__ == '__main__':
