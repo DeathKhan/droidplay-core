@@ -27,11 +27,6 @@ mem_alias	0x10000000
 mem_stack	0x10000000
 app_pool	0xCD500000
 
-# ---- Threads ----
-# A thread woken by a higher-priority thread pinned to its core must not run until that one blocks: the resource loader's FileLoadThread (priority 45,
-# core 0) wakes its waiters (priority 47, core 0) before it has finished with the entry (docs/reference/threads.md)
-core_preempt	on
-
 # ---- Shader split ----
 shader_groups	/ObjectData/=objectdata /StageData/=stagedata /SoundData/=sounddata /LayoutData/=layoutdata /LocalizedData/=localizeddata /EventData/=eventdata /MovieData/=moviedata /SystemData/=systemdata /ShaderData/=shaderdata /EffectData/=effectdata
 shader_note	Super Mario Odyssey shaders

@@ -75,7 +75,7 @@ Numbered in the order they were found, so links to a number stay right:
    another thread records](../../docs/reference/nvn-objects.md#getcommandmemorysize-read-while-another-thread-records); with it, 0 of 18 boots crashed on the
    Retroid Pocket 5, at the same frame times. Odyssey crashed on the Odin 2 three times in about 20 launches, all in its first seconds of loading: twice in its
    loader thread as the mode-select layout loads (`main+0x95d414` with `addr=0`, once `svcBreak`), once at `main+0x954fb8`; never in 18 launches on the other two
-   then, but later in about one launch in four on the Retroid Pocket 5. Fixed with `core_preempt on` in its profile: [A thread woken by a higher-priority thread of
+   then, but later in about one launch in four on the Retroid Pocket 5. Fixed by the host for every game (first by `core_preempt on` in its profile): [A thread woken by a higher-priority thread of
    its core runs before that one blocks](../../docs/reference/threads.md#a-thread-woken-by-a-higher-priority-thread-of-its-core-runs-before-that-one-blocks).
 5. **Fixed: the pipeline cache was saved only when the app paused** (`vkb_pipeline_cache_save` on `APP_CMD_PAUSE`). The list of pipelines to make again at start
    (`pipeline.cache.keys4`) is written as each one is made, but the driver's compiled binaries are in the cache, so after a stop by force (the benchmark, or a player
