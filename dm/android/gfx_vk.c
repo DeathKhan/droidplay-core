@@ -47,6 +47,7 @@ static int g_fmt_list;   // VK_KHR_image_format_list enabled (vt_create)
 static void pb_dump(void);   // gfx_vk_draw.inc: the pipelines being built, for a crash dump
 static int g_stencil_export;   // VK_EXT_shader_stencil_export enabled: a fragment shader writes the stencil test's value (gfx_vk_dscopy.inc)
 static vkb_ctx g_vk; static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT; static int g_vk_ok;
+#include "gfx_vk_rec.inc"   // the vkCmd* calls below go through its wrappers (DM_VK_RECORDER)
 // Query resets (the chunks' query pools, "Query resets" below). DM_VK_QRESET_USED=0 (env.txt): every pool is reset whole in the command buffer at every chunk begin, as before
 // (no host resets either); DM_VK_HOST_QRESET=0: VK_EXT_host_query_reset is not enabled, and the used queries are reset in the command buffer at the chunk's next begin
 static int qr_used(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_QRESET_USED"); v = !(e && *e == '0'); } return v; }
@@ -178,7 +179,8 @@ typedef struct { int kind; uint64_t h; } dead_t;
 typedef struct { uint64_t src, dst, n; uint32_t value; int fill; } cop_t;   // a large buffer copy or fill, done by the completion thread in its place in the queue   // kind 1 image view, 2 framebuffer, 3 image, 4 device memory
 // One chunk's descriptor sets of one set layout (a shader's dsl or dsl_tf; gfx_vk_draw.inc ds_get): s[0, used) handed out while the chunk records, s[used, n) free again
 typedef struct ds_list { VkDescriptorSet *s; int n, used, cap; } ds_list;
-enum { CR_MAX = 160 };   // a chunk's breadcrumbs (crumb): its passes, draws (at most MID_DRAWS) and dispatches, the last 160 kept
+enum { CR_MAX = 1280 };   // a chunk's breadcrumbs (crumb): its passes, draws and dispatches, the last 1280 kept: a chunk of DM_VK_MID_DRAWS=512 (Breath of the Wild) with a pass each, and its
+                         // dispatches (160 kept only the last 160 of such a chunk, which could leave out the draw that hung). About 40 KB a chunk
 typedef struct chunk {
     VkCommandPool pool; VkCommandBuffer cb; VkFence fence; int open, busy, ts, ndraw, held; uint64_t seq, nvn_fence, hold;
     int qd, td, pd, sd;   // queries of qp / tq / pq written since their last reset, [0, n): reset in the command buffer when the chunk next begins; sd: its two g_tsq slots (Query resets below)
@@ -191,6 +193,7 @@ typedef struct chunk {
     arena_blk *ar; int nar, car, ar_cur, ar_last;   // gfx_vk_draw.inc
     VkDescriptorPool *dp; int ndp, cdp, dp_cur; VkBufferView *bv; int nbv, cbv;
     VkDescriptorSet *dsc; int ndsc, cdsc, dsc_used;   // the depth-stencil copies' sets (gfx_vk_dscopy.inc dsc_set): made from its pools, handed out again once it completes
+    uint64_t rq_ticket;   // its submission's ticket with the recorder on (gfx_vk_rec.inc rec_submit), 0 when submitted by the replay
     ds_list **dl; int ndl, cdl; ds_list **dt; int ndt, cdt; int nds;   // recycled descriptor sets (gfx_vk_draw.inc ds_get): the lists holding sets, those handed out from in this recording, the sets held
     struct { const char *a, *b; uint32_t n, m; char kind; } cr[CR_MAX]; int ncr;   // what it recorded, the last CR_MAX of ncr (crumb): named when the GPU hangs or is lost in it (gpu_slow)
 } chunk;
@@ -452,7 +455,7 @@ static uint64_t g_flushes;
 // had nothing to say there (no address, no vendor record: a hang, not a page fault), so the log names what the chunk recorded instead (crumb): the GPU runs the chunks in
 // order, the one before had completed, and the chunk it was in is the first that took over GPU_SLOW_NS. Breath of the Wild's named one draw every time, once the
 // chunks were cut after every draw (a file vk_mid holding 1, mid_poll). At most 3 such chunks are logged, and the first lost fence or submission says what VK_EXT_device_fault gives
-enum { GPU_SLOW_NS = 200000000 };   // a chunk this long on the GPU (64 draws at most) is a hang or as good as one
+enum { GPU_SLOW_NS = 200000000 };   // a chunk this long on the GPU (64 draws by default, 512 with DM_VK_MID_DRAWS=512) is a hang or as good as one
 static void gpu_fault_log(VkResult r) {   // once, from whichever thread sees the loss first
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
     if (!g_fault_info) { LOG("[RED] [vk] the GPU was lost (%d); the driver offers no VK_EXT_device_fault to say why", r); return; }
@@ -480,10 +483,16 @@ static void gpu_slow(chunk *c, VkResult fr, uint64_t ns, int cut) {
     nrep++; int n = c->ncr < CR_MAX ? c->ncr : CR_MAX;
     LOG("[RED] [vk] submission %llu took %.0f ms on the GPU%s%s (the one before had completed): it recorded %d passes, draws and dispatches, the last %d of them:", (unsigned long long)c->seq, ns / 1e6,
         cut ? ", its end timestamp never written (the driver's hang recovery cut it short)" : "", fr == VK_ERROR_DEVICE_LOST ? ", and its fence reports the device lost" : "", c->ncr, n);
-    for (int k = 0; k < n; k++) { int i = (c->ncr - n + k) % CR_MAX; char kd = c->cr[i].kind; int at = c->ncr - n + k;
-        if (kd == 'p') LOG("[vk]   %d: pass %u x %u", at, c->cr[i].n, c->cr[i].m);
-        else if (kd == 'c' || kd == 'C') LOG("[vk]   %d: %sdispatch, compute %s, %u x %u groups", at, kd == 'C' ? "indirect " : "", c->cr[i].a, c->cr[i].n, c->cr[i].m);
-        else LOG("[vk]   %d: %sdraw, vertex %s fragment %s, %u vertices x %u instances", at, kd == 'D' ? "indirect " : "", c->cr[i].a, c->cr[i].b ? c->cr[i].b : "-", c->cr[i].n, c->cr[i].m); }
+    for (int k = 0; k < n;) {   // a run of the same crumb (Breath of the Wild's chunks hold runs of 17 alike draws) is one line, "× run"
+        int i = (c->ncr - n + k) % CR_MAX, run = 1; char kd = c->cr[i].kind; int at = c->ncr - n + k;
+        while (k + run < n) { int j = (c->ncr - n + k + run) % CR_MAX;
+            if (c->cr[j].kind != kd || c->cr[j].a != c->cr[i].a || c->cr[j].b != c->cr[i].b || c->cr[j].n != c->cr[i].n || c->cr[j].m != c->cr[i].m) break;
+            run++; }
+        char x[24] = ""; if (run > 1) snprintf(x, sizeof x, " (x %d, to %d)", run, at + run - 1);
+        if (kd == 'p') LOG("[vk]   %d: pass %u x %u%s", at, c->cr[i].n, c->cr[i].m, x);
+        else if (kd == 'c' || kd == 'C') LOG("[vk]   %d: %sdispatch, compute %s, %u x %u groups%s", at, kd == 'C' ? "indirect " : "", c->cr[i].a, c->cr[i].n, c->cr[i].m, x);
+        else LOG("[vk]   %d: %sdraw, vertex %s fragment %s, %u vertices x %u instances%s", at, kd == 'D' ? "indirect " : "", c->cr[i].a, c->cr[i].b ? c->cr[i].b : "-", c->cr[i].n, c->cr[i].m, x);
+        k += run; }
 }
 // Submit the current chunk (an empty one too: its fence then follows the earlier ones); nvn_fence: the NVN fence it completes. → its sequence number, 0 if none
 static uint64_t chunk_submit(uint64_t nvn_fence) {
@@ -491,11 +500,14 @@ static uint64_t chunk_submit(uint64_t nvn_fence) {
     if (g_drawing) RED_ONCE(3, "a chunk was closed while a draw was being made: that draw's resources went with it");
     rp_end();
     int rec = C->open;   // a chunk whose command buffer was never begun is submitted with none: the fence alone
-    if (rec) { cb_barrier(); if (C->ts) vkCmdWriteTimestamp(C->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)(C - g_ch) + 1); vkEndCommandBuffer(C->cb); C->open = 0; }
+    int deferred = rec_on();   // the recorder ends the command buffer and submits it after the calls queued before (rec_submit): the replay goes on recording meanwhile
+    if (rec) { cb_barrier(); if (C->ts) vkCmdWriteTimestamp(C->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)(C - g_ch) + 1); if (!deferred) vkEndCommandBuffer(C->cb); C->open = 0; }
     C->nvn_fence = nvn_fence;
     chunk *c = C; C = NULL;
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = rec ? 1u : 0u, .pCommandBuffers = &c->cb};
-    pthread_mutex_lock(&g_vk.qmu); VkResult r = vkQueueSubmit(g_vk.q, 1, &si, c->fence); pthread_mutex_unlock(&g_vk.qmu);
+    VkResult r = VK_SUCCESS;
+    c->rq_ticket = 0; if (deferred) c->rq_ticket = rec_submit(rec ? c->cb : VK_NULL_HANDLE, c->fence);   // its failures are the recorder's to report (rq_make R_SUBMIT)
+    else { pthread_mutex_lock(&g_vk.qmu); r = vkQueueSubmit(g_vk.q, 1, &si, c->fence); pthread_mutex_unlock(&g_vk.qmu); }
     if (r != VK_SUCCESS) { RED_ONCE(2, "vkQueueSubmit failed: %d", r); if (r == VK_ERROR_DEVICE_LOST) gpu_fault_log(r); }
     g_flushes++;
     pthread_mutex_lock(&g_cmu);
@@ -815,6 +827,7 @@ static void *chunk_thread(void *arg) {
     void dm_android_place_thread(int done); dm_android_place_thread(1);   // the placement experiment (DM_VK_PIN_DONE, DM_VK_UCLAMP_MIN), off by default
     for (;;) {
         pthread_mutex_lock(&g_cmu); while (!g_fifo_n) pthread_cond_wait(&g_ccv, &g_cmu); chunk *c = g_fifo[0]; pthread_mutex_unlock(&g_cmu);
+        rec_wait_submitted(c->rq_ticket);   // a deferred submission reached the queue first (gfx_vk_rec.inc); before w0, so the recorder's lag is not taken for GPU time
         uint64_t w0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         VkResult fr = vkWaitForFences(g_vk.dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
         uint64_t waited = clock_gettime_nsec_np(CLOCK_MONOTONIC) - w0; int cut = 0;   // the chunk's time on the GPU (the one before had completed), at most (gpu_slow)
@@ -1597,14 +1610,14 @@ static void post(post_op o) {   // done when the current chunk completes, after 
 // reported to the hint, it would have asked for full boost at any load. Wall clock, as the hint's contract asks: the replay's waits for the GPU (about 5 ms a
 // frame there) are part of the frame. The threads that acquired or replayed since the last present go with it, so the session follows the threads doing the work
 static _Atomic uint64_t g_hint_paced, g_hint_gen = 1;   // the acquires' pacing since the last present; presents so far (+ 1), for hint_note
-static pthread_mutex_t g_hint_mu = PTHREAD_MUTEX_INITIALIZER; static int32_t g_hint_tid[3]; static int g_hint_ntid;
+static pthread_mutex_t g_hint_mu = PTHREAD_MUTEX_INITIALIZER; static int32_t g_hint_tid[4]; static int g_hint_ntid;   // 4: the acquiring, submitting and replay threads, and the recorder (gfx_vk_rec.inc)
 static void hint_note(void) {   // the calling thread works on this frame (once per thread and frame)
     static __thread uint64_t seen; uint64_t g = atomic_load_explicit(&g_hint_gen, memory_order_relaxed);
     if (seen == g) return;
     seen = g; int32_t t = gettid();
     pthread_mutex_lock(&g_hint_mu);
     int i = 0; while (i < g_hint_ntid && g_hint_tid[i] != t) i++;
-    if (i == g_hint_ntid && i < 3) g_hint_tid[g_hint_ntid++] = t;
+    if (i == g_hint_ntid && i < 4) g_hint_tid[g_hint_ntid++] = t;
     pthread_mutex_unlock(&g_hint_mu);
 }
 void dm_acquire_paced(uint64_t ns) { atomic_fetch_add_explicit(&g_hint_paced, ns, memory_order_relaxed); hint_note(); }
@@ -1618,7 +1631,7 @@ void dm_acquire_paced(uint64_t ns) { atomic_fetch_add_explicit(&g_hint_paced, ns
 static void hint_frame(uint64_t now, uint64_t from) {   // the present thread, before its pacing sleep; from: when the last one ended (0 = no present yet)
     void dm_android_hint_frame(uint64_t work_ns, const int32_t *tids, int n, uint64_t hold_ns, int thermal);
     uint64_t nvn_fstep_hold(int *k, int *kmin, int *thermal);
-    int32_t t[3]; pthread_mutex_lock(&g_hint_mu); int n = g_hint_ntid; memcpy(t, g_hint_tid, sizeof t); g_hint_ntid = 0; pthread_mutex_unlock(&g_hint_mu);
+    int32_t t[4]; pthread_mutex_lock(&g_hint_mu); int n = g_hint_ntid; memcpy(t, g_hint_tid, sizeof t); g_hint_ntid = 0; pthread_mutex_unlock(&g_hint_mu);
     atomic_fetch_add_explicit(&g_hint_gen, 1, memory_order_relaxed);
     uint64_t paced = atomic_exchange_explicit(&g_hint_paced, 0, memory_order_relaxed), span = from && now > from ? now - from : 0;
     int k, kmin, th; uint64_t vs = nvn_fstep_hold(&k, &kmin, &th), hold = vs ? (uint64_t)(FSTEP_FIT * (k - 1 > kmin ? k - 1 : kmin) * (double)vs) : 0;
@@ -1688,9 +1701,15 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); return nvn_timestamp_
 enum { EARLY_DRAWS = 48, MID_DRAWS = 64 };   // MID_DRAWS: a chunk that long goes to the GPU before the next draw, in the middle of a pass (the pass is begun again with its targets
 // loaded): Super Mario Bros. Wonder draws most of a frame in two passes of about 140 draws, which reached the GPU only when each ended, and the game then waited for the GPU
 // (SyncWait 12.5 ms a wait) after recording 23 ms of draws
-// g_mid_draws: MID_DRAWS, or a file named vk_mid beside $DM_DUMP_DIR holding a number, read every 30 presents (a test of the split's cost: each piece loads and stores the pass's targets)
+// g_mid_draws: MID_DRAWS, DM_VK_MID_DRAWS=<n> (env.txt, or a game's android_defaults.txt), or a file named vk_mid beside $DM_DUMP_DIR holding a number, read every 30 presents
+// (a test of the split's cost: each piece loads and stores the pass's targets). A game whose passes are long and whose GPU is not waited for draw by draw is better
+// with fewer cuts: Breath of the Wild on a OnePlus Pad 3 (about 3,600 draws a frame) at 512 instead of 64 took 1.5 ms less of the replay's CPU a frame (30.6 against
+// 32.2: fewer submissions and command buffer ends) and 2.9 ms less GPU time (18.7 against 21.6: fewer passes ended and begun again with their targets loaded). Measured
+// with descriptor set reuse on and one draw that hangs that GPU skipped by a local test switch (the device is lost without it), one run per value
 static int g_mid_draws = MID_DRAWS;
 static void mid_poll(uint64_t presents) {
+    static int init; if (!init) { init = 1; const char *e = getenv("DM_VK_MID_DRAWS"); int v = e ? atoi(e) : 0;
+        if (v > 0) { g_mid_draws = v; LOG("[vk] chunks sent in the middle of a pass after %d draws (DM_VK_MID_DRAWS)", v); } }
     const char *dir = getenv("DM_DUMP_DIR"); if (!dir || presents % 30) return;
     char p[700]; snprintf(p, sizeof p, "%s/../vk_mid", dir); FILE *f = fopen(p, "r"); if (!f) return;
     int v = 0; if (fscanf(f, "%d", &v) == 1 && v > 0 && v != g_mid_draws) { LOG("[vk] chunks sent in the middle of a pass after %d draws (was %d)", v, g_mid_draws); g_mid_draws = v; }
@@ -1923,7 +1942,7 @@ uint64_t mtl_present_slept_ns(uint64_t *end_ns) {
 static uint64_t g_pace_per; static int g_pace_due;   // the period of the present mtl_present_pace sleeps after (both on the replay thread)
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     pthread_mutex_lock(&g_bk);
-    vtex *v = vt_get(t); flush();
+    vtex *v = vt_get(t); flush(); rec_drain();   // the frame's chunks on the queue before the front end's blit of it (rec_submit)
     dump_poll(atomic_load(&g_presents)); prof_poll(atomic_load(&g_presents)); mid_poll(atomic_load(&g_presents));
     if (prof_on()) { all_wait(); prof_write(); }
     if (atomic_load(&g_presents) == 30) prewarm_start();   // the pipelines of earlier sessions (gfx_vk_draw.inc), once the game draws
@@ -2035,6 +2054,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         ext_check() ? "; DM_VK_EXT_CHECK on" : "");
     if (ext_check()) LOG("[vk] DM_VK_EXT_CHECK: %llu constant buffer bindings copied whole with NaN past their extents (cumulative)", (unsigned long long)g_ext_checked);
     LOG("[vk] support buffer: %llu stages wrote it, %llu left it unwritten (no module reads binding 0) (cumulative; gfx_vk_draw.inc stage_set)", (unsigned long long)g_sup_written, (unsigned long long)g_sup_skipped);
+    if (g_rq) LOG("[vk] recorder: %llu calls queued, %llu drains, %llu made directly; the replay waited %.1f ms for it (cumulative; gfx_vk_rec.inc)", (unsigned long long)g_rq_records, (unsigned long long)g_rq_drains, (unsigned long long)g_rq_direct, atomic_load(&g_rq_waits_ns) / 1e6);
     if (set_reuse()) { static unsigned long long f0; static uint64_t h0, m0;   // per frame since the last line
         if (frame > f0) { double nf = (double)(frame - f0), h = (double)(g_sr_hit - h0) / nf, m = (double)(g_sr_miss - m0) / nf;
             LOG("[vk] descriptor sets a frame over the last %llu frames: %.0f bound again with the same descriptors, %.0f written (%.1f%% bound again); %llu too large to keep "

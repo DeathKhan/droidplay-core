@@ -1779,6 +1779,22 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Check:** Breath of the Wild on a OnePlus Pad 3: three submissions of 249, 277 and 281 ms, each with its end timestamp unwritten and each holding the draw of vertex shader `2decd3e894b3736a` and fragment shader `26ae1640f3448ba4`, before the device was lost; with chunks of one draw, that draw alone. `VK_EXT_device_fault` gave no address and no vendor record (a hang, not a page fault).
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) on a OnePlus Pad 3 (the hang itself is open there).
 
+### Command recording on a thread of its own (Android)
+
+- **Symptom:** a game with thousands of draws a frame is held by the replay thread's CPU time. In a profile of that thread the driver's recording calls are a large share: Breath of the Wild on a OnePlus Pad 3, `vkCmdDrawIndexed` 9.9%, `vkCmdBindDescriptorSets` 8.2%, `vkCmdBeginRenderPass` 1.4%, and binds, copies and dynamic state besides. Meanwhile the phone's other cores are idle.
+- **Cause:** the replay made every `vkCmd*` call itself, and ended and submitted each chunk, on its one thread.
+- **Fix:** `DM_VK_RECORDER=1` (off by default) (`dm/android/gfx_vk_rec.inc`).
+  - Each wrapper copies its call's arguments (arrays and structures included) into a ring, and a recorder thread (`vk-record`) makes the calls in order. It also ends each chunk's command buffer and submits it with its fence (`rec_submit`). A command buffer that fails to end is not submitted: its fence goes alone, so the chunk still completes.
+  - The replay waits for it only in `mtl_present`, before the frame goes to the front end, whose blit uses the same queue.
+  - The completion thread waits for a chunk's submission before its fence (`rec_wait_submitted`), and before it starts timing the chunk for the hang report.
+  - Every `vkCmd*` of the replay is made under `g_bk`, so the ring has one producer.
+  - The recorder joins the frame's performance hint session.
+  - The idea is nx2android's (`784c9d4`).
+- **Check:** Breath of the Wild on a OnePlus Pad 3, with descriptor set reuse, 512 draws a chunk, and one draw skipped by a local test switch (it hangs that GPU, [Android baselines](../../dm/android/baselines.md) problem 14):
+  - replay CPU 30.7 → 24.2 ms a frame;
+  - with `DM_FPS_TARGET=30`, 30.0 fps (frame p95 38.4–38.9 ms, replay 17.3–17.5 ms) against 29.2–29.6 fps without it;
+  - at the 60 fps target it stayed at 20 fps in four runs of five.
+
 ### Descriptor sets bound again within a chunk (Android)
 
 - **Symptom:** a game with thousands of draws a frame spends a large part of the replay thread in `vkUpdateDescriptorSets`: about 7,300 sets a frame in Breath of the Wild. The Odin 2's profile of 2026-11-07 put it at 3.4 ms a frame.
