@@ -13,7 +13,9 @@
 #include "front.h"
 #include "dm_input.h"
 #include "nvn_obj.h"
+#include <android/api-level.h>   // android_get_device_api_level
 #include <android/bitmap.h>
+#include <dlfcn.h>
 #include <android/log.h>
 #include <android/window.h>   // AWINDOW_FLAG_KEEP_SCREEN_ON
 #include <android_native_app_glue.h>
@@ -590,6 +592,32 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
     return 0;
 }
 
+// ---------- The display's rate: Android is told the frame rate the host presents at ----------
+// The host paces presents on its own grid (gfx_vk.c mtl_present_pace: the game's present interval in ticks of DM_PRESENT_HZ, 60 by default) and the FIFO swapchain shows each
+// frame at the display's next vsync. The display's rate is Android's choice, and with no word from the app a frame rate it does not divide is shown unevenly: Divinity at
+// 40 fps (DM_PRESENT_HZ=80) on a OnePlus Pad 3 held at 60 Hz stayed on screen 16.7 and 33.3 ms in turn (SurfaceFlinger's frame times, 64 and 61 of 126), and 30 or 60 fps
+// on a 144 Hz panel would be so too. Told the rate as a fixed source (ANativeWindow_setFrameRate, API 30, through dlsym: the build targets 29), Android may pick a display rate
+// it divides, 120 Hz for 40, where it can switch seamlessly. On the Pad 3 it took the request (the layer's requestedFrameRate 40 Hz ExactOrMultiple) and kept 60 Hz all the
+// same: the vendor's refresh-rate policy decides there. DM_VK_FRAME_RATE=0 tells nothing, as before
+static _Atomic int g_fr_want;   // the host's present rate in millihertz (0 = none to tell); the present thread's (front_frame_rate)
+void front_frame_rate(int mhz) { atomic_store_explicit(&g_fr_want, mhz > 0 ? mhz : 0, memory_order_relaxed); }
+static void fr_apply(void) {   // the main thread, between frames: the window is told when the rate or the window changes
+    static int32_t (*set)(ANativeWindow *, float, int8_t); static int on = -1, told; static ANativeWindow *told_win; static unsigned nlog;
+    ANativeWindow *w = g_app->window; int want = atomic_load_explicit(&g_fr_want, memory_order_relaxed);
+    if (!w || (w == told_win && want == told)) return;
+    if (on < 0) {
+        const char *e = getenv("DM_VK_FRAME_RATE"); on = !(e && !strcmp(e, "0"));
+        void *h = on ? dlopen("libandroid.so", RTLD_NOW) : NULL; set = h ? (int32_t (*)(ANativeWindow *, float, int8_t))dlsym(h, "ANativeWindow_setFrameRate") : NULL;
+        if (!on) LOG("[front] DM_VK_FRAME_RATE=0: Android is not told the frame rate");
+        else if (!set) LOG("[front] Android API %d cannot be told the frame rate (ANativeWindow_setFrameRate came with 30)", android_get_device_api_level());
+    }
+    int fresh = w != told_win; told_win = w; told = want;
+    if (!set || (fresh && !want)) return;   // a new window has no rate until one is told
+    int32_t r = set(w, want / 1000.0f, want ? 1 : 0);   // 1: ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE; 0 fps: no preference again
+    if (nlog++ < 16) LOG("[front] Android told the frame rate is %.3f fps (a fixed source): %s%s", want / 1000.0, r ? strerror(-r) : "accepted",
+                         nlog == 16 ? "; further changes not logged" : "");
+}
+
 // ---------- Lifecycle ----------
 static int g_started;
 static void on_cmd(struct android_app *app, int32_t cmd) {
@@ -628,6 +656,7 @@ void android_main(struct android_app *app) {
             if (app->destroyRequested) { vk_window_down(); (*app->activity->vm)->DetachCurrentThread(app->activity->vm); _exit(0); }
             if (g_sc) break;
         }
+        fr_apply();
         if (!frame_draw()) status_draw();
     }
 }

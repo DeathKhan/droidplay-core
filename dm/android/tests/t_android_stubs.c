@@ -3,6 +3,7 @@
 #include "nvn_obj.h"
 __attribute__((weak)) int front_has_window(void) { return 0; }
 __attribute__((weak)) void front_android_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+__attribute__((weak)) void front_frame_rate(int mhz) { (void)mhz; }
 // host functions the graphics tests do not link (hle_os.c, front end; nvn_mtl.m's test hook)
 __attribute__((weak)) int dm_detclock_enabled(void) { return 0; }
 __attribute__((weak)) void dm_guest_frame_tick(void) {}
