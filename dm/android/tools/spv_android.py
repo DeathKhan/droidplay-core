@@ -10,12 +10,15 @@
 #     VK_EXT_transform_feedback): the host draws it as points with rasterization off, the vertex buffers shifted so v counts from the draw's first vertex;
 #   for a vertex shader, also <key>.z.spv: before every return of the entry point, position z becomes (z + w) / 2, the -1..1 depth of NVN's default depth mode
 #     mapped to Vulkan's 0..1 (nvn_mtl.m adds the same as its main0_z entry point; Vulkan without VK_EXT_depth_clip_control has no other way);
+#   the uniform slots' size table (bank 25, which the translator's TranslationFlags.MetalUniformBounds reads before each read of c[3..16]) is taken out, its bound
+#     tests made true and its binding dropped from res.json (cbsize_strip): the reads are the ones the translator wrote before the table;
 #   res.json cbufs[].ext: how many bytes of each constant buffer the shader can read (cb_extents, on the final module; the .z / .tf variants add no constant buffer read).
 # Usage: spv_android.py <dmsh_xlate output dir> <out dir> [key ...]   (all keys of the input dir by default); prints one line per shader and a summary
 import itertools, json, struct, sys
 from pathlib import Path
 
-ANDROID_CHAIN = 4   # res.json 'android': bumped when this post-pass or spv_build.py's translation changes what they make (spv_build.py translates older outputs again)
+ANDROID_CHAIN = 5   # res.json 'android': bumped when this post-pass or spv_build.py's translation changes what they make (spv_build.py translates older outputs again).
+                    # 5: the size table taken out (cbsize_strip), so a chain 4 output of the merged translator, which reads it, is translated again
 EXT_FROM = 3   # 4 added res.json cbufs[].ext (cb_extents) and nothing else: spv_build.py brings an output of chain 3 up to date from its .spv (add_ext), without the translator,
                # only while ANDROID_CHAIN is EXT_FROM + 1 (upgrade stamps that chain, so a later bump for a change to the .spv translates chain 3's outputs again)
 SET_OF = {'vs': 0, 'ps': 1, 'gs': 2, 'tc': 3, 'te': 3, 'cs': 0}
@@ -46,8 +49,11 @@ def emit(hdr, ins):
 def ext_name(x):   # OpExtension's literal string
     return b''.join(struct.pack('<I', v) for v in x[1:]).split(b'\0')[0].decode()
 
-def process(data, stage):
+def process(data, stage, cbsize=None):
+    """→ (header, instructions, interlock removed, size table taken out: None when the shader has none, else True, or False when its use was not the translator's)"""
     hdr, ins = parse(data)
+    stripped = None
+    if cbsize is not None: hdr, ins, stripped = cbsize_strip(hdr, ins, cbsize)
     s = SET_OF.get(stage, 0); interlock = False
     out = []
     for x in ins:
@@ -66,7 +72,7 @@ def process(data, stage):
         at = next(i for i, x in enumerate(out) if x[0] == OP_CAP)
         out[at + 1:at + 1] = [[OP_CAP, c] for c in need]
     hdr, out = dyn_components(hdr, out)
-    return hdr, out, interlock
+    return hdr, out, interlock, stripped
 
 # ---- Dynamic vector components ----
 OP_TYPEBOOL, OP_TYPESTRUCT_, OP_TYPEARRAY, OP_TYPERUNTIMEARRAY_, OP_SELECT, OP_IEQUAL = 20, 30, 28, 29, 169, 170
@@ -147,6 +153,68 @@ def dyn_components(hdr, ins):
         out.append(x)
     hdr = list(hdr); hdr[3] = bound
     return hdr, out
+
+# ---- The uniform slots' size table taken out ----
+# The translator bounds every read of a game uniform slot (c[3..16]) for Metal, which has no bounds of its own (TranslationFlags.MetalUniformBounds,
+# Instructions.cs TryGenerateBoundedUniformLoad): it loads the slot's size from the table in bank 25, tests the word against it and selects 0 past it. Every
+# operand of such a test is a constant buffer's, so the test is the same for the whole draw, and the Adreno 830's driver (0x80320001) faults the GPU on a vertex
+# shader with about 270 of them or more: the context is lost (vkQueueSubmit -4) and nothing is drawn after (Pokémon Brilliant Diamond, whose vertex shaders have up
+# to 295; docs/reference/rendering.md, "Uniform bound tests in a vertex shader lose the device on the Adreno 830"). Taken out here: the replay binds a slot's buffer
+# as the game bound it, so a read past it is undefined on Vulkan, as it was before the table, and the code is as fast as it was then
+CBSIZE_BANK = 25   # dm/gfx/nvn/dmsh_abi.h DMSH_CBSIZE_BANK
+OP_NAME, OP_CONSTANTTRUE, OP_INBOUNDSACCESSCHAIN, OP_ULESSTHAN, OP_SHIFTRIGHTLOGICAL = 5, 41, 66, 176, 194
+def cbsize_strip(hdr, ins, binding):
+    """The size table (constant buffer `binding`, bank 25) taken out of a shader: each load of a slot's size becomes 65536 (the whole 64 KB of a constant buffer) and
+    each bound test on it, `word < size >> 2`, true (any word an index into the 4096-element array can reach); the table's variable, access chains, name and
+    decorations go. What is left is the read the translator wrote before the table (the selects of true fold away).
+    → (header, instructions, True); the module as it was and None when it has no such table, or False when the table has a use the translator does not make"""
+    var = {x[1] for x in ins if x[0] == OP_DECORATE and x[2] == DEC_BINDING and x[3] == binding} & {x[2] for x in ins if x[0] == OP_VARIABLE}
+    if not var: return hdr, ins, None
+    chains = {x[2] for x in ins if x[0] in (OP_ACCESSCHAIN, OP_INBOUNDSACCESSCHAIN) and x[3] in var}
+    loads = {x[2] for x in ins if x[0] == OP_LOAD and x[3] in chains}
+    words = {x[2] for x in ins if x[0] == OP_SHIFTRIGHTLOGICAL and x[3] in loads}
+    infn = False
+    for x in ins:   # in the functions, the variable is only the base of access chains and a chain only the pointer of a load (Instructions.cs TryGenerateBoundedUniformLoad)
+        op = x[0]
+        if op == OP_FUNCTION: infn = True
+        elif op == OP_FUNCTIONEND: infn = False
+        if not infn: continue
+        for q in range(1, len(x)):
+            w = x[q]
+            if spv_lit(op, q) or (op not in NO_RESULT and q <= 2): continue
+            if (w in var and not (op in (OP_ACCESSCHAIN, OP_INBOUNDSACCESSCHAIN) and q == 3)) or (w in chains and not (op == OP_LOAD and q == 3)): return hdr, ins, False
+    bound = hdr[3]
+    tu = next(x[1] for x in ins if x[0] == OP_LOAD and x[2] in loads)
+    tb = next((x[1] for x in ins if x[0] == OP_TYPEBOOL), None)
+    c64k = next((x[2] for x in ins if x[0] == OP_CONSTANT and x[1] == tu and x[3] == 0x10000), None)
+    ctrue = next((x[2] for x in ins if x[0] == OP_CONSTANTTRUE and x[1] == tb), None) if tb is not None else None
+    glob = []
+    if c64k is None: c64k = bound; bound += 1; glob.append([OP_CONSTANT, tu, c64k, 0x10000])
+    if ctrue is None and tb is not None: ctrue = bound; bound += 1; glob.append([OP_CONSTANTTRUE, tb, ctrue])
+    out = []
+    for x in ins:
+        op = x[0]
+        if op == OP_LOAD and x[2] in loads: out.append([OP_COPYOBJECT, x[1], x[2], c64k]); continue
+        if op == OP_ULESSTHAN and x[4] in words and ctrue is not None: out.append([OP_COPYOBJECT, x[1], x[2], ctrue]); continue
+        if op in (OP_ACCESSCHAIN, OP_INBOUNDSACCESSCHAIN) and x[2] in chains: continue
+        if (op == OP_VARIABLE and x[2] in var) or (op in (OP_DECORATE, OP_NAME) and x[1] in var): continue
+        if op == OP_ENTRY:   # a SPIR-V 1.4 module lists every global variable in the interface, after the entry point's name (its last word holds a zero byte)
+            e = 3
+            while e < len(x) and all(x[e] >> s & 0xff for s in (0, 8, 16, 24)): e += 1
+            x = x[:e + 1] + [w for w in x[e + 1:] if w not in var]
+        out.append(x)
+    at = next(i for i, x in enumerate(out) if x[0] == OP_FUNCTION)
+    out[at:at] = glob
+    dead = lambda x: (x[0] == OP_SHIFTRIGHTLOGICAL and x[2] in words) or (x[0] == OP_COPYOBJECT and x[2] in loads)
+    while True:   # the sizes and their shifts that no compare reads any more go too
+        used = set()
+        for x in out:
+            if x[0] not in (OP_NAME, OP_DECORATE, OP_MEMBERDECORATE): used.update(x[1:] if x[0] in NO_RESULT else x[3:])
+        keep = [x for x in out if not (dead(x) and x[2] not in used)]
+        if len(keep) == len(out): break
+        out = keep
+    hdr = list(hdr); hdr[3] = bound
+    return hdr, out, True
 
 def z_variant(hdr, ins):
     """Before each OpReturn of the entry point: position.z = (position.z + position.w) * 0.5"""
@@ -685,13 +753,16 @@ def upgrade(out, key):
 def main():
     src, dst = Path(sys.argv[1]), Path(sys.argv[2]); dst.mkdir(parents=True, exist_ok=True)
     keys = sys.argv[3:] or sorted(p.stem for p in src.glob('*.spv') if not p.name.endswith('.reader.spv'))
-    n = nz = bad = eb = ew = 0
+    n = nz = bad = eb = ew = ncs = 0
     for k in keys:
         res = json.loads((src / f'{k}.res.json').read_text(encoding='utf-8'))
         stage = res.get('stage', 'vs')
-        hdr, ins, interlock = process((src / f'{k}.spv').read_bytes(), stage)
+        cs = next((c['binding'] for c in res.get('cbufs') or [] if c.get('slot') == CBSIZE_BANK), None)
+        hdr, ins, interlock, stripped = process((src / f'{k}.spv').read_bytes(), stage, cs)
         (dst / f'{k}.spv').write_bytes(emit(hdr, ins)); n += 1
         if interlock: res.setdefault('notes', []).append('android: fragment shader interlock removed (no ordering of overlapping fragments)')
+        if stripped: res['cbufs'] = [c for c in res['cbufs'] if c.get('slot') != CBSIZE_BANK]; ncs += 1
+        elif stripped is False: print(f'[RED] {k}: the uniform slots\' size table (c{CBSIZE_BANK}) is used other than the translator\'s bound tests use it: left in (it loses the device on Adreno 830)')
         res['set'] = SET_OF.get(stage, 0); res['android'] = ANDROID_CHAIN
         b, w = add_ext(res, ins); eb += b; ew += w
         if stage == 'vs': res['vin'] = vin_types(ins)
@@ -702,7 +773,7 @@ def main():
             z = z_variant(hdr, ins)
             if z: (dst / f'{k}.z.spv').write_bytes(z); nz += 1
             else: bad += 1; print(f'[RED] {k}: no position output found, no depth -1..1 variant')
-    print(f'spv_android: {n} shaders, {nz} depth variants, {bad} without one; constant buffers: {eb} with a known extent, {ew} read whole')
+    print(f'spv_android: {n} shaders, {nz} depth variants, {bad} without one; constant buffers: {eb} with a known extent, {ew} read whole; the size table taken out of {ncs}')
 
 if __name__ == '__main__':
     main()

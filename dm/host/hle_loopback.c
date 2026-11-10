@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { LB_BASE = 0x200, LB_MAX = 64,   // descriptors 512..575: below select's 1024, apart from the event descriptors (hle_net.c, 0x4000)
+enum { LB_BASE = 0x200, LB_MAX = 64,   // descriptors 512..575, apart from the event descriptors (hle_net.c numbers those from 0, below 64, and its Select sees only those: a loopback socket is waited on with Poll or a blocking RecvFrom; RakNet blocks in RecvFrom)
        LB_QMAX = 512, LB_QBYTES = 1 << 20, LB_DGRAM_MAX = 65507, LB_EPHEMERAL = 49152 };
 // FreeBSD's numbers, which Horizon's bsd service uses
 enum { E_BADF = 9, E_INVAL = 22, E_AGAIN = 35, E_MSGSIZE = 40, E_AFNOSUPPORT = 47, E_ADDRINUSE = 48, E_ADDRNOTAVAIL = 49, E_NETDOWN = 50, E_NETUNREACH = 51,

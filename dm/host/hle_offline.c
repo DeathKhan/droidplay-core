@@ -79,11 +79,11 @@ HLE_FORCE("_ZN2nn6socket12GetLastErrnoEv", "offline: ENETDOWN, or a loopback soc
 HLE_FORCE("_ZN2nn6socket6SocketEiii", "offline (cut): -1; a loopback datagram socket with net_loopback", int, h_sk_Socket3i, int a, int b, int c) { if (dm_lb_takes(a, b, c)) return dm_lb_socket(a, b, c); dm_lb_offline_call(); return -1; }
 HLE_FORCE("_ZN2nn6socket8ShutdownEii", "offline (cut)", int, h_sk_Shutdown, int s, int h) { (void)s; (void)h; return -1; }
 HLE_FORCE("_ZN2nn6socket4BindEiPK8sockaddrj", "offline (cut); loopback sockets bind", int, h_sk_Bind, int s, const void *a, unsigned n) { LB_OR_OFFLINE(s, dm_lb_bind(s, a, n)); }
-int dm_sk_poll(void *fds, uint64_t n, int ms);   // hle_net.c: nothing to wait on → the timeout passes, 0; else -1
-int dm_sk_select(int nfds, const uint64_t *r, const uint64_t *w, const uint64_t *e, const int64_t *tv);
-HLE_FORCE("_ZN2nn6socket4PollEP6pollfdmi", "offline: waits out the timeout when there is nothing to wait on, else fails", int, h_sk_Poll, void *p, uint64_t n, int t) { return dm_sk_poll(p, n, t); }
+int dm_sk_poll(void *fds, uint64_t n, int ms);   // hle_net.c: waits on the host's event descriptors; with none the timeout passes, 0
+int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t *tv);
+HLE_FORCE("_ZN2nn6socket4PollEP6pollfdmi", "offline: waits on the host's event descriptors; nothing else is ever ready", int, h_sk_Poll, void *p, uint64_t n, int t) { return dm_sk_poll(p, n, t); }
 // SDK 4's Select with plain fd_set / timeval (Dark Souls Remastered)
-HLE_FORCE("_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval", "offline: waits out the timeout when there is nothing to wait on, else fails", int, h_sk_Select2, int n, void *r, void *w, void *e, void *t) { return dm_sk_select(n, r, w, e, t); }
+HLE_FORCE("_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval", "offline: Poll over its sets (the host's event descriptors; nothing else is ever ready)", int, h_sk_Select2, int n, void *r, void *w, void *e, void *t) { return dm_sk_select(n, r, w, e, t); }
 HLE_FORCE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", "offline (cut); loopback sockets send to 127.0.0.1", long, h_sk_SendTo, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { LB_OR_OFFLINE(s, dm_lb_sendto(s, b, n, f, a, al)); }
 HLE_FORCE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", "offline (cut); loopback sockets send to 127.0.0.1", long, h_sk_SendTo2, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { LB_OR_OFFLINE(s, dm_lb_sendto(s, b, n, f, a, al)); }
 HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", "offline (cut); loopback sockets receive", long, h_sk_RecvFrom2, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { LB_OR_OFFLINE(s, dm_lb_recvfrom(s, b, n, f, a, al)); }

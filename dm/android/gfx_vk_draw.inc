@@ -113,9 +113,12 @@ typedef struct { int binding, slot; uint32_t ext; } rb_cbuf;   // ext: bytes the
 typedef struct { int binding, slot, cb_slot, cb_off, flags; } rb_sbuf;
 typedef struct { int binding, type, cbuf_slot, handle, array, separate, flags; VkFormat fmt; int samp_slot; } rb_tex;   // fmt: an image's declared format (0: Unknown); cbuf_slot / samp_slot: the banks of the texture and sampler handles (rb_tex_read)
 enum { SH_VS, SH_PS, SH_GS, SH_TS, SH_CS };
+// constant buffers a shader may bind: up to 18 of banks 0 to 17, plus NVN2's push constants (c24, DMSH_PUSH_BANK) and the uniform slots' size table (c25,
+// DMSH_CBSIZE_BANK), which the translator adds to every shader that reads a uniform slot: a binding past the cap would be dropped without a word
+#define CB_MAX 20
 typedef struct {
     char key[17]; int stage, set, ok; VkShaderStageFlagBits vkstage; VkShaderModule mod, modz, modtf; uint32_t tf_stride[4]; VkDescriptorSetLayout dsl_tf;
-    int ncb, nsb, ntx, nim; rb_cbuf cb[18]; rb_sbuf sb[16]; rb_tex tx[64], im[16];
+    int ncb, nsb, ntx, nim; rb_cbuf cb[CB_MAX]; rb_sbuf sb[16]; rb_tex tx[64], im[16];
     VkDescriptorSetLayout dsl;
     char vin[16];   // vertex inputs' types: 'f' float, 'u' uint, 's' int (res.json "vin")
     int vid;   // a vertex shader reading gl_VertexIndex: its draws keep their vertex numbers (bind_vbufs lo 0)
@@ -219,7 +222,7 @@ static void spv_cb_ext(const uint32_t *w, size_t n, const rb_cbuf *cb, int ncb, 
         if (op == 71 && len >= 4 && w[i + 2] == 33 && w[i + 1] < bound) bind[w[i + 1]] = (int32_t)w[i + 3];   // OpDecorate id Binding b
         if (op == 43 && len == 4 && w[i + 2] < bound) { isc[w[i + 2]] = 1; cval[w[i + 2]] = (int32_t)w[i + 3]; }   // OpConstant (32-bit)
         i += len; }
-    int64_t mx[18]; int full[18]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = 0; }
+    int64_t mx[CB_MAX]; int full[CB_MAX]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = 0; }
     for (size_t i = 5; i < n; ) { uint32_t len = w[i] >> 16, op = w[i] & 0xffff; if (!len || i + len > n) break;
         if (op != 71 && op != 5 && op != 6 && op != 15 && op != 59) {   // decorations, names, entry points and the variable's own declaration are not uses
             for (uint32_t q = 1; q < len; q++) { uint32_t id = w[i + q]; if (id >= bound || bind[id] < 0) continue;
@@ -259,7 +262,7 @@ static void spv_cb_ext2(const uint32_t *w, size_t n, const rb_cbuf *cb, int ncb,
         else if (op == 59 && len >= 4 && w[i + 2] < bound) { t[w[i + 2]].op = op; t[w[i + 2]].a = w[i + 1]; t[w[i + 2]].b = w[i + 3]; }   // OpVariable type (result) class
         else if ((op >= 73 && op <= 75) || op == 67 || op == 70) give_up = 1;   // decoration groups, OpPtrAccessChain / OpInBoundsPtrAccessChain
         i += len; }
-    int64_t mx[18]; int full[18]; uint32_t alen[18]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = give_up; alen[k] = 0; }
+    int64_t mx[CB_MAX]; int full[CB_MAX]; uint32_t alen[CB_MAX]; for (int k = 0; k < ncb; k++) { mx[k] = -1; full[k] = give_up; alen[k] = 0; }
     for (uint32_t v = 0; v < bound && !give_up; v++) {   // each buffer's variables: Uniform, vec4[L] at stride 16 as member 0 at offset 0
         if (t[v].op != 59 || t[v].bind < 0) continue;
         int k = cb_index(cb, ncb, t[v].bind); if (k == ncb) continue;
@@ -455,8 +458,8 @@ static vshader *sh_get(const char *key) {
     s->stage = !strcmp(sn, "ps") ? SH_PS : !strcmp(sn, "gs") ? SH_GS : !strcmp(sn, "cs") ? SH_CS : !strcmp(sn, "vs") ? SH_VS : SH_TS;
     s->vkstage = s->stage == SH_PS ? VK_SHADER_STAGE_FRAGMENT_BIT : s->stage == SH_GS ? VK_SHADER_STAGE_GEOMETRY_BIT : s->stage == SH_CS ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_VERTEX_BIT;
     s->set = js_int(&r, "set", s->stage == SH_PS ? 1 : s->stage == SH_GS ? 2 : 0);
-    const jv *a = js_get(&r, "cbufs"); uint32_t rext[18] = {0};   // rext: res.json's extents (cb_ext_pick)
-    for (int i = 0; a && i < a->n && s->ncb < 18; i++) { rext[s->ncb] = (uint32_t)js_int(&a->kid[i], "ext", 0); s->cb[s->ncb++] = (rb_cbuf){js_int(&a->kid[i], "binding", 0), js_int(&a->kid[i], "slot", 0), 0}; }
+    const jv *a = js_get(&r, "cbufs"); uint32_t rext[CB_MAX] = {0};   // rext: res.json's extents (cb_ext_pick)
+    for (int i = 0; a && i < a->n && s->ncb < CB_MAX; i++) { rext[s->ncb] = (uint32_t)js_int(&a->kid[i], "ext", 0); s->cb[s->ncb++] = (rb_cbuf){js_int(&a->kid[i], "binding", 0), js_int(&a->kid[i], "slot", 0), 0}; }
     a = js_get(&r, "sbufs");
     for (int i = 0; a && i < a->n && s->nsb < 16; i++) { const jv *o = &a->kid[i]; s->sb[s->nsb++] = (rb_sbuf){js_int(o, "binding", 0), js_int(o, "slot", 0), js_int(o, "cb_slot", 0), js_int(o, "cb_offset", 0), js_int(o, "flags", 0)}; }
     rb_tex_read(js_get(&r, "textures"), s->tx, &s->ntx, 64); rb_tex_read(js_get(&r, "images"), s->im, &s->nim, 16);
@@ -468,12 +471,12 @@ static vshader *sh_get(const char *key) {
     js_free(&r);
     snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key); s->mod = sh_module(p, &s->b0);
     { size_t nw = 0; uint32_t *w = spv_read(p, &nw);
-      if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); s->wlayer = s->stage != SH_PS && s->stage != SH_CS && spv_layer_out(w, nw); uint32_t ext[18]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
+      if (w) { spv_io(w, nw, &s->io_in, &s->io_out); s->vid = s->stage == SH_VS && spv_vid(w, nw); s->wlayer = s->stage != SH_PS && s->stage != SH_CS && spv_layer_out(w, nw); uint32_t ext[CB_MAX]; (cb_ext2_on() ? spv_cb_ext2 : spv_cb_ext)(w, nw, s->cb, s->ncb, ext); cb_ext_pick(s, ext, rext); free(w); } }
     if (s->stage == SH_VS) { snprintf(p, sizeof p, "%s/%s.z.spv", g_spv_dir, s->key); s->modz = sh_module(p, &s->b0); }
     if (s->tf_stride[0] | s->tf_stride[1] | s->tf_stride[2] | s->tf_stride[3]) { snprintf(p, sizeof p, "%s/%s.tf.spv", g_spv_dir, s->key); s->modtf = sh_module(p, &s->b0); }
     if (!s->mod) return NULL;
     // the set's layout: support buffer, constant buffers, storage buffers, textures, images
-    VkDescriptorSetLayoutBinding b[1 + 18 + 16 + 64 + 16 + 4]; uint32_t nb = 0;
+    VkDescriptorSetLayoutBinding b[1 + CB_MAX + 16 + 64 + 16 + 4]; uint32_t nb = 0;
     b[nb++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
     sh_dyn(s);
     for (int i = 0; i < s->ncb; i++) b[nb++] = (VkDescriptorSetLayoutBinding){(uint32_t)s->cb[i].binding, s->cbdyn[i] != 0xff ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, (VkShaderStageFlags)s->vkstage, NULL};
@@ -2057,7 +2060,7 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
     int nst = nvn_stage_of(s->stage);
     VkDescriptorSet set = VK_NULL_HANDLE; *pset = VK_NULL_HANDLE;   // the writes name their set once it is known (below)
     // one write per binding; every element of an array is written (an unwritten descriptor is undefined)
-    VkWriteDescriptorSet wr[1 + 18 + 16 + 64 + 16]; VkDescriptorBufferInfo bi[1 + 18 + 16]; VkDescriptorImageInfo *ii; VkBufferView *bvs; uint32_t nw = 0, nbi = 0, nii = 0, nbv = 0;
+    VkWriteDescriptorSet wr[1 + CB_MAX + 16 + 64 + 16]; VkDescriptorBufferInfo bi[1 + CB_MAX + 16]; VkDescriptorImageInfo *ii; VkBufferView *bvs; uint32_t nw = 0, nbi = 0, nii = 0, nbv = 0;
     uint8_t c2buf[C2_SIZE]; const uint8_t *c2 = c2_bank(nst, c2buf);   // NULL: handle words read with c2_word, the whole bank made only for a c2 constant buffer (below)
     // support buffer: render scale 1, the viewport's inverse and size. Written only for a stage whose modules read it (sh_get spv_b0_used): a descriptor no instruction of the
     // pipeline uses need not be valid (Vulkan: VUID-vkCmdDraw-None-08114, valid "if they are statically used"), so binding 0 stays in the layout, unwritten. Breath of the Wild
@@ -2078,6 +2081,10 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
         if (slot == 0) { bank_c0(nst, bank, base_inst); src = bank; n = 0x800; }
         else if (slot == 2) { if (!c2) bank_c2(nst, bank); src = c2 ? c2 : bank; n = C2_SIZE; }
         else if (slot == DMSH_PUSH_BANK) { src = D.push[nst == 5]; n = DMSH_PUSH_SIZE; }   // NVN2 push constants: compute's block or the graphics stages' (OP_PUSH_CONST)   // c2 read as a constant buffer: 81 of Breath of the Wild's 19,592 shaders, none of a measured frame's
+        else if (slot == DMSH_CBSIZE_BANK) {   // the uniform slots' bound sizes in bytes (nvn_mtl.m NVN_RB_CBSIZE), which the translator's uniform reads compare with: past its slot's size a read gives 0, as Maxwell's constant buffers do
+            memset(bank, 0, 16 * ((DMSH_CBSIZE_SLOTS + 3) / 4));
+            for (int r = 0; r < DMSH_CBSIZE_SLOTS; r++) { const p_bind_buf *u = &D.ubo[nst][r]; uint32_t v = u->addr ? (u->size < 65536 ? (uint32_t)u->size : 65536) : 0; memcpy(bank + 4 * r, &v, 4); }
+            src = bank; n = 16 * ((DMSH_CBSIZE_SLOTS + 3) / 4); }
         else if (slot == 1) {   // the shader's own constant segment, in its code memory: its bounds were read from the control section at SetShaders (gone by now: Danganronpa V3's movie shader read zeros)
             const NVNshaderData *sd = pr && prog_stage >= 0 ? &pr->sd[prog_stage] : NULL; uint32_t o = 0, e = 0; int c1m;
             if (sd && sd->data && ((c1m = c1_memo(pr, prog_stage, &o, &e)) >= 0 ? c1m : prog_c1(pr, (unsigned)prog_stage, &o, &e)) && e > o && e - o <= 0x10000) { src = (const void *)(uintptr_t)(sd->data + o); n = e - o; }
