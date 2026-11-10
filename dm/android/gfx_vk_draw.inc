@@ -177,30 +177,7 @@ static int spv_vid(const uint32_t *w, size_t n) {   // a variable decorated Buil
     return 0;
 }
 // ---- Which modules read the support buffer (binding 0) ----
-// Word q of an instruction with opcode op in a function body is a literal, never an id: an extended instruction's number, a function's or a merge's control,
-// a variable's storage class, memory operands, composite indices and shuffle components, branch weights, switch cases, image operand masks, group operations, line numbers.
-// An opcode not listed has every word taken for an id, so that an unknown one can only make a use seen where there is none (safe), never hide one
-static int spv_lit(uint32_t op, uint32_t q) {
-    switch (op) {
-        case 8: case 317: return 1;   // OpLine (an OpString and two numbers), OpNoLine
-        case 12: return q == 4;   // OpExtInst type result set instruction operands...
-        case 54: case 59: return q == 3;   // OpFunction type result control ftype; OpVariable type result class [initializer]
-        case 61: return q >= 4;   // OpLoad type result pointer [memory operands]
-        case 62: case 63: return q >= 3;   // OpStore pointer object [memory operands]; OpCopyMemory target source [memory operands]
-        case 64: return q >= 4;   // OpCopyMemorySized
-        case 79: case 82: return q >= 5;   // OpVectorShuffle type result v1 v2 components...; OpCompositeInsert type result object composite indices...
-        case 81: return q >= 4;   // OpCompositeExtract type result composite indices...
-        case 246: return q >= 3;   // OpLoopMerge merge continue control [parameters]
-        case 247: case 256: case 257: return q == 2;   // OpSelectionMerge merge control; OpLifetimeStart / Stop pointer size
-        case 250: return q >= 4;   // OpBranchConditional condition true false [weights]
-        case 251: return q >= 3;   // OpSwitch selector default (literal label)...: the labels are no variables
-        case 87: case 88: case 91: case 92: case 95: case 98: case 305: case 306: case 309: case 310: case 313: case 320: return q == 5;   // image sample / fetch / read: the operand mask
-        case 89: case 90: case 93: case 94: case 96: case 97: case 307: case 308: case 311: case 312: case 314: case 315: return q == 6;   // with a depth reference or a gather component
-        case 99: return q == 4;   // OpImageWrite image coordinate texel [mask]
-        case 342: return q == 4;   // OpGroupNonUniformBallotBitCount type result scope operation value
-        default: return op >= 349 && op <= 364 && q == 4;   // OpGroupNonUniform arithmetic / bitwise / logical: the group operation
-    }
-}
+// spv_lit (which words of an instruction are literals): spv_lit.h
 // 1 when the module statically uses binding 0 (Vulkan: an instruction in the entry point's call tree names the variable): a variable decorated Binding 0 is an id operand
 // of an instruction in a function body, or a global variable's initializer; 1 too when the module cannot be followed (malformed, decoration groups). The support buffer
 // is binding 0 of every set (Ryujinx's 1,392 bytes: render scale, the viewport's inverse and size), read by few shaders: 200 of Breath of the Wild's 19,592 (render scale
@@ -377,11 +354,34 @@ done:
     free(o); free(loc); free(pst); free(ppt); free(privp); free(nullc); free(der);
     return res;
 }
+// The module without subgroup operations in a stage where the GPU runs none (spv_limits.h), in *out (to free); 0 when it needs nothing. A GPU that runs them in
+// every graphics stage gets every module as translated, untouched; so does one that runs them in the module's stage. DM_SPV_LIMITS=0 (env.txt): modules as translated
+static size_t spv_fit(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_LIMITS"); on = !(e && *e == '0'); }
+    *out = NULL;
+    if (!on || (g_sg_stages & VK_SHADER_STAGE_ALL_GRAPHICS) == VK_SHADER_STAGE_ALL_GRAPHICS || !spv_lim_wanted(code, nw, g_sg_stages)) return 0;
+    uint32_t *s = malloc(2 * (size_t)code[3] * 4), *o = NULL; size_t need = 0, k = 0; int got = 0;
+    if (!s) return 0;
+    spv_limits(code, nw, g_sg_stages, s, NULL, 0, &need, &got);
+    if (need && (o = malloc(need * 4))) k = spv_limits(code, nw, g_sg_stages, s, o, need, &need, &got);
+    free(s);
+    if (!k) { free(o); o = NULL; }
+    static _Atomic int logged, nred;
+    if (k && !atomic_exchange(&logged, 1))
+        LOG("[vk] the GPU runs subgroup operations in stages %#x only: shaders of other stages that use them are rewritten without (fragment shaders: lanes of a 2x2 quad, "
+            "shuffles through fine derivatives; other stages: one lane). First: %s", g_sg_stages, what);
+    if (k && vk_debug()) LOG("[vk] %s: subgroup operations rewritten (%s)", what, got & SPV_LIM_SG_QUAD ? "quad" : "one lane");
+    if ((got & SPV_LIM_SG_KEPT) && atomic_fetch_add(&nred, 1) < 8)
+        LOG("[RED] [vk] %s uses subgroup operations in a stage where the GPU has none (it runs them in stages %#x), some of which spv_limits does not rewrite: made as it is", what, g_sg_stages);
+    *out = o; return k;
+}
 static VkShaderModule sh_module_code(const uint32_t *code, size_t nw, const char *what) {
+    uint32_t *fit = NULL; size_t fn = spv_fit(code, nw, what, &fit); if (fn) { code = fit; nw = fn; }
     VkShaderModule m = VK_NULL_HANDLE; VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = code};
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     if (vkCreateShaderModule(g_vk.dev, &ci, NULL, &m) != VK_SUCCESS) { LOG("[RED] [vk] shader module %s refused by the driver", what); m = VK_NULL_HANDLE; }
     atomic_fetch_add(&g_mod_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_mod_made, 1);
+    free(fit);
     return m;
 }
 static VkShaderModule ps_variant(vshader *s, uint32_t miss) {
@@ -1165,7 +1165,7 @@ static int rp_start(void) {
     VkCommandBuffer c = cb(); if (!c) return 0;
     VkRenderPassBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = P.rp, .framebuffer = P.fb, .renderArea = {{0, 0}, {P.w, P.h}}};
     if (prof_on()) prof_pass_begin();
-    vkCmdBeginRenderPass(c, &bi, VK_SUBPASS_CONTENTS_INLINE); bf_reset();
+    vkCmdBeginRenderPass(c, &bi, VK_SUBPASS_CONTENTS_INLINE); bf_reset(); crumb('p', NULL, NULL, P.w, P.h);
     P.active = 1; g_passes++;
     return 1;
 }
@@ -2698,7 +2698,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!bind_vbufs(c, k.sh[0], lo, vhi, base_inst, inst)) { g_drop[6]++; return 0; }
     if (ib) { bf_ibuf(c, ib, ioff, i32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16); vkCmdDrawIndexed(c, icount, inst, 0, (int32_t)((di ? di->base_vertex : 0) - lo), base_inst); }
     else vkCmdDraw(c, count, inst, (uint32_t)(dw->first - lo), base_inst);
-    g_draws++; C->ndraw++;
+    g_draws++; C->ndraw++; crumb((dw ? dw->ind : di->ind) ? 'D' : 'd', k.sh[0]->key, k.sh[1] ? k.sh[1]->key : NULL, ib ? icount : count, inst);
     if (g_prof_cur >= 0) { prof_rec *pr = &g_prof[g_prof_cur]; uint64_t nv = (uint64_t)(ib ? icount : count) * inst; pr->draws++; pr->verts += nv;
         if (nv > pr->big) { pr->big = nv; pr->bigvs = k.sh[0]->key; pr->bigfs = k.sh[1] ? k.sh[1]->key : NULL; } }
     if (dump_on()) {
@@ -2763,7 +2763,7 @@ static int vk_dispatch(const p_dispatch *dp) {
     int pr_i = -1;
     if (prof_on() && C->pq && C->npq + 2 <= 512 && g_nprof < 1024) { prof_rec *r = &g_prof[pr_i = g_nprof++]; memset(r, 0, sizeof *r); r->c = C; r->ncolor = -1; r->w = g[0]; r->h = g[1]; r->draws = (int)g[2]; r->seq = g_prof_seq++;
         r->s0 = C->npq++; vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->pq, (uint32_t)r->s0); }
-    vkCmdDispatch(c, g[0], g[1], g[2]);
+    vkCmdDispatch(c, g[0], g[1], g[2]); crumb(dp->ind ? 'C' : 'c', s->key, NULL, g[0], g[1] * g[2]);
     if (pr_i >= 0) { g_prof[pr_i].s1 = C->npq++; vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, C->pq, (uint32_t)g_prof[pr_i].s1); }
     cb_barrier();
     g_dispatches++; C->ndraw++;

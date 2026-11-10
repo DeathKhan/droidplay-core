@@ -30,8 +30,8 @@ median GPU time per frame. Animal Crossing runs at 30 fps on the Switch too.
 | **Super Mario Odyssey 1.4.1**, Start menu (a fresh save) | 60 · 16.7 / 17.6–18.7 | 60 · 16.6 / 18.0 | 60 · 16.6 / 17.5–17.9 |
 | Super Mario Odyssey, the opening cutscene (Start pressed on a fresh save) | 59.9 · 16.7 / 18.4 · GPU 5.5 (one run crashed at boot) | 59.9 · 16.7 / 18.9 · GPU 9.3 | **38** · 25.9 / 30.6–31.5 · GPU 12.9 |
 | Super Mario Odyssey, play (the Cap Kingdom, at the Look Around hint) | 60 · 16.7 / 18.5 · GPU 4.5 (one run, 15 s; it crashed at the hint video before the fix in problem 1) | not run | not run |
-| **Pokémon Brilliant Diamond 1.3.0**, language menu (a fresh save) | 60 · 16.7 / 19.2–19.4 | 60 · 16.6–16.7 / 18.5–18.8 | **Crashes** at 2.6 s |
-| Pokémon Brilliant Diamond, Eterna City (a save) | 60 · 16.6 / 18.1–18.2 · GPU 8.1 | 58.9–59.7 · 16.6–16.8 / 18.8–19.7 · GPU 10.7 | **Crashes** at 2.6 s |
+| **Pokémon Brilliant Diamond 1.3.0**, language menu (a fresh save) | 60 · 16.7 / 19.2–19.4 | 60 · 16.6–16.7 / 18.5–18.8 | 60 · 16.6–16.7 / 18.1–19.4 (2026-11-10, after problem 2's fix) |
+| Pokémon Brilliant Diamond, Eterna City (a save) | 60 · 16.6 / 18.1–18.2 · GPU 8.1 | 58.9–59.7 · 16.6–16.8 / 18.8–19.7 · GPU 10.7 | **14.9** · 66.8–66.9 / 72.8–73.2 · GPU 16.0–16.1 (2026-11-10, after problem 2's fix; problem 13) |
 | **Animal Crossing: New Horizons 3.0.3**, the new game's airport (a fresh save) | 30 · 33.3 / 34.7–35.4 · GPU 5.3 | 30 · 33.3 / 35.7–35.8 · GPU 7.1 | 30 · 33.4 / 36.5–36.7 · GPU 15.8 |
 | Animal Crossing, outside the player's house (a save) | 30 · 33.3–33.4 / 35.7–35.8 · GPU 9.4–9.7 | 29.9 · 33.3–33.4 / 38.0–38.1 · GPU 15.5–15.9 | Not measured: the game stops at its first save (see below) |
 | **Super Smash Bros. Ultimate 13.0.5**, boot with Android's Roboto as the shared font (fixed: problem 3) | **Crashes** 2–4 s in | **Crashes** | **Crashes** |
@@ -58,10 +58,14 @@ Numbered in the order they were found, so links to a number stay right:
    Kingdom. The decoder now asks for flexible YUV, which gets linear NV12, and a picture without readable planes is dropped rather than read: [Android:
    H.264 pictures in a buffer the CPU cannot read](../../docs/reference/movies.md#android-h264-pictures-in-a-buffer-the-cpu-cannot-read). Games whose movies are
    VP9 (Smash) take the software decoder and were not affected.
-2. **Brilliant Diamond crashes on the Retroid Pocket 5** in the Adreno 650 driver's shader compiler (`libllvm-qgl.so`, `addr=0x48`), while it builds its first
-   pipelines. The newer drivers of the other two take the same SPIR-V. Which shader it is is not known yet: nothing logs each pipeline as it is built.
-   Mesa's Turnip compiles them: with `DM_VK_DRIVER` and Mr. Purple's Turnip T30, the game reaches Eterna City on the Retroid Pocket 5 and draws it right, at
-   11.3 fps ([Another Vulkan driver](README.md#another-vulkan-driver-dm_vk_driver)).
+2. **Fixed: Brilliant Diamond crashed on the Retroid Pocket 5** in the Adreno 650 driver's shader compiler (`libllvm-qgl.so+0x2dcef0`, `addr=0x48`) on every
+   launch, as it built its first pipelines. The pipeline being built (vertex shader `f8d70797a143b99f`, fragment shader `b2f8ca02b9c1a06c`) is one of the 23 whose
+   fragment shader shuffles: Maxwell's `fwidth`, translated to `OpGroupNonUniformShuffle`, in a stage where this GPU runs no subgroup operations
+   (`subgroupSupportedStages` is compute alone; the Adreno 740 and 830 run them in fragment shaders too). With that shuffle made a copy of its own value, the
+   pipeline built and the crash moved to the next of the 23 (`74f249b01166d890`); with all 23 shuffles out, the game booted. Such modules are now rewritten as
+   they are made, the quad's lanes read through fine derivatives: [Subgroup operations rewritten for stages the GPU runs none in](../../docs/reference/rendering.md#subgroup-operations-rewritten-for-stages-the-gpu-runs-none-in).
+   The game boots and plays on the phone's own driver (2026-11-10): the language menu at 60 fps, Eterna City at 14.9 fps (problem 13). Mesa's Turnip compiled
+   the modules as they were (`DM_VK_DRIVER`, [Another Vulkan driver](README.md#another-vulkan-driver-dm_vk_driver)): Eterna City at 57.7–58.2 fps (GPU 8.8–9.2 ms) on the same build.
 3. **Fixed: Smash crashed at boot with Android's stock shared font.** The standard shared font was the device's Roboto, which has no TrueType hinting,
    and Smash's font engine needs a hinted font (`main+0x7caa0`, `addr=0x38`). The packer now copies a hinted TrueType font into each game's
    `font/standard.ttf` (Arial Unicode on a Mac, as the iPhone build does), and Smash boots on all three devices: [Android: the standard shared font must
@@ -133,6 +137,12 @@ Numbered in the order they were found, so links to a number stay right:
     replay's recording of about 616 draws 9.7 ms on the game's thread (`@nvn_ms`), a 9.0 ms `nvnSyncWait` on the GPU (`@sync_ms`), GPU 12.9 ms at 490
     MHz, the floor this device keeps (`min_pwrlevel` 3; 670 MHz at most), 44% busy. The wait and the work after it are in series, so a frame's work takes about
     24 ms, two vsyncs; 60 fps needs the recording cost or the GPU's time to come down by about a third, or the two to overlap. Not worked on yet.
+13. **Brilliant Diamond's Eterna City runs at 15 fps on the Retroid Pocket 5's own driver** (14.9 fps, frame p50 66.8–66.9 ms, GPU 16.0–16.1 ms; since problem 2's
+    fix), against 57.7–58.2 fps (GPU 8.8–9.2 ms) with Turnip on the same build, back to back. `NVN submit+present` is nearly all of the frame, and the completion
+    thread (`vk-done`) is on a CPU 78% of the time: simpleperf puts 70% of its samples on the loads of `wb_apply`'s compare of storage-buffer write-backs with their
+    snapshots (`chunk_done`) and 21% on `memcpy`. That is the symptom of [Storage buffer write-backs read from cached memory on Vulkan](../../docs/reference/rendering.md#storage-buffer-write-backs-read-from-cached-memory-on-vulkan),
+    though here the arena already takes the cached coherent type (type 4, flags `0xf`, of the types `0x11`): on this driver the CPU reads GPU-written memory slowly
+    anyway. Not worked on yet.
 
 ## Reading the numbers
 

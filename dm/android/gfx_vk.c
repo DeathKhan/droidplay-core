@@ -26,6 +26,7 @@
 #include "nvn_fmt_mtl.h"
 #include "gfx_vk.h"
 #include "spv_readonly.h"
+#include "spv_limits.h"
 #include "nvn_fstep.h"   // FSTEP_FIT: the performance hint's target (hint_frame)
 #include "nvn_queue.h"   // the queue scheduler (hle_nvn.c nvn_queue.inc): event publication and GPU progress
 #include <stdatomic.h>
@@ -40,6 +41,7 @@ static int vk_debug(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_DEBU
 static pthread_mutex_t g_bk = PTHREAD_MUTEX_INITIALIZER;   // the replay is one thread's at a time: submissions, CPU reads, texture lifetimes
 
 // ---------------- The device ----------------
+static uint32_t g_sg_stages = VK_SHADER_STAGE_ALL;   // the stages that run subgroup operations (subgroupSupportedStages; spv_limits.h); all when not known
 static VkPhysicalDeviceFeatures g_vk_feat; static int g_divisor;   // what the device was created with; VK_EXT_vertex_attribute_divisor   // what the device was created with
 static int g_fmt_list;   // VK_KHR_image_format_list enabled (vt_create)
 static void pb_dump(void);   // gfx_vk_draw.inc: the pipelines being built, for a crash dump
@@ -50,6 +52,7 @@ static vkb_ctx g_vk; static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT; static
 static int qr_used(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_QRESET_USED"); v = !(e && *e == '0'); } return v; }
 static int qr_host_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_HOST_QRESET"); v = !(e && *e == '0') && qr_used(); } return v; }
 static PFN_vkResetQueryPoolEXT g_qreset;   // vkResetQueryPoolEXT, through vkGetDeviceProcAddr (the instance is Vulkan 1.1, and the android-29 libvulkan.so stub has no vkResetQueryPool); NULL: no host resets
+static PFN_vkGetDeviceFaultInfoEXT g_fault_info;   // VK_EXT_device_fault enabled: what the driver says of a lost device (gpu_fault_log); NULL: not offered
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
 static void vk_create(void) {
     pthread_mutex_init(&g_vk.qmu, NULL);
@@ -66,6 +69,11 @@ static void vk_create(void) {
     uint32_t n = 1; VkResult r = vkEnumeratePhysicalDevices(g_vk.inst, &n, &g_vk.pd);
     if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || !n) { LOG("[RED] [vk] no GPU"); return; }
     vkGetPhysicalDeviceProperties(g_vk.pd, &g_vk.props); vkGetPhysicalDeviceMemoryProperties(g_vk.pd, &g_vk.mp);
+    if (VK_API_VERSION_MINOR(g_vk.props.apiVersion) >= 1 || VK_API_VERSION_MAJOR(g_vk.props.apiVersion) > 1) {
+        VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
+        vkGetPhysicalDeviceProperties2(g_vk.pd, &p2); g_sg_stages = sg.supportedStages;
+    }
     VkPhysicalDeviceFeatures f; vkGetPhysicalDeviceFeatures(g_vk.pd, &f);
     g_vk.has_bc = f.textureCompressionBC; g_vk.has_astc = f.textureCompressionASTC_LDR;
     uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_vk.pd, &nq, NULL);
@@ -74,7 +82,7 @@ static void vk_create(void) {
     if (g_vk.qf == nq) { LOG("[RED] [vk] no graphics queue"); return; }
     uint32_t nd = 0; vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, NULL);
     VkExtensionProperties *de = calloc(nd ? nd : 1, sizeof *de); vkEnumerateDeviceExtensionProperties(g_vk.pd, NULL, &nd, de);
-    const char *dext[5]; uint32_t nde = 0;
+    const char *dext[6]; uint32_t nde = 0;
     if (has_ext(de, nd, "VK_KHR_swapchain")) { dext[nde++] = "VK_KHR_swapchain"; g_vk.has_swapchain = 1; }
     int divisor = has_ext(de, nd, "VK_EXT_vertex_attribute_divisor");   // NVN vertex streams step per N instances (gfx_vk_draw.inc pipe_get)
     if (divisor) dext[nde++] = "VK_EXT_vertex_attribute_divisor";
@@ -84,6 +92,7 @@ static void vk_create(void) {
     // colour images name the formats they are viewed in (vt_create: Adreno's framebuffer compression); core only from Vulkan 1.2, and the instance asks for 1.1
     if ((g_fmt_list = has_ext(de, nd, "VK_KHR_image_format_list"))) dext[nde++] = "VK_KHR_image_format_list";
     int hqr = qr_host_env() && has_ext(de, nd, "VK_EXT_host_query_reset");   // the completion thread resets the queries a chunk used (Query resets below); core only from Vulkan 1.2
+    int dfault = has_ext(de, nd, "VK_EXT_device_fault");   // a lost device's faults: their kind and address (gpu_fault_log)
     free(de);
     VkPhysicalDeviceFeatures want = {.textureCompressionBC = f.textureCompressionBC, .textureCompressionASTC_LDR = f.textureCompressionASTC_LDR,
                                      .textureCompressionETC2 = f.textureCompressionETC2, .independentBlend = f.independentBlend, .geometryShader = f.geometryShader,
@@ -100,23 +109,27 @@ static void vk_create(void) {
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     VkPhysicalDeviceHostQueryResetFeaturesEXT hq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, .pNext = divisor ? &dv : NULL};
     VkPhysicalDeviceShaderDrawParametersFeatures dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hq : divisor ? (void *)&dv : NULL};
-    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &dp};
+    VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .pNext = &dp};
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = dfault ? (void *)&ff : (void *)&dp};
     if (VK_API_VERSION_MINOR(g_vk.props.apiVersion) >= 1 || VK_API_VERSION_MAJOR(g_vk.props.apiVersion) > 1) vkGetPhysicalDeviceFeatures2(g_vk.pd, &f2);
     hqr = hqr && hq.hostQueryReset;
     if (hqr) dext[nde++] = "VK_EXT_host_query_reset";
+    if ((dfault = dfault && ff.deviceFault)) dext[nde++] = "VK_EXT_device_fault";
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dve = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, .vertexAttributeInstanceRateDivisor = dv.vertexAttributeInstanceRateDivisor};
     VkPhysicalDeviceHostQueryResetFeaturesEXT hqe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, .pNext = divisor ? &dve : NULL, .hostQueryReset = VK_TRUE};
     VkPhysicalDeviceShaderDrawParametersFeatures dpe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, .pNext = hqr ? (void *)&hqe : divisor ? (void *)&dve : NULL, .shaderDrawParameters = dp.shaderDrawParameters};
     g_divisor = divisor && dv.vertexAttributeInstanceRateDivisor;
     if (!dp.shaderDrawParameters) LOG("[RED] [vk] no shaderDrawParameters: translated vertex shaders declare DrawParameters");
-    VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &dpe, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qc, .enabledExtensionCount = nde, .ppEnabledExtensionNames = dext,
+    VkPhysicalDeviceFaultFeaturesEXT ffe = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .pNext = &dpe, .deviceFault = VK_TRUE};
+    VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = dfault ? (void *)&ffe : (void *)&dpe, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qc, .enabledExtensionCount = nde, .ppEnabledExtensionNames = dext,
                              .pEnabledFeatures = &want};
     if (vkCreateDevice(g_vk.pd, &dc, NULL, &g_vk.dev) != VK_SUCCESS) { LOG("[RED] [vk] no Vulkan device"); return; }
     vkGetDeviceQueue(g_vk.dev, g_vk.qf, 0, &g_vk.q);
     if (hqr && !(g_qreset = (PFN_vkResetQueryPoolEXT)vkGetDeviceProcAddr(g_vk.dev, "vkResetQueryPoolEXT"))) LOG("[RED] [vk] VK_EXT_host_query_reset is enabled but vkResetQueryPoolEXT was not found");
+    if (dfault) g_fault_info = (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetDeviceFaultInfoEXT");
     LOG("[vk] query resets: %s", g_qreset ? "on the host, the queries each chunk used, once read (VK_EXT_host_query_reset)" : qr_used() ? "in the command buffer, the queries the chunk used last time"
                                                                                                                                      : "in the command buffer, every pool at every chunk begin (DM_VK_QRESET_USED=0)");
-    LOG("[vk] descriptor sets bound at once: %u, subgroup size / ops / stages: see vulkan probe", g_vk.props.limits.maxBoundDescriptorSets);
+    LOG("[vk] descriptor sets bound at once: %u, subgroup operations in stages %#x", g_vk.props.limits.maxBoundDescriptorSets, g_sg_stages);
     { void crash_set_gfx_hook(void (*)(void)); crash_set_gfx_hook(pb_dump); }   // a crash dump lists the pipelines being built (gfx_vk_draw.inc)
     LOG("[vk] %s (Vulkan %u.%u.%u): BC %s, ASTC %s", g_vk.props.deviceName, VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion),
         VK_API_VERSION_PATCH(g_vk.props.apiVersion), g_vk.has_bc ? "native" : "decoded on the CPU", g_vk.has_astc ? "native" : "missing");
@@ -165,6 +178,7 @@ typedef struct { int kind; uint64_t h; } dead_t;
 typedef struct { uint64_t src, dst, n; uint32_t value; int fill; } cop_t;   // a large buffer copy or fill, done by the completion thread in its place in the queue   // kind 1 image view, 2 framebuffer, 3 image, 4 device memory
 // One chunk's descriptor sets of one set layout (a shader's dsl or dsl_tf; gfx_vk_draw.inc ds_get): s[0, used) handed out while the chunk records, s[used, n) free again
 typedef struct ds_list { VkDescriptorSet *s; int n, used, cap; } ds_list;
+enum { CR_MAX = 160 };   // a chunk's breadcrumbs (crumb): its passes, draws (at most MID_DRAWS) and dispatches, the last 160 kept
 typedef struct chunk {
     VkCommandPool pool; VkCommandBuffer cb; VkFence fence; int open, busy, ts, ndraw, held; uint64_t seq, nvn_fence, hold;
     int qd, td, pd, sd;   // queries of qp / tq / pq written since their last reset, [0, n): reset in the command buffer when the chunk next begins; sd: its two g_tsq slots (Query resets below)
@@ -178,6 +192,7 @@ typedef struct chunk {
     VkDescriptorPool *dp; int ndp, cdp, dp_cur; VkBufferView *bv; int nbv, cbv;
     VkDescriptorSet *dsc; int ndsc, cdsc, dsc_used;   // the depth-stencil copies' sets (gfx_vk_dscopy.inc dsc_set): made from its pools, handed out again once it completes
     ds_list **dl; int ndl, cdl; ds_list **dt; int ndt, cdt; int nds;   // recycled descriptor sets (gfx_vk_draw.inc ds_get): the lists holding sets, those handed out from in this recording, the sets held
+    struct { const char *a, *b; uint32_t n, m; char kind; } cr[CR_MAX]; int ncr;   // what it recorded, the last CR_MAX of ncr (crumb): named when the GPU hangs or is lost in it (gpu_slow)
 } chunk;
 // Chunks in use (g_nchunk of NCHUNK_MAX): the one being recorded and those submitted, until the completion thread is done with them. With none free, cur() waits for the
 // oldest (the wait is in the GPU busy line: g_chunk_wait_ns). A submission is cut every 48-64 draws (EARLY_DRAWS, MID_DRAWS), so a game sends many a frame, and with four
@@ -189,6 +204,11 @@ enum { NCHUNK_MAX = 16, NCHUNK_DEF = 8 };
 static int g_nchunk = NCHUNK_DEF;   // set in chunks_init, before the first chunk is made
 static chunk g_ch[NCHUNK_MAX], *C;   // C: the chunk being recorded (NULL: none yet)
 static chunk *g_fifo[NCHUNK_MAX]; static int g_fifo_n;   // submitted, oldest first
+// a pass ('p': its size), draw ('d', 'D' indirect: vertex and fragment shader, vertices or indices, instances) or dispatch ('c', 'C' indirect: groups) the chunk recorded now made (gpu_slow)
+static void crumb(char kind, const char *a, const char *b, uint32_t n, uint32_t m) {
+    if (!C) return;
+    chunk *c = C; int i = c->ncr++ % CR_MAX; c->cr[i].kind = kind; c->cr[i].a = a; c->cr[i].b = b; c->cr[i].n = n; c->cr[i].m = m;
+}
 static _Atomic uint64_t g_chunk_wait_ns;   // the replay's time in cur() waiting for a free chunk
 static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_seq, g_seq_done; static _Atomic int g_inflight_wb, g_inflight_cop, g_inflight_fwd; static int g_drawing;   // g_drawing: a draw is being made (its resources are in C)
@@ -265,7 +285,7 @@ static chunk *cur(void) {   // the chunk being recorded: a free one is taken (wa
     uint64_t t0 = 0;
     for (;;) { for (int i = 0; i < g_nchunk && !C; i++) if (!g_ch[i].busy) C = &g_ch[i]; if (C) break; if (!t0) t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); pthread_cond_wait(&g_ccv, &g_cmu); }
     if (t0) atomic_fetch_add(&g_chunk_wait_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0);
-    C->busy = 1; C->seq = ++g_seq; C->nvn_fence = 0; C->ndraw = 0;
+    C->busy = 1; C->seq = ++g_seq; C->nvn_fence = 0; C->ndraw = 0; C->ncr = 0;
     pthread_mutex_unlock(&g_cmu);
     return C;
 }
@@ -425,6 +445,46 @@ static void dead_add(int kind, uint64_t h) {   // destroyed when the current chu
     C->dead[C->ndead++] = (dead_t){kind, h};
 }
 static uint64_t g_flushes;
+// ---------------- A GPU that hangs ----------------
+// A chunk the GPU could not finish: on a OnePlus Pad 3 (Adreno 830, Android 16) Breath of the Wild's first frames in the field each had one chunk that took 240-430 ms on the
+// GPU, the driver's hang recovery cutting it short (its fence signalled, its end timestamp never written), until one ran past the driver's 3 s, the device was lost
+// (vkQueueSubmit -4) and the loading screen stayed up for good, with nothing in the log to say where. The kernel's report (kgsl) needs root on a phone, and VK_EXT_device_fault
+// had nothing to say there (no address, no vendor record: a hang, not a page fault), so the log names what the chunk recorded instead (crumb): the GPU runs the chunks in
+// order, the one before had completed, and the chunk it was in is the first that took over GPU_SLOW_NS. Breath of the Wild's named one draw every time, once the
+// chunks were cut after every draw (a file vk_mid holding 1, mid_poll). At most 3 such chunks are logged, and the first lost fence or submission says what VK_EXT_device_fault gives
+enum { GPU_SLOW_NS = 200000000 };   // a chunk this long on the GPU (64 draws at most) is a hang or as good as one
+static void gpu_fault_log(VkResult r) {   // once, from whichever thread sees the loss first
+    static _Atomic int once; if (atomic_exchange(&once, 1)) return;
+    if (!g_fault_info) { LOG("[RED] [vk] the GPU was lost (%d); the driver offers no VK_EXT_device_fault to say why", r); return; }
+    VkDeviceFaultCountsEXT fc = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult q = g_fault_info(g_vk.dev, &fc, NULL);
+    if (q != VK_SUCCESS && q != VK_INCOMPLETE) { LOG("[RED] [vk] the GPU was lost (%d); vkGetDeviceFaultInfoEXT gave %d", r, q); return; }
+    VkDeviceFaultAddressInfoEXT ad[16]; VkDeviceFaultVendorInfoEXT vd[16];
+    if (fc.addressInfoCount > 16) fc.addressInfoCount = 16;
+    if (fc.vendorInfoCount > 16) fc.vendorInfoCount = 16;
+    fc.vendorBinarySize = 0;   // deviceFaultVendorBinary is not enabled
+    VkDeviceFaultInfoEXT fi = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = fc.addressInfoCount ? ad : NULL, .pVendorInfos = fc.vendorInfoCount ? vd : NULL};
+    q = g_fault_info(g_vk.dev, &fc, &fi);
+    LOG("[RED] [vk] the GPU was lost (%d): \"%s\", %u fault addresses, %u vendor records (VK_EXT_device_fault: %d)", r, fi.description, fc.addressInfoCount, fc.vendorInfoCount, q);
+    static const char *const kind[] = {"none", "a read of an invalid address", "a write to an invalid address", "execution at an invalid address", "instruction pointer, unknown",
+                                       "instruction pointer, invalid", "instruction pointer of the fault"};
+    for (uint32_t i = 0; i < fc.addressInfoCount; i++)
+        LOG("[vk]   fault: %s at %#llx (precision %#llx)", (unsigned)ad[i].addressType < 7 ? kind[ad[i].addressType] : "?", (unsigned long long)ad[i].reportedAddress, (unsigned long long)ad[i].addressPrecision);
+    for (uint32_t i = 0; i < fc.vendorInfoCount; i++)
+        LOG("[vk]   vendor: \"%s\", code %#llx, data %#llx", vd[i].description, (unsigned long long)vd[i].vendorFaultCode, (unsigned long long)vd[i].vendorFaultData);
+}
+// the completion thread: c took ns on the GPU, its fence gave fr; cut: its end timestamp was never written (the driver's hang recovery skipped the rest of it)
+static void gpu_slow(chunk *c, VkResult fr, uint64_t ns, int cut) {
+    if (fr != VK_SUCCESS) gpu_fault_log(fr);
+    static int nrep; if (nrep >= 3) return;
+    nrep++; int n = c->ncr < CR_MAX ? c->ncr : CR_MAX;
+    LOG("[RED] [vk] submission %llu took %.0f ms on the GPU%s%s (the one before had completed): it recorded %d passes, draws and dispatches, the last %d of them:", (unsigned long long)c->seq, ns / 1e6,
+        cut ? ", its end timestamp never written (the driver's hang recovery cut it short)" : "", fr == VK_ERROR_DEVICE_LOST ? ", and its fence reports the device lost" : "", c->ncr, n);
+    for (int k = 0; k < n; k++) { int i = (c->ncr - n + k) % CR_MAX; char kd = c->cr[i].kind; int at = c->ncr - n + k;
+        if (kd == 'p') LOG("[vk]   %d: pass %u x %u", at, c->cr[i].n, c->cr[i].m);
+        else if (kd == 'c' || kd == 'C') LOG("[vk]   %d: %sdispatch, compute %s, %u x %u groups", at, kd == 'C' ? "indirect " : "", c->cr[i].a, c->cr[i].n, c->cr[i].m);
+        else LOG("[vk]   %d: %sdraw, vertex %s fragment %s, %u vertices x %u instances", at, kd == 'D' ? "indirect " : "", c->cr[i].a, c->cr[i].b ? c->cr[i].b : "-", c->cr[i].n, c->cr[i].m); }
+}
 // Submit the current chunk (an empty one too: its fence then follows the earlier ones); nvn_fence: the NVN fence it completes. → its sequence number, 0 if none
 static uint64_t chunk_submit(uint64_t nvn_fence) {
     if (!C) return 0;
@@ -436,7 +496,7 @@ static uint64_t chunk_submit(uint64_t nvn_fence) {
     chunk *c = C; C = NULL;
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = rec ? 1u : 0u, .pCommandBuffers = &c->cb};
     pthread_mutex_lock(&g_vk.qmu); VkResult r = vkQueueSubmit(g_vk.q, 1, &si, c->fence); pthread_mutex_unlock(&g_vk.qmu);
-    if (r != VK_SUCCESS) { RED_ONCE(2, "vkQueueSubmit failed: %d", r); }
+    if (r != VK_SUCCESS) { RED_ONCE(2, "vkQueueSubmit failed: %d", r); if (r == VK_ERROR_DEVICE_LOST) gpu_fault_log(r); }
     g_flushes++;
     pthread_mutex_lock(&g_cmu);
     if (c->nwb) atomic_fetch_add(&g_inflight_wb, 1);
@@ -755,14 +815,18 @@ static void *chunk_thread(void *arg) {
     void dm_android_place_thread(int done); dm_android_place_thread(1);   // the placement experiment (DM_VK_PIN_DONE, DM_VK_UCLAMP_MIN), off by default
     for (;;) {
         pthread_mutex_lock(&g_cmu); while (!g_fifo_n) pthread_cond_wait(&g_ccv, &g_cmu); chunk *c = g_fifo[0]; pthread_mutex_unlock(&g_cmu);
+        uint64_t w0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         VkResult fr = vkWaitForFences(g_vk.dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
+        uint64_t waited = clock_gettime_nsec_np(CLOCK_MONOTONIC) - w0; int cut = 0;   // the chunk's time on the GPU (the one before had completed), at most (gpu_slow)
         int ts = c->ts, nq = c->nq, ntq = c->ntq, npq = c->npq;   // the queries it used, reset once read (qr_done): the counts are zeroed on the way
         c->t_end = 0; uint64_t busy = 0;
         if (c->ts) { uint64_t t[2]; c->ts = 0;
-            if (vkGetQueryPoolResults(g_vk.dev, g_tsq, 2 * (uint32_t)(c - g_ch), 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
+            VkResult tr = vkGetQueryPoolResults(g_vk.dev, g_tsq, 2 * (uint32_t)(c - g_ch), 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT); cut = tr == VK_NOT_READY && fr == VK_SUCCESS;
+            if (tr == VK_SUCCESS && t[1] > t[0])
                 { atomic_fetch_add(&g_gpu_ns, (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod)); atomic_fetch_add(&g_gpu_chunks, 1); c->t_end = t[1];
                   uint64_t s = t[1] > last && t[0] < last ? last : t[0];   // from the previous chunk's end when it started before it; an end at or before that one (the counter started again) counts the whole span
                   busy = (uint64_t)((double)(t[1] - s) * g_vk.props.limits.timestampPeriod); last = t[1]; } }
+        if (waited >= GPU_SLOW_NS || fr != VK_SUCCESS) gpu_slow(c, fr, waited, cut);
         int had_wb = c->nwb != 0, had_cop = c->ncop != 0, had_fwd = c->nfwd != 0;
         chunk_done(c); c->nwb = c->ncop = c->nfwd = 0;
         if (c->nvn_fence) { pthread_mutex_lock(&g_fmu); if (atomic_load(&g_done) < c->nvn_fence) atomic_store(&g_done, c->nvn_fence); pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu);
