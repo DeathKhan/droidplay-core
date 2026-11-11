@@ -36,12 +36,31 @@ static uint64_t g_ev_cap, g_ev_psi_scans; static int g_ev_level; static double g
 static nvn_hmap g_ev_store = {.klen = 8};   // the storage of evicted images not made again yet: the lookup that makes one again counts it (ev_made)
 static void ev_made(vtex *v) { uint64_t k = (uint64_t)(uintptr_t)v->store; if (k && g_ev_store.n && nvn_hm_del(&g_ev_store, &k)) g_ev_back++; }
 static int ev_clean(const vtex *v, uint64_t now, uint64_t age) { return v->img && ie_clean(v->gpu_w, v->pool_read, v->pkg, v->shared, v->filled, v->last_present, now, age); }
-static double ev_psi(void) {   // "some avg10" of /proc/pressure/memory; -1 when off or unreadable (said once: an app's SELinux domain may not read it)
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_IMAGE_EVICT_PSI"); on = !(e && *e == '0'); }
+static ssize_t ev_read(const char *path, char *b, size_t cap, int *er) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC); ssize_t n = fd >= 0 ? read(fd, b, cap - 1) : -1; *er = errno; if (fd >= 0) close(fd);
+    if (n >= 0) b[n] = 0;
+    return n;
+}
+// Where the pressure is read: the system's /proc/pressure/memory, else the process's own cgroup's memory.pressure (the same text; cgroup v2, "0::<path>" in /proc/self/cgroup),
+// as an app's SELinux domain may not read the first (the Galaxy Z Fold 8: Permission denied). The first one readable is kept; none: the ages alone (said once)
+static double ev_psi(void) {   // "some avg10" in percent; -1 when off or unreadable
+    static int on = -1; static char path[256]; char b[512]; int er = 0;
+    if (on < 0) { const char *e = getenv("DM_VK_IMAGE_EVICT_PSI"); on = !(e && *e == '0'); }
     if (!on) return -1;
-    int fd = open("/proc/pressure/memory", O_RDONLY | O_CLOEXEC); char b[256]; ssize_t n = fd >= 0 ? read(fd, b, sizeof b - 1) : -1; int er = errno; if (fd >= 0) close(fd);
-    if (n <= 0) { LOG("[vk] image eviction: /proc/pressure/memory not readable (%s): the ages alone", strerror(n < 0 ? er : EIO)); on = 0; return -1; }
-    b[n] = 0; return ie_psi_some10(b);
+    if (!path[0]) {
+        int er1 = 0, er2 = ENOENT; char cg[256] = "";
+        if (ev_read("/proc/pressure/memory", b, sizeof b, &er1) > 0) snprintf(path, sizeof path, "/proc/pressure/memory");
+        else {
+            char c[512]; const char *z = ev_read("/proc/self/cgroup", c, sizeof c, &er) > 0 ? strstr(c, "0::") : NULL;
+            if (z) { size_t l = strcspn(z + 3, "\n"); snprintf(cg, sizeof cg, "/sys/fs/cgroup%.*s/memory.pressure", (int)(l < 200 ? l : 200), z + 3);
+                     if (ev_read(cg, b, sizeof b, &er2) > 0) snprintf(path, sizeof path, "%s", cg); }
+        }
+        LOG("[vk] image eviction: memory pressure %s%s (/proc/pressure/memory: %s; the process's cgroup %s: %s)", path[0] ? "read from " : "not readable: the ages alone",
+            path, er1 ? strerror(er1) : "readable", cg[0] ? cg : "(none in /proc/self/cgroup)", path[0] && !strcmp(path, cg) ? "readable" : strerror(er2));
+        if (!path[0]) { on = 0; return -1; }
+    }
+    if (ev_read(path, b, sizeof b, &er) <= 0) return -1;
+    return ie_psi_some10(b);
 }
 static void ev_overwritten(uint64_t now, uint64_t age, uint8_t as) {   // the shared images another one over their storage overwrote (ie_sweep), marked as
     if (!g_share.n) return;
