@@ -1422,7 +1422,7 @@ static int rp_prepare_(int layered) {
     k.ncolor = (uint32_t)(R.rt.n > 8 ? 8 : R.rt.n);
     for (uint32_t i = 0; i < k.ncolor; i++) {
         if (!R.rt.color[i]) continue;
-        vtex *v = vt_get(R.rt.color[i]); if (!v) continue;
+        vtex *v = vt_get_w(R.rt.color[i]); if (!v) continue;
         const view_t *cv = R.rt.has_cview[i] ? &R.rt.cview[i] : NULL;
         uint32_t lv = cv && cv->set_levels ? cv->base_level : 0, ly = cv && cv->set_layers ? cv->min_layer : 0;
         vtex *sh = cv && cv->set_format ? bcrt_shadow(v, cv->format, lv, ly) : NULL;   // a BC texture written through a one-block-per-texel view (bcrt_shadow)
@@ -1446,7 +1446,7 @@ static int rp_prepare_(int layered) {
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1; if (lw < w) w = lw; if (lh < h) h = lh;
     }
     if (R.rt.depth) {
-        vtex *v = vt_get(R.rt.depth);
+        vtex *v = vt_get_w(R.rt.depth);
         if (v && v->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
             const view_t *dv = R.rt.has_dview ? &R.rt.dview : NULL;
             uint32_t lv = dv && dv->set_levels ? dv->base_level : 0, ly = dv && dv->set_layers ? dv->min_layer : 0;
@@ -2723,6 +2723,7 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
             const tc_ent *ce = tex_once() ? tc_el(tc, ci++, tid) : NULL; const treg_t *ri = ce ? (ce->r.ok ? &ce->r : NULL) : rg;   // as the textures above
             VkImageView iv = VK_NULL_HANDLE; vtex *v = !ri ? NULL : ce ? ce->v : vt_get(&ri->t);
             if (v && !(v->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !img_up(v, s->stage == SH_CS)) { g_bind_bad = 1; v = NULL; }   // made without storage use (vt_storage_up)
+            if (v) { v->gpu_w = 1; v->last_w = atomic_load(&g_presents); }   // an image slot: the shader may store to it (gfx_vk_evict.inc)
             if (v && s->upsq && !g_upsq_dst) g_upsq_dst = v;   // a listed upscaler's output (gfx_vk_upsq.inc)
             if (v) { iv = storage_view(v, ri->has_v ? &ri->v : NULL, vt, t->fmt); if (!iv) g_bind_bad = 1; }
             if (iv && v->fmt == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && s->stage == SH_CS) { if (t->binding < 64) g_e5_need |= 1ull << t->binding; else g_bind_bad = 1; }   // its pipeline packs RGB9E5 there (cpipe_e5)
@@ -3424,8 +3425,8 @@ static int is_int_fmt(VkFormat f) {
 // the view covers (1: one), 1 for a masked clear
 static int clear_rp_prepare(int slot, int full, uint32_t *nl) {
     vtex *v = NULL; const view_t *vw = NULL; *nl = 1;
-    if (slot >= 0 && slot < R.rt.n && R.rt.color[slot]) { v = vt_get(R.rt.color[slot]); vw = R.rt.has_cview[slot] ? &R.rt.cview[slot] : NULL; }
-    else if (slot < 0 && R.rt.depth) { v = vt_get(R.rt.depth); vw = R.rt.has_dview ? &R.rt.dview : NULL; }
+    if (slot >= 0 && slot < R.rt.n && R.rt.color[slot]) { v = vt_get_w(R.rt.color[slot]); vw = R.rt.has_cview[slot] ? &R.rt.cview[slot] : NULL; }
+    else if (slot < 0 && R.rt.depth) { v = vt_get_w(R.rt.depth); vw = R.rt.has_dview ? &R.rt.dview : NULL; }
     if (v && full) { uint32_t lv = vw && vw->set_levels ? vw->base_level : 0, ly = vw && vw->set_layers ? vw->min_layer : 0; if (lv < v->levels) *nl = rt_layers(v, vw, lv, ly); }
     return rp_prepare_(*nl > 1);
 }
