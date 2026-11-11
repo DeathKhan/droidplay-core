@@ -2,6 +2,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 // Clean: its content is still its storage's (a packaged texture, or a shared one filled from its storage when made), nothing on the GPU wrote it, the texture pool by
 // ID never read it (a view dropped from the pool set reads 0 until the sync after a draw reads its ID again), and no lookup for age presents
 static inline int ie_clean(int gpu_w, int pool_read, int pkg, int shared, int filled, uint64_t last_present, uint64_t now, uint64_t age) {
@@ -28,4 +29,33 @@ static inline void ie_sweep(ie_ent *e, uint32_t n, uint64_t now, uint64_t age, u
         if (ie_overwritten(&e[i], &e[j], now, age)) mark[i] = 1;
         if (ie_overwritten(&e[j], &e[i], now, age)) mark[j] = 1;
     }
+}
+// Memory pressure (Linux PSI, /proc/pressure/memory). Android's lmkd ends the foreground game by how long tasks stall on memory ("thrashing", "swap is low"), not by
+// how much RAM is free, and compressed swap keeps MemAvailable up while the game already stalls, so the ages above can be too slow. From IE_PSI_HOLD percent of the last
+// 10 s stalled, the images whose content a lookup makes again stop growing; from IE_PSI_SHRINK an eighth of the image memory goes at each scan, the least recently looked up
+// first; never under IE_FLOOR. The rule BananaNative's 483ce24a gives its texture cache (MIT), written anew for these ages
+#define IE_PSI_HOLD 5.0
+#define IE_PSI_SHRINK 15.0
+#define IE_FLOOR (512ull << 20)
+// "some avg10=" of /proc/pressure/memory's text, in percent; -1 when it isn't there
+static inline double ie_psi_some10(const char *buf) { const char *a = buf ? strstr(buf, "some avg10=") : NULL; return a ? strtod(a + 11, NULL) : -1; }
+static inline int ie_psi_level(double some10) { return some10 >= IE_PSI_SHRINK ? 2 : some10 >= IE_PSI_HOLD ? 1 : 0; }
+// The image bytes to get down to at a level, given what is alive: none (UINT64_MAX) without pressure; while holding, the least alive at any scan since the hold began
+// (*cap, kept between scans: images made since then go again); while shrinking, an eighth under what is alive (the hold continues from there); never under IE_FLOOR
+static inline uint64_t ie_target(int level, uint64_t live, uint64_t *cap) {
+    if (!level) { *cap = 0; return UINT64_MAX; }
+    if (level >= 2) *cap = live - live / 8;
+    else if (!*cap || live < *cap) *cap = live;
+    if (*cap < IE_FLOOR) *cap = IE_FLOOR;
+    return *cap;
+}
+// An image the pressure rule may take (its content made again by its next lookup, no lookup for a few presents): its last lookup, its bytes, the caller's pointer
+typedef struct { uint64_t last_present, bytes; void *p; } ie_cand;
+static inline int ie_cand_cmp(const void *x, const void *y) { const ie_cand *a = x, *b = y; return a->last_present != b->last_present ? (a->last_present < b->last_present ? -1 : 1) : 0; }
+// Sorts c by last lookup and marks the least recently looked up until need bytes are chosen (mark[i] for c[i] after the sort); returns the bytes chosen
+static inline uint64_t ie_pick(ie_cand *c, uint32_t n, uint64_t need, uint8_t *mark) {
+    qsort(c, n, sizeof *c, ie_cand_cmp);
+    uint64_t got = 0;
+    for (uint32_t i = 0; i < n; i++) { mark[i] = got < need; if (mark[i]) got += c[i].bytes; }
+    return got;
 }
