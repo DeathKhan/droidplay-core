@@ -65,7 +65,9 @@ static VkPipelineCache pcache(void) {
     if (g_pc_tried) return g_pc;
     g_pc_tried = 1;
     const char *env = getenv("DM_PIPELINE_CACHE"), *drv = vk_driver_name(), *path = NULL; void *data = NULL; long n = 0;
-    if (env && drv) snprintf(g_pc_path, sizeof g_pc_path, "%s.%s", env, drv); else if (env) snprintf(g_pc_path, sizeof g_pc_path, "%s", env);
+    // compiled with FPCR 0 (vk_fp_host): a cache file of its own, so the pipelines compiled under the game's flush-to-zero are not taken from the old one
+    const char *fz = vk_fp_host() ? ".fp0" : "";
+    if (env && drv) snprintf(g_pc_path, sizeof g_pc_path, "%s%s.%s", env, fz, drv); else if (env) snprintf(g_pc_path, sizeof g_pc_path, "%s%s", env, fz);
     if (env) path = g_pc_path;
     FILE *f = path ? fopen(path, "rb") : NULL;
     if (f) { fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET); data = malloc((size_t)n); if (!data || fread(data, 1, (size_t)n, f) != (size_t)n) n = 0; fclose(f); }
@@ -127,11 +129,14 @@ typedef struct {
     struct { uint32_t miss; struct lmod *m; } var[4]; int nvar;   // fragment shaders: variants with unwritten inputs made constants (ps_variant)
     int b0;   // a module of its set (.spv, .z.spv, .tf.spv; ps_variant only makes inputs private) reads binding 0, the support buffer (spv_b0_used): stage_set writes it only then
     int wlayer;   // a vertex, tessellation or geometry shader that writes the layer (spv_layer_out): its draws get every layer of their targets (rp_prepare)
+    struct { uint32_t miss; struct lmod *m; } avar[4]; int navar;   // alpha-test variants (ps_alpha_mod, spv_alpha.h) by the inputs variant; a NULL module: the transform does not apply
     ds_list *dsf;   // its descriptor sets kept by each chunk, [2 chunk + tf] (dsl, dsl_tf): made at its first set (ds_get), never freed (as the shader)
     uint32_t ndesc;   // descriptors in dsl, an array's counted up to 1024 (what stage_set writes of it): DM_VK_SET_STATS=1 checks each stage_set writes them all
     uint8_t dsbig;   // bit tf: one set of its layout (dsl, dsl_tf) does not fit an empty pool (sh_get ds_fits, else ds_alloc_n, RED 93): ds_get gives none for it, without making another pool
     uint8_t cbdyn[18], ndyn;   // set_reuse: cb[i] a dynamic uniform buffer, its offset at cbdyn[i] of the bind's (0xff: a plain one, its offset in the set); ndyn of them
     uint8_t pool;   // reads the texture pool by ID: its modules read the pool set (gfx_vk_pool.inc), which its pipelines' layouts take at POOL_SET
+    uint8_t gm;   // binds the raw pool table (a storage buffer under DMSH_GMEM_MAP_CB_SLOT): 1, 2 with the stores' write log too (gfx_vk_gmem.inc)
+    uint64_t e5[2]; void *cpe5[2];   // compute: sets of storage image bindings bound to E5B9G9R9 textures, and its pipeline for each with those packed (cpipe_e5, spv_e5.h)
 } vshader;
 // Descriptor sets bound again instead of written again (stage_set, sr_find). Every draw copies its constant buffers to new arena offsets, so a set holding those offsets
 // never matched the draw before, and stage_set wrote every set of every stage: Breath of the Wild about 7,500 a frame, vkUpdateDescriptorSets 3.4 ms a frame of the
@@ -361,19 +366,21 @@ done:
     return res;
 }
 // The module with each 32 lanes of a wider subgroup one warp (spv_wide.h), in *out (to free); 0 when it needs nothing: a subgroup of 32 lanes, a stage that runs
-// no subgroup operations (spv_limits'), or a module that uses none; 0 too for a stage spv_wide leaves (SPV_WIDE_STAGES: not fragment), which the log names once.
-// DM_SPV_WIDE=0 (env.txt): modules as translated
+// no subgroup operations (spv_limits'), or a module that uses none; 0 too for a stage spv_wide leaves (SPV_WIDE_STAGES: not fragment or compute), which the log
+// names once. DM_SPV_WIDE=0 (env.txt): modules as translated; DM_SPV_WIDE_CS=0: compute modules as translated
 static size_t spv_fit_wide(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_WIDE"); on = !(e && *e == '0'); }
+    static int on = -1, cs = 1;
+    if (on < 0) { const char *c = getenv("DM_SPV_WIDE_CS"); cs = !(c && *c == '0'); const char *e = getenv("DM_SPV_WIDE"); on = !(e && *e == '0'); }
     *out = NULL;
     uint32_t st = on && g_sg_size > 32 ? spv_wide_wanted(code, nw, g_sg_stages) : 0;
     if (!st) return 0;
-    if (!(st & SPV_WIDE_STAGES)) {   // a stage no device test covers yet: as translated, said once for each
+    if (!(st & SPV_WIDE_STAGES & (cs ? ~0u : ~0x20u))) {   // a stage no device test covers yet, or compute switched off: as translated, said once for each
         static _Atomic uint32_t told;
         if (!(atomic_fetch_or(&told, st) & st))
-            LOG("[RED] [vk] %s: a %s shader with Maxwell's 32-lane warp instructions on the GPU's %u-lane subgroups: spv_wide rewrites fragment shaders only, so it is "
-                "made as translated, and its lanes 32 and up may shuffle from or vote with the wrong lanes (said once for its stage)", what,
-                st == 0x20 ? "compute" : st == 0x40 ? "task" : st == 0x80 ? "mesh" : st == 0x8 ? "geometry" : st & 6 ? "tessellation" : "vertex", g_sg_size);
+            LOG("[RED] [vk] %s: a %s shader with Maxwell's 32-lane warp instructions on the GPU's %u-lane subgroups: %s, so it is made as translated, and its lanes "
+                "32 and up may shuffle from or vote with the wrong lanes (said once for its stage)", what,
+                st == 0x20 ? "compute" : st == 0x40 ? "task" : st == 0x80 ? "mesh" : st == 0x8 ? "geometry" : st & 6 ? "tessellation" : "vertex", g_sg_size,
+                st == 0x20 ? "DM_SPV_WIDE_CS=0 leaves compute shaders" : "spv_wide rewrites fragment and compute shaders only");
         return 0;
     }
     uint32_t *s = malloc(2 * (size_t)code[3] * 4), *o = NULL; size_t need = 0, k = 0; int got = 0;
@@ -414,13 +421,86 @@ static size_t spv_fit_narrow(const uint32_t *code, size_t nw, const char *what, 
         LOG("[RED] [vk] %s: a whole-warp reduction step past the GPU's %u-lane subgroup whose result spv_narrow does not follow: left as translated (its shuffle reads the lane's own value)", what, g_sg_size);
     *out = o; return k;
 }
+// The module with Maxwell's FMUL and FADD kept unfused (NoContraction), for a module of a stage that places vertices (spv_precise.h), in *out (to free); 0 when it
+// needs nothing (a fragment or compute shader, or nothing to mark). On every GPU: Maxwell rounds them apart, so the driver may not fuse them either, and two vertex
+// shaders that compute one position give one depth. DM_SPV_PRECISE=0 (env.txt): modules as translated, the driver contracting as it likes
+static size_t spv_fit_precise(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_PRECISE"); on = !(e && *e == '0'); }
+    *out = NULL;
+    if (!on || !spv_precise_wanted(code, nw)) return 0;
+    uint32_t *s = malloc(((size_t)code[3] + 31) / 32 * 4 + 4), *o = NULL; size_t need = 0, k = 0; int got = 0;
+    if (!s) return 0;
+    spv_precise(code, nw, s, NULL, 0, &need, &got);
+    if (need && (o = malloc(need * 4))) k = spv_precise(code, nw, s, o, need, &need, &got);
+    free(s);
+    if (!k) { free(o); return 0; }
+    static _Atomic int logged;
+    if (!atomic_exchange(&logged, 1))
+        LOG("[vk] vertex, tessellation and geometry shaders keep Maxwell's unfused FMUL and FADD (NoContraction), so a depth pre-pass and a later pass with another "
+            "vertex shader get the same depths (DM_SPV_PRECISE=0: the driver may fuse them). First: %s, %d", what, got);
+    if (vk_debug()) LOG("[vk] %s: %d results kept unfused", what, got);
+    *out = o; return k;
+}
+// The module with its layer and viewport output made ordinary outputs, on a GPU that has no such output from vertex shaders (spv_layer.h): no
+// VK_EXT_shader_viewport_index_layer, Vulkan 1.1. Its compiler crashed on them (the Adreno 730's driver V@0615.98). In *out (to free); 0 when it needs nothing.
+// DM_SPV_LAYER=0 (env.txt): modules as translated
+static size_t spv_fit_layer(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_LAYER"); on = !(e && *e == '0'); }
+    *out = NULL;
+    if (!on || g_layer_out || !spv_layer_wanted(code, nw)) return 0;
+    uint32_t *o = malloc(nw * 4); size_t k = o ? spv_layer(code, nw, o, nw) : 0;
+    static _Atomic int logged, nred;
+    if (!k) {
+        int parsed = o != NULL; free(o);
+        if (parsed && atomic_fetch_add(&nred, 1) < 8) LOG("[RED] [vk] %s declares layer or viewport output that spv_layer does not rewrite (a block member): made as it is, on a GPU without it", what);
+        return 0;
+    }
+    if (!atomic_exchange(&logged, 1))
+        LOG("[vk] the GPU has no layer or viewport output from vertex shaders (no VK_EXT_shader_viewport_index_layer, Vulkan 1.1): shaders that write them write an unused "
+            "output instead, and draw to layer 0 and viewport 0 (DM_SPV_LAYER=0: as translated). First: %s", what);
+    if (vk_debug()) LOG("[vk] %s: layer or viewport output rewritten as an ordinary output", what);
+    *out = o; return k;
+}
+// The module with its butterfly shuffles as ShuffleXor (spv_xor.h), in *out (to free); 0 when it needs nothing: a GPU spv_xor is not for, subgroups under 32 lanes
+// (spv_narrow rewrites those), a stage that runs no subgroup operations (spv_limits'), or no shuffle by the lane ID ^ a mask. For Qualcomm's own driver below
+// Vulkan 1.3 (its GPU name "Adreno (TM) ..."; Turnip's differs): the Adreno 730's (V@0615.98) returns garbage from the translator's Shuffle by the lane ^ the
+// mask in compute shaders, and ShuffleXor is right. The Adreno 740's and 830's drivers (Vulkan 1.3) run the shuffle as translated, which is left to them.
+// DM_SPV_XOR=1 (env.txt): on any GPU of 32 lanes or more (ShuffleXor is exact everywhere); =0: never
+static int xor_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_SPV_XOR");
+        int q = g_vk.props.vendorID == 0x5143 && !strncmp(g_vk.props.deviceName, "Adreno (TM)", 11) && g_vk.props.apiVersion < VK_API_VERSION_1_3;
+        v = e && *e == '0' ? 0 : e && *e == '1' ? 1 : q;
+    }
+    return v;
+}
+static size_t spv_fit_xor(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
+    *out = NULL;
+    if (g_sg_size < 32 || !xor_on() || !spv_xor_wanted(code, nw) || !spv_wide_wanted(code, nw, g_sg_stages)) return 0;
+    uint32_t *s = malloc(SPX_N * (size_t)code[3] * 4), *o = NULL; size_t need = 0, k = 0; int ns = 0;
+    if (!s) return 0;
+    spv_xor(code, nw, s, NULL, 0, &need, &ns);
+    if (need && (o = malloc(need * 4))) k = spv_xor(code, nw, s, o, need, &need, &ns);
+    free(s);
+    if (!k) { free(o); return 0; }
+    static _Atomic int logged;
+    if (!atomic_exchange(&logged, 1))
+        LOG("[vk] %s (Vulkan %u.%u): the translator's butterfly shuffles (Shuffle by the lane ^ a mask) are made ShuffleXor, which this driver runs right "
+            "(DM_SPV_XOR=0: as translated). First: %s, %d", g_vk.props.deviceName, VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion), what, ns);
+    if (vk_debug()) LOG("[vk] %s: %d butterfly shuffles made ShuffleXor", what, ns);
+    *out = o; return k;
+}
 // The module without subgroup operations in a stage where the GPU runs none (spv_limits.h), in *out (to free); 0 when it needs nothing. A GPU that runs them in
 // every graphics stage gets every module as translated, untouched; so does one that runs them in the module's stage. DM_SPV_LIMITS=0 (env.txt): modules as translated
 static size_t spv_fit(const uint32_t *code, size_t nw, const char *what, uint32_t **out) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_LIMITS"); on = !(e && *e == '0'); }
     *out = NULL;
-    size_t wk = spv_fit_wide(code, nw, what, out); if (wk) return wk;   // a stage that runs them: as wide as the GPU's subgroups
-    size_t nk = spv_fit_narrow(code, nw, what, out); if (nk) return nk;   // or as narrow
+    uint32_t *xo = NULL; size_t xk = spv_fit_xor(code, nw, what, &xo);   // first: spv_wide keeps its ShuffleXor
+    if (xk) { code = xo; nw = xk; }
+    size_t wk = spv_fit_wide(code, nw, what, out); if (wk) { free(xo); return wk; }   // a stage that runs them: as wide as the GPU's subgroups
+    size_t nk = spv_fit_narrow(code, nw, what, out); if (nk) { free(xo); return nk; }   // or as narrow
+    if (xk) { *out = xo; return xk; }   // a stage that runs them (spv_fit_xor's check), so nothing for spv_limits
     if (!on || (g_sg_stages & VK_SHADER_STAGE_ALL_GRAPHICS) == VK_SHADER_STAGE_ALL_GRAPHICS || !spv_lim_wanted(code, nw, g_sg_stages)) return 0;
     uint32_t *s = malloc(2 * (size_t)code[3] * 4), *o = NULL; size_t need = 0, k = 0; int got = 0;
     if (!s) return 0;
@@ -516,6 +596,7 @@ static vshader *sh_get(const char *key) {
     for (int i = 0; a && i < a->n && s->ncb < CB_MAX; i++) { rext[s->ncb] = (uint32_t)js_int(&a->kid[i], "ext", 0); s->cb[s->ncb++] = (rb_cbuf){js_int(&a->kid[i], "binding", 0), js_int(&a->kid[i], "slot", 0), 0}; }
     a = js_get(&r, "sbufs");
     for (int i = 0; a && i < a->n && s->nsb < 16; i++) { const jv *o = &a->kid[i]; s->sb[s->nsb++] = (rb_sbuf){js_int(o, "binding", 0), js_int(o, "slot", 0), js_int(o, "cb_slot", 0), js_int(o, "cb_offset", 0), js_int(o, "flags", 0)}; }
+    for (int i = 0; i < s->nsb; i++) if (s->sb[i].cb_slot == DMSH_GMEM_MAP_CB_SLOT) s->gm = s->gm > 1 || s->sb[i].cb_off == DMSH_GMEM_LOG_CB_OFFSET ? 2 : 1;
     rb_tex_read(js_get(&r, "textures"), s->tx, &s->ntx, 64); rb_tex_read(js_get(&r, "images"), s->im, &s->nim, 16);
     // the texture and sampler pools read by ID (handle 0x40000000, the arrays as long as the ID ranges) are the pool set's, not the stage's (spv_pool.h); the first such shader
     // starts the pool set, so a game without one never makes it
@@ -647,7 +728,7 @@ static uint8_t *gc_alloc(int cls, int *blk, VkDeviceSize *off) {
         if (g_gc_nblk && g_gc_blk[g_gc_nblk - 1].used + n <= GC_BLOCK) { gc_blk *b = &g_gc_blk[g_gc_nblk - 1]; *blk = g_gc_nblk - 1; *off = b->used; b->used += n; return b->p + *off; }
         if (g_gc_nblk < (int)(GC_BUDGET / GC_BLOCK)) {
             gc_blk *b = &g_gc_blk[g_gc_nblk]; memset(b, 0, sizeof *b);
-            VkBufferCreateInfo bc = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GC_BLOCK, .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+            VkBufferCreateInfo bc = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GC_BLOCK, .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};   // storage: sb_keep
             if (vkCreateBuffer(g_vk.dev, &bc, NULL, &b->b) != VK_SUCCESS) return NULL;
             VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, b->b, &mr);
             uint32_t mt = vkb_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -691,6 +772,19 @@ static gc_ent *gc_get(uintptr_t src, uint64_t n, uint64_t kind, uint64_t out_n, 
     return e;
 }
 static VkBuffer gc_buf(const gc_ent *e) { return g_gc_blk[e->blk].b; }
+// A storage buffer a shader only reads is kept the same way, as its raw bytes (kind 0, so a buffer also read as a vertex stream has one copy). It was copied into the arena once
+// in every chunk that read it and compared with its shadow (ucopy) at every other draw of the chunk: Super Smash Bros. Ultimate's battles read about 44 storage buffers a frame
+// (2.4 to 2.7 MB, tens of KB to hundreds each), the same bytes every frame, and copying and comparing them cost a Retroid Pocket 5's replay thread 29 µs a draw against 22 kept
+// (about 1.2 ms a frame). Its pending writes were dealt with before (draw_view lands them, sb_fwd binds a dispatch's on the GPU), and a write since the stamp, the game's or the
+// host's, sends it back to the copy as gc_get does. DM_VK_SB_KEEP=0 (env.txt): copied in every chunk, as before
+static uint64_t g_gc_sb;   // storage buffer bindings served from a kept copy (also counted in g_gc_hit)
+static int sb_keep_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SB_KEEP"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_SB_KEEP=0: read-only storage buffers are copied in every chunk"); } return v; }
+static int sb_keep(uint64_t addr, size_t n, VkBuffer *b, VkDeviceSize *off) {   // → 1 with *b / *off the kept copy (filled now when new); 0: copy it (ucopy)
+    if (!sb_keep_on()) return 0;
+    uint8_t *fill = NULL; gc_ent *e = gc_get((uintptr_t)addr, n, 0, n, &fill); if (!e) return 0;
+    if (fill) { size_t al = (n + 15) & ~(size_t)15; memcpy(fill, (const void *)(uintptr_t)addr, n); if (al > n) memset(fill + n, 0, al - n); }   // bound to the 16-byte range, as ucopy's
+    *b = gc_buf(e); *off = e->off; g_gc_sb++; return 1;
+}
 
 
 // ---------------- Bound state ----------------
@@ -704,7 +798,7 @@ static struct {
     int tex_base, samp_base; uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][6]; int has_vp; float dr[2]; int depth_clamp; float blend_color[4]; p_prim_restart restart;
     p_tf_bind tf[4]; uint64_t tf_off[4]; int tf_on, rast_discard;
-    uint8_t push[2][DMSH_PUSH_SIZE]; float alpha_ref;   // NVN2 push constants, graphics and compute blocks (read as c[DMSH_PUSH_BANK]); the alpha test's reference (no alpha test here yet)
+    uint8_t push[2][DMSH_PUSH_SIZE]; float alpha_ref;   // NVN2 push constants, graphics and compute blocks (read as c[DMSH_PUSH_BANK]); the alpha test's reference (spv_alpha.h)
 } D;
 static int g_d_init;
 // The pipeline key's state (vk_draw_) as the key takes it from D: the fields a blend or depth / stencil object sets, over zeroed bits (the bits they leave over are whatever
@@ -772,7 +866,7 @@ static int draw_state_op(uint32_t op, const void *a) {
                 int ch = 0;                                         // fields but alpha-to-coverage are not in the key)
                 switch (b->kind) {
                     case 0: { blend_st n, o; memcpy(&bs, b->bytes, sizeof bs); memset(&n, 0, sizeof n); memset(&o, 0, sizeof o); blend_k(&n, &bs); blend_k(&o, &D.blend[bs.target & 7]); ch = memcmp(&n, &o, sizeof n) != 0; break; }
-                    case 1: { color_st c; memcpy(&c, b->bytes, sizeof c); ch = c.blend_en != D.color.blend_en || c.logic_op != D.color.logic_op; break; }
+                    case 1: { color_st c; memcpy(&c, b->bytes, sizeof c); ch = c.blend_en != D.color.blend_en || c.logic_op != D.color.logic_op || c.alpha_func != D.color.alpha_func; break; }
                     case 2: ch = memcmp(&D.chmask, b->bytes, sizeof D.chmask) != 0; break;
                     case 3: { ms_st m; memcpy(&m, b->bytes, sizeof m); ch = m.a2c != D.ms.a2c; break; }
                     case 4: { poly_st p; memcpy(&p, b->bytes, sizeof p); ch = p.cull != D.poly.cull || p.front != D.poly.front || p.mode != D.poly.mode || p.offset_en != D.poly.offset_en; break; }
@@ -817,7 +911,7 @@ static int draw_state_op(uint32_t op, const void *a) {
             if (b->offset < DMSH_PUSH_SIZE && b->size <= DMSH_PUSH_SIZE - b->offset) memcpy(D.push[b->compute ? 1 : 0] + b->offset, b->data, b->size);
             else RED_ONCE(132, "push constants at %u, %u bytes, past the %u-byte block: dropped", b->offset, b->size, (unsigned)DMSH_PUSH_SIZE);
             return 1; }
-        case OP_ALPHA_REF: D.alpha_ref = ((const p_alpha_ref *)a)->ref; return 1;   // kept for an alpha test the replay does not do yet (the key's alpha_func is dropped too)
+        case OP_ALPHA_REF: D.alpha_ref = ((const p_alpha_ref *)a)->ref; return 1;   // the alpha test's reference: a push constant set at each draw (spv_alpha.h), not part of the key
         default: return 0;
     }
 }
@@ -856,6 +950,15 @@ make:
     if (swz) { cm.r = swz[0] < 6 ? S_[swz[0]] : cm.r; cm.g = swz[1] < 6 ? S_[swz[1]] : cm.g; cm.b = swz[2] < 6 ? S_[swz[2]] : cm.b; cm.a = swz[3] < 6 ? S_[swz[3]] : cm.a; }
     VkImageViewCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = v->img, .viewType = type, .format = k.fmt, .components = cm,
                                 .subresourceRange = {aspect, level, nlevels, layer, nlayers}};
+    // an image with STORAGE for views of another format (ext_store, vt_storage_up): a view would otherwise take the image's usage, and one in its own format would claim a
+    // storage use that format does not have. Each takes what its format supports, so the format (in the key) decides the usage
+    VkImageViewUsageCreateInfo vu = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    if (v->ext_store) {
+        VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, k.fmt, &fp); VkFormatFeatureFlags ff = fp.optimalTilingFeatures;
+        vu.usage = v->usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ? VK_IMAGE_USAGE_SAMPLED_BIT : 0) |
+                               (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0));
+        if (vu.usage) ic.pNext = &vu;
+    }
     if (vkCreateImageView(g_vk.dev, &ic, NULL, &iv) != VK_SUCCESS) { RED_ONCE(81, "image view of format %d type %d failed", v->fmt, type); return VK_NULL_HANDLE; }
     nvn_hm_put(&g_views, &k, iv);
     return iv;
@@ -921,6 +1024,7 @@ static VkImageViewType view_type_of(int st) {   // Ryujinx's SamplerType
     }
 }
 #include "gfx_vk_pool.inc"   // NVN2's texture and sampler pools read by ID: the pool set
+#include "gfx_vk_gmem.inc"   // raw global memory: the memory pools at device addresses and the raw pool table (DM_VK_RAW_GMEM)
 
 // ---------------- Render passes and framebuffers ----------------
 typedef struct { VkFormat color[8]; VkFormat depth; uint32_t ncolor, samples; } rp_key;
@@ -947,7 +1051,7 @@ static VkRenderPass rp_get(const rp_key *k) {
     nvn_hm_put(&g_rps, k, rp);
     return rp;
 }
-static struct { int active, layered; VkRenderPass rp; rp_key key; uint32_t w, h; VkFramebuffer fb; vtex *cv[8], *dv; uint32_t clv[8], cly[8];
+static struct { int active, layered; VkRenderPass rp; rp_key key; uint32_t w, h, layers; VkFramebuffer fb; vtex *cv[8], *dv; uint32_t clv[8], cly[8];
                 uint8_t *snap[8]; size_t snap_cap[8], snap_n[8]; uint8_t *snap_dst[8]; VkImage snap_img[8]; } P;   // snap: a linear target's guest bytes at rp_prepare (lsnap_take), until its write-back takes them
 static uint64_t g_passes;
 // DM_VK_DUMP=<frame>: every render pass of that frame (counted in presents from 1) has its colour targets copied out when it ends, written to
@@ -1064,8 +1168,11 @@ static void prof_write(void) {
 // (one depth plane of a 32×32×32 BC4 texture per pass). Vulkan has no such attachment: the BC image itself was attached, and every submission holding that pass stopped the
 // Adreno 740's command processor ("CP opcode error", three at every Breath of the Wild start, in the kernel log), and the kernel driver dropped each such submission whole,
 // with everything else recorded in it (uploads, other passes). The pass draws into a shadow of blocks × blocks in the view's
-// format instead; the level's (layer's or depth plane's) blocks are copied into it before the pass and back after it (vkCmdCopyImage: a block and a texel of one size)
+// format instead; the level's (layer's or depth plane's) blocks are copied into it before the pass and back after it (vkCmdCopyImage: a block and a texel of one size).
+// A BC texture the CPU decoded (no BC textures on the GPU) is shadowed too, for BC4 and BC5: the shadow keeps its blocks between passes, and after each pass they are
+// decoded into the image on the GPU (gfx_vk_bcdec.inc bcd_decode) instead of copied back
 typedef struct { VkImage base; uint32_t lv, ly; VkFormat f; } bcrt_key;
+static int bcd_takes(const vtex *b); static int bcd_decode(vtex *b, vtex *s, uint32_t lv, uint32_t ly);   // gfx_vk_bcdec.inc
 static nvn_hmap g_bcrt = {.klen = sizeof(bcrt_key)};
 static struct { vtex *base, *sh; uint32_t lv, ly; } g_bcrt_pend[8];   // the pass's shadowed attachments: copied back at rp_end
 static uint64_t g_bcrt_n;
@@ -1079,9 +1186,9 @@ static VkImageSubresourceLayers bcrt_sub(const vtex *b, uint32_t lv, uint32_t ly
 static VkOffset3D bcrt_off(const vtex *b, uint32_t ly) { return (VkOffset3D){0, 0, b->type == VK_IMAGE_TYPE_3D ? (int32_t)ly : 0}; }
 // the shadow of base's level lv, layer (or depth plane) ly, for an attachment view of NVN format nf: NULL when base is not BC or the view is not one block per texel
 static vtex *bcrt_shadow(vtex *b, uint32_t nf, uint32_t lv, uint32_t ly) {
-    int bb = bc_block_bytes(b->fmt); uint32_t m = 0; uint8_t sw[4];
-    if (!bb || b->conv || !nvn_fmt_to_mtl(nf, &m, sw) || !m) return NULL;
-    VkFormat f = vk_of_mtl(m); if (!f || fmt_bytes(f) != bb) return NULL;
+    int bb = bc_block_bytes(b->conv ? b->nvfmt : b->fmt); uint32_t m = 0; uint8_t sw[4];   // a decoded image's blocks: its NVN format's
+    if (!bb || !nvn_fmt_to_mtl(nf, &m, sw) || !m) return NULL;
+    VkFormat f = vk_of_mtl(m); if (!f || fmt_bytes(f) != bb || (b->conv && !bcd_takes(b))) return NULL;
     bcrt_key k; memset(&k, 0, sizeof k); k.base = b->img; k.lv = lv; k.ly = ly; k.f = f;
     vtex *s = nvn_hm_get(&g_bcrt, &k); if (s) return s;
     uint32_t lw = b->w >> lv ? b->w >> lv : 1, lh = b->h >> lv ? b->h >> lv : 1;
@@ -1158,7 +1265,10 @@ static void lin_writeback(int i) {   // attachment i of the pass that ends
 static void rp_end(void) {
     if (!P.active) return;
     occl_end(); prof_pass_end(); vkCmdEndRenderPass(C->cb); P.active = 0; if (dump_on()) dump_pass_end();
-    for (int i = 0; i < 8; i++) if (g_bcrt_pend[i].sh) { bcrt_copy(g_bcrt_pend[i].base, g_bcrt_pend[i].sh, g_bcrt_pend[i].lv, g_bcrt_pend[i].ly, 1); g_bcrt_pend[i].sh = NULL; }
+    for (int i = 0; i < 8; i++) if (g_bcrt_pend[i].sh) {
+        if (g_bcrt_pend[i].base->conv) bcd_decode(g_bcrt_pend[i].base, g_bcrt_pend[i].sh, g_bcrt_pend[i].lv, g_bcrt_pend[i].ly);   // decoded on the GPU into the image the game samples
+        else bcrt_copy(g_bcrt_pend[i].base, g_bcrt_pend[i].sh, g_bcrt_pend[i].lv, g_bcrt_pend[i].ly, 1);
+        g_bcrt_pend[i].sh = NULL; }
     if (linwb_on()) for (int i = 0; i < 8; i++) if (P.cv[i]) lin_writeback(i);
     lsnap_drop_all();   // what no write-back took
 }
@@ -1256,7 +1366,7 @@ static int rp_prepare_(int layered) {
         vtex *sh = cv && cv->set_format ? bcrt_shadow(v, cv->format, lv, ly) : NULL;   // a BC texture written through a one-block-per-texel view (bcrt_shadow)
         if (sh) {
             VkCommandBuffer c = cb(); if (!c) continue;
-            bcrt_copy(v, sh, lv, ly, 0);
+            if (!v->conv) bcrt_copy(v, sh, lv, ly, 0);   // a decoded image holds texels, not blocks: its shadow keeps the blocks its last pass drew
             VkImageView iv = view_get(sh, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT, NULL); if (!iv) continue;
             k.color[i] = sh->fmt; k.samples = sh->samples; cvw[i] = iv; nv++; P.cv[i] = sh; P.clv[i] = 0; P.cly[i] = 0; rt_note(sh);
             g_bcrt_pend[i].base = v; g_bcrt_pend[i].sh = sh; g_bcrt_pend[i].lv = lv; g_bcrt_pend[i].ly = ly;
@@ -1304,7 +1414,7 @@ static int rp_prepare_(int layered) {
         if (vkCreateFramebuffer(g_vk.dev, &fc, NULL, &fb) != VK_SUCCESS) { RED_ONCE(85, "framebuffer %ux%u failed", w, h); lsnap_drop_all(); return 0; }
         nvn_hm_put(&g_fbs, &fk, fb);
     }
-    P.rp = rp; P.key = k; P.w = w; P.h = h; P.fb = fb; P.layered = layered; if (layers > 1) g_layered_passes++;
+    P.rp = rp; P.key = k; P.w = w; P.h = h; P.layers = layers; P.fb = fb; P.layered = layered; if (layers > 1) g_layered_passes++;
     return 1;
 }
 static int rp_prepare(void) { return rp_prepare_(0); }
@@ -1323,8 +1433,8 @@ static void ds_chunk_done(chunk *c);
 static void draw_chunk_reset(chunk *c) {
     for (int i = 0; i < c->nar; i++) c->ar[i].used = 0; c->ar_cur = 0;
     if (ds_recycle()) ds_chunk_done(c);
-    else { for (int i = 0; i < c->ndp; i++) vkResetDescriptorPool(g_vk.dev, c->dp[i], 0); c->dp_cur = 0; c->ndsc = 0; }   // the reset freed the copies' sets too
-    c->dsc_used = 0;   // the depth-stencil copies' sets (gfx_vk_dscopy.inc), free again
+    else { for (int i = 0; i < c->ndp; i++) vkResetDescriptorPool(g_vk.dev, c->dp[i], 0); c->dp_cur = 0; c->ndsc = 0; c->nbcd = 0; }   // the reset freed the copies' and decodes' sets too
+    c->dsc_used = 0; c->bcd_used = 0;   // the depth-stencil copies' sets (gfx_vk_dscopy.inc) and the BC decodes' (gfx_vk_bcdec.inc), free again
     for (int i = 0; i < c->nbv; i++) vkDestroyBufferView(g_vk.dev, c->bv[i], NULL); c->nbv = 0;
 }
 
@@ -1449,8 +1559,41 @@ static const struct { const char *n; size_t o, s; } PK_F[] = {{"z", offsetof(pip
     {"topo", offsetof(pipe_key, topo), 1}, {"restart", offsetof(pipe_key, restart), 1}, {"depth_clamp", offsetof(pipe_key, depth_clamp), 1}, {"ll", offsetof(pipe_key, ll), 1},
     {"color", offsetof(pipe_key, color), sizeof(color_st)}, {"chmask", offsetof(pipe_key, chmask), sizeof(chmask_st)}, {"blend", offsetof(pipe_key, blend), sizeof(((pipe_key *)0)->blend)},
     {"ms", offsetof(pipe_key, ms), sizeof(ms_st)}, {"poly", offsetof(pipe_key, poly), sizeof(poly_st)}, {"ds", offsetof(pipe_key, ds), sizeof(ds_st)}};
-typedef struct { VkPipeline p; VkPipelineLayout pl; } pipe_t;
+typedef struct { VkPipeline p; VkPipelineLayout pl; int alpha; } pipe_t;   // alpha: the fragment module is spv_alpha.h's, and the draw sets its reference (a push constant)
 static nvn_hmap g_pipes = {.klen = sizeof(pipe_key)};
+static int is_int_fmt(VkFormat f);   // below: an integer colour format, which takes no alpha test (as in OpenGL)
+// Whether this draw runs NVN's alpha test: a fragment shader, a function other than ALWAYS, and no integer colour 0. A depth-only pass runs it too (shadow maps of
+// foliage rely on it, as on Metal): the test reads what the shader writes to colour 0 whether or not the pass keeps it
+static int alpha_test_on(const pipe_key *k) {
+    return k->sh[1] && !k->tf && k->color.alpha_func && k->color.alpha_func != NVN_ALPHA_FUNC_ALWAYS && !(k->ncolor && is_int_fmt(k->rk.color[0]));
+}
+// The fragment shader's module with the alpha test in it (spv_alpha.h): one per shader and inputs variant, its function set at each pipeline (VkSpecializationInfo,
+// SpecId 0) and the reference a push constant set at each alpha-tested draw, so one module serves every function and reference. A shader whose earlier stage
+// leaves inputs unwritten is transformed first (spv_drop_inputs), then the alpha test (lm_code). NULL: the transform does not apply (colour 0 is no vec4 of
+// float), the draw keeps the shader as it is, and that is remembered so no pipeline retries it
+static pthread_mutex_t g_alpha_mu = PTHREAD_MUTEX_INITIALIZER;   // one variant per shader and inputs variant, made here and in the prewarm thread (pipe_prep) outside the replay's lock
+static lmod *ps_alpha_mod_locked(vshader *s, uint32_t miss) {
+    for (int i = 0; i < s->navar; i++) if (s->avar[i].miss == miss) return s->avar[i].m;
+    char p[700]; snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key);
+    lmod *m = lm_new_a(p, miss, 1, NULL);   // the code goes through spv_alpha.h (lm_code), and its identifier is of the test in it
+    if (s->navar < 4) { s->avar[s->navar].miss = miss; s->avar[s->navar++].m = m; }
+    if (m) { static int nl; if (nl++ < 8) LOG("[vk] fragment shader %s: alpha-test variant (its function a specialization constant, the reference a push constant)", s->key); }
+    return m;
+}
+static lmod *ps_alpha_mod(vshader *s, uint32_t miss) {   // the cache and the module are one thread's at a time (pipeline creation, the prewarm thread)
+    pthread_mutex_lock(&g_alpha_mu);
+    lmod *m = ps_alpha_mod_locked(s, miss);
+    pthread_mutex_unlock(&g_alpha_mu);
+    return m;
+}
+// The fragment shader's module: the alpha-test variant (spv_alpha.h), and a variant when the earlier stage leaves inputs unwritten (spv_drop_inputs). *alpha is 1
+// when the alpha variant is the one returned; the caller sets the function's specialization then
+static lmod *pipe_ps_mod(const pipe_key *k, vshader *s, int *alpha) {
+    const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0;
+    *alpha = 0;
+    if (alpha_test_on(k)) { lmod *m = ps_alpha_mod(s, miss); if (m) { *alpha = 1; return m; } }
+    return miss ? ps_variant(s, miss) : s->mod;
+}
 // ---- Pipelines made again at start ----
 // Creating a pipeline costs the Adreno driver about 2 ms (a shader compile; less when its pipeline cache has the binary): Super Mario Bros. Wonder made 122 in one
 // frame entering a level (222 ms) and a few every time a new effect showed up. Every pipeline made is appended to <DM_PIPELINE_CACHE>.keys (its shaders' keys, the
@@ -1481,6 +1624,17 @@ static void pk_record(const pipe_key *k) {   // under g_bk
     if (!g_pk_out) { static int tried; if (tried++) return; g_pk_out = pk_open("ab"); if (!g_pk_out) return; }
     fwrite(r, PK_REC, 1, g_pk_out); fflush(g_pk_out);
 }
+// Whether each shader of a key is the stage of its slot (vk_draw__: vertex 0, fragment 1, geometry 2; slot 3 stays empty, as tessellation draws are skipped there). sh_get makes
+// every stage it does not draw (task, mesh, tessellation) SH_TS with the vertex stage bit, and a draw with one is skipped before it has a key; but the start-up list makes its
+// entries from their shader keys alone, and an entry a build that drew mesh shaders had written put Ocarina of Time's mesh shader 0c1ffecd02018fb0 in the vertex slot. Made as
+// a vertex stage, that module crashed the Adreno 830's compiler (libllvm-qgl.so) a few seconds into every start on a OnePlus Pad 3
+static const char *sh_stage_name(int st) { return st == SH_VS ? "vertex" : st == SH_PS ? "fragment" : st == SH_GS ? "geometry" : st == SH_CS ? "compute" : "task, mesh or tessellation"; }
+static const char *const PK_SLOT[4] = {"vertex", "fragment", "geometry", "fourth (unused)"};
+static int pk_stages_ok(const pipe_key *k, int *slot) {
+    static const int want[4] = {SH_VS, SH_PS, SH_GS, -1};
+    for (int i = 0; i < 4; i++) if (k->sh[i] && k->sh[i]->stage != want[i]) { *slot = i; return 0; }
+    return 1;
+}
 static pipe_t *pipe_get(const pipe_key *k);
 static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t *onva, VkPrimitiveTopology *otp);
 static void pipe_prep(const pipe_key *k);
@@ -1491,7 +1645,7 @@ static VkRenderPass rp_get(const rp_key *k);
 static void *prewarm_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-prewarm"); setpriority(PRIO_PROCESS, (id_t)gettid(), 10);
     FILE *f = pk_open("rb"); if (!f) return NULL;
-    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); int made = 0, had = 0, bad = 0, n = 0, rep = 0;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); int made = 0, had = 0, bad = 0, n = 0, rep = 0, wrong = 0;
     uint8_t *all = NULL; size_t cnt = 0, cap = 0, rec = PK_REC;
     pthread_mutex_lock(&g_bk); if (!g_pk_listed.klen) g_pk_listed.klen = PK_REC; pthread_mutex_unlock(&g_bk);
     for (;;) {
@@ -1521,6 +1675,10 @@ static void *prewarm_thread(void *arg) {
         pthread_mutex_lock(&g_bk);   // the shaders, the pass and what the pipeline shares (pipe_prep), under the lock; the compile without it
         pipe_key k; memset(&k, 0, sizeof k); int ok = 1, mk = 0;
         for (int j = 0; j < 4 && ok; j++) if (h.sh[j][0]) { h.sh[j][16] = 0; k.sh[j] = sh_get(h.sh[j]); if (!k.sh[j]) ok = 0; }
+        int slot; if (ok && !pk_stages_ok(&k, &slot)) {   // an entry the replay would never make for a draw (pk_stages_ok)
+            if (!wrong++) LOG("[RED] [vk] start-up list: an entry with %s shader %s in the %s slot is left out (the replay makes no such pipeline; a build that drew those shaders wrote it)",
+                              sh_stage_name(k.sh[slot]->stage), k.sh[slot]->key, PK_SLOT[slot]);
+            pthread_mutex_unlock(&g_bk); continue; }
         if (ok) { k.z = z; k.rk = rk; k.rp = rp_get(&rk); memcpy((uint8_t *)&k + pk_tail_off(), r + sizeof h + 4 + sizeof rk, PK_TAIL); if (!k.rp) ok = 0; }
         if (ok) { if (nvn_hm_get(&g_pipes, &k)) had++; else { pipe_prep(&k); mk = 1; } } else bad++;
         pthread_mutex_unlock(&g_bk);
@@ -1536,7 +1694,8 @@ static void *prewarm_thread(void *arg) {
         usleep(1000);
     }
     free(all);
-    LOG("[vk] pipelines made again from the list: %d made, %d there already, %d failed, of the first %zu of %d records (%d repeats dropped), in %.1f s", made, had, bad, cnt, n, rep, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e9);
+    LOG("[vk] pipelines made again from the list: %d made, %d there already, %d failed, %d left out (a shader in the wrong slot), of the first %zu of %d records (%d repeats dropped), in %.1f s",
+        made, had, bad, wrong, cnt, n, rep, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e9);
     // the cache was written only when the app paused: a session that ended otherwise (killed for an update or by the system) lost what the list compiled, and the next start
     // compiled it all again (Super Mario Bros. Wonder on the Adreno 619: about 23 ms a pipeline from the stale cache, 7 from a saved one)
     if (made) vkb_pipeline_cache_save();
@@ -1571,18 +1730,28 @@ static void pb_dump(void) {   // crash.c, on the crashing thread, after its back
 // The pipeline of key k into pp (its layout and pipeline). Under the replay's lock from pipe_get; the start-up list (prewarm_thread) calls it without the lock after pipe_prep,
 // so a compile there no longer holds the game's draws up (the driver's pipeline cache is internally synchronized)
 static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t *onva, VkPrimitiveTopology *otp) {
+    int slot; if (!pk_stages_ok(k, &slot)) {   // never handed to the driver (pk_stages_ok): a module of another stage in a slot crashed a compiler
+        RED_ONCE(178, "a pipeline with %s shader %s in its %s slot is not made (said once)", sh_stage_name(k->sh[slot]->stage), k->sh[slot]->key, PK_SLOT[slot]);
+        return VK_ERROR_INITIALIZATION_FAILED; }
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &g_empty_dsl); }
     VkDescriptorSetLayout sets[POOL_SET + 1] = {g_empty_dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl}; uint32_t nset = 1;
-    VkPipelineShaderStageCreateInfo st[4]; lmod *lms[4]; uint32_t ns = 0;
+    VkPipelineShaderStageCreateInfo st[4]; lmod *lms[4]; uint32_t ns = 0; VkSpecializationInfo psi; memset(&psi, 0, sizeof psi);
+    VkSpecializationMapEntry pme[1]; uint32_t psv = 0; const vshader *pspec = NULL;
     for (int i = 0; i < 4; i++) { vshader *s = k->sh[i]; if (!s) continue;
         sets[s->set & 3] = k->tf ? s->dsl_tf : s->dsl; if ((uint32_t)(s->set & 3) + 1 > nset) nset = (uint32_t)(s->set & 3) + 1;
         lmod *mod = k->tf ? s->modtf : s->stage == SH_VS && k->z && s->modz ? s->modz : s->mod;
-        if (s->stage == SH_PS) { const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0; if (miss) mod = ps_variant(s, miss); }   // see spv_drop_inputs
+        if (s->stage == SH_PS) { int alpha = 0; mod = pipe_ps_mod(k, s, &alpha);   // the alpha test (spv_alpha.h) and unwritten inputs (spv_drop_inputs)
+            if (alpha) {   // the variant's function, by SpecId (spv_alpha.h decorates it 0); the reference arrives in a push constant
+                pme[0] = (VkSpecializationMapEntry){0, 0, 4}; psv = k->color.alpha_func; psi = (VkSpecializationInfo){1, pme, 4, &psv}; pspec = s; } }
         if (!mod) return VK_ERROR_INITIALIZATION_FAILED;
-        lms[ns] = mod; st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .pName = "main"};   // its module: lm_pipeline
+        lms[ns] = mod; st[ns] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = s->vkstage, .pName = "main"};
+        if (s->stage == SH_PS && pspec == s) st[ns].pSpecializationInfo = &psi;
+        ns++;
         if (s->pool) { sets[POOL_SET] = g_pool_dsl; nset = POOL_SET + 1; } }
-    VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nset, .pSetLayouts = sets};
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4};   // the alpha test's reference (spv_alpha.h); unused by shaders that do not declare it
+    VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nset, .pSetLayouts = sets, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
     if (vkCreatePipelineLayout(g_vk.dev, &lc, NULL, &pp->pl) != VK_SUCCESS) return VK_ERROR_INITIALIZATION_FAILED;
+    pp->alpha = pspec != NULL;
     VkVertexInputBindingDescription vb[32]; VkVertexInputAttributeDescription va[16]; VkVertexInputBindingDivisorDescriptionEXT vd[32]; uint32_t nvd = 0; uint32_t nvb = 0, nva = 0; uint32_t used = 0;
     for (int i = 0; i < 16; i++) {
         va_st a; memcpy(&a, &k->attr[i], 4);
@@ -1648,13 +1817,9 @@ static VkResult pipe_make(const pipe_key *k, pipe_t *pp, uint32_t *ons, uint32_t
     *ons = ns; *onva = nva; *otp = tp;
     return pr;
 }
-static lmod *pipe_ps_mod(const pipe_key *k, vshader *s) {   // the fragment shader's module: a variant when the earlier stage leaves inputs unwritten (spv_drop_inputs)
-    const vshader *pv = k->sh[2] ? k->sh[2] : k->sh[0]; uint32_t miss = pv ? s->io_in & ~pv->io_out : 0;
-    return miss ? ps_variant(s, miss) : s->mod;
-}
 static void pipe_prep(const pipe_key *k) {   // under the lock: what pipe_make would otherwise create in shared state
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; vkCreateDescriptorSetLayout(g_vk.dev, &lc, NULL, &g_empty_dsl); }
-    for (int i = 0; i < 4; i++) if (k->sh[i] && k->sh[i]->stage == SH_PS && !k->tf) pipe_ps_mod(k, k->sh[i]);
+    for (int i = 0; i < 4; i++) if (k->sh[i] && k->sh[i]->stage == SH_PS && !k->tf) { int a; pipe_ps_mod(k, k->sh[i], &a); }
 }
 // ---------------- Pipelines met for the first time, built in the background ----------------
 // A pipeline met for the first time cost the driver's compile on the replay thread, which the game's frame waits for: 20 to 35 ms a graphics pipeline on an Adreno 830, and the
@@ -1851,11 +2016,17 @@ static const uint8_t c_bases[6] = {0x11, 0x51, 0x41, 0, 0, 0x31};   // c0 storag
 static uint32_t g_cdim[3];   // the current dispatch's group counts (c0 + 0x200 for compute)
 static void bank_c0(int nst, uint8_t *b, uint32_t base_inst) {
     memset(b, 0, 0x800);
-    if (nst == 5) { memcpy(b + 0x200, g_cdim, 12);   // compute: the group counts, then the uniform buffer table (0x210 + 16 r)
+    if (nst == 5) { memcpy(b + DMSH_C0_DISPATCH, g_cdim, 12);   // compute: the group counts, then the uniform buffer table (0x210 + 16 r)
+        // NVN2 compute also reads them at the start of the segment, as nvn_mtl.m's encode_args_ writes them: Ocarina of Time's fog takes its sample count from x · y · 32 · 32
+        // (21d9f83e6027c565), and at zero divided by it, which put NaN in the fog's froxel volumes and left Kokiri Forest black
+        if (dm_sdk_ounce()) memcpy(b + DMSH_C0_DISPATCH_NVN2, g_cdim, 12);
         for (int r = 0; r < 16; r++) { uint64_t a = D.ubo[5][r].addr; uint32_t n = (uint32_t)D.ubo[5][r].size; memcpy(b + 0x210 + 16 * r, &a, 8); memcpy(b + 0x218 + 16 * r, &n, 4); } }
     uint32_t o = (uint32_t)c_bases[nst] << 4;
     for (int r = 0; r < 16 && o && o + 16 * r + 12 <= 0x800; r++) { uint64_t a = D.ssbo[nst][r].addr; uint32_t n = (uint32_t)D.ssbo[nst][r].size; memcpy(b + o + 16 * r, &a, 8); memcpy(b + o + 16 * r + 8, &n, 4); }
     memcpy(b + 0x644, &base_inst, 4);
+    // graphics stages (task and mesh too): the largest point size, to which GLSLC clamps a shader-written gl_PointSize, as nvn_mtl.m writes it. At 0 every
+    // point sprite had size 0 (Super Mario Odyssey's fog splats on the Mac; Ocarina of Time draws five point-mesh programs)
+    if (nst != 5) { const float max_point = 2047.0f; memcpy(b + DMSH_C0_POINT_SIZE, &max_point, 4); }
 }
 // c2's layout, as nvn_mtl.m's C2_* and c2_handle: a 32-bit handle word every 8 bytes, the row's upper word 0; combined slots 0..40 from 0x20 (32..40 share the
 // image table: a bound image is what lies there; nvn_mtl.m tex_slot_h stops at 39, the image table's 8 slots), separate textures from 0x168, separate samplers from 0x568;
@@ -1952,6 +2123,24 @@ static int buf_fwd(uint64_t addr, uint64_t n, int write, VkDeviceSize al, VkBuff
 }
 static int sb_fwd(uint64_t addr, uint64_t n, int write, VkBuffer *b, VkDeviceSize *o) { return buf_fwd(addr, n, write, g_vk.props.limits.minStorageBufferOffsetAlignment, b, o); }
 static int tb_fwd(uint64_t addr, uint64_t n, int write, VkBuffer *b, VkDeviceSize *o) { return buf_fwd(addr, n, write, g_vk.props.limits.minTexelBufferOffsetAlignment, b, o); }
+// A shader that binds the same guest memory twice (Final Fantasy Resonance's Niagara argument shader 544e80ec57b3a10b: one 8 KB buffer as an R32ui image it
+// reads and as a format-less one it clears): on the Switch the two views are one buffer. When the draw or dispatch is the first in its chunk to write it, buf_fwd
+// finds no write-back to bind in place (it looks only at those from before the draw, g_fwd_nwb), so each binding got an arena copy and a write-back of its own:
+// a write through one view was not what the other read, and the two write-backs, with one snapshot, landed byte by byte over each other. A binding inside a
+// write-back this same draw or dispatch made is bound on that copy (wb_alias.h), with no copy or write-back of its own, and what both views wrote lands once.
+// DM_VK_ALIAS=0 (env.txt): each binding gets its own copy, as before (the A/B of this alone)
+static int alias_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_ALIAS"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_ALIAS=0: a shader's bindings of the same memory get copies of their own"); } return v; }
+static uint64_t g_alias;   // bindings bound on the copy of another binding of the same draw or dispatch (own_alias)
+static int own_alias(const char *key, uint64_t addr, uint64_t n, VkDeviceSize al, VkBuffer *b, VkDeviceSize *o) {
+    if (!C || !addr || !n || g_fwd_nwb < 0 || g_fwd_nwb > C->nwb || !alias_on()) return 0;
+    for (int i = C->nwb - 1; i >= g_fwd_nwb; i--) {   // this draw's or dispatch's own write-backs (g_fwd_nwb: the chunk's count when it began)
+        const wb_t *w = &C->wb[i]; uint64_t at;
+        if (!wb_alias_at(w->st < 0 || w->inpl, w->rows, (uintptr_t)w->dst, w->row_bytes, w->off, addr, n, al, &at)) continue;   // (in place: off is its offset in the pool piece, gfx_vk_gmem_inplace.inc)
+        if (!g_alias++) LOG("[vk] shader %s binds %#llx+%llu again: bound on the copy of its other binding (own_alias)", key, (unsigned long long)addr, (unsigned long long)n);
+        *b = w->inpl ? w->ipb : C->ar[-1 - w->st].b; *o = (VkDeviceSize)at; return 1;
+    }
+    return 0;
+}
 // the guest bytes tbuf_view copies of a buffer texture: its width in texels, cut to the GPU's limit, times the texel size; 0 when it copies none (the dummy is bound).
 // draw_view asks it for the range a draw reads, so it must cover at least what tbuf_view reads
 static size_t tbuf_bytes(const tex_t *t) {
@@ -1961,6 +2150,7 @@ static size_t tbuf_bytes(const tex_t *t) {
     if (n > g_vk.props.limits.maxTexelBufferElements) n = g_vk.props.limits.maxTexelBufferElements;
     return (size_t)n * (size_t)bpb;
 }
+static const char *g_alias_key = "";   // the shader stage_set binds, for own_alias's log
 static VkBufferView tbuf_view(const tex_t *t, int write, int cs) {   // cs: a dispatch binds it (a buffer image it writes may be bound in place, and its write-back is forwardable: buf_fwd)
     uint32_t m = 0; uint8_t swz[4];
     if (!t || t->d.target != NVN_TEXTURE_TARGET_BUFFER || !t->mem || !nvn_fmt_to_mtl(t->d.format, &m, swz) || !m) return VK_NULL_HANDLE;
@@ -1971,6 +2161,7 @@ static VkBufferView tbuf_view(const tex_t *t, int write, int cs) {   // cs: a di
     if (t->d.width > g_vk.props.limits.maxTexelBufferElements) RED_ONCE(102, "buffer texture of %u elements over the GPU's %u: cut", (unsigned)t->d.width, g_vk.props.limits.maxTexelBufferElements);
     VkBuffer b; VkDeviceSize off;
     if ((!write || cs) && tb_fwd((uint64_t)(uintptr_t)t->mem, bytes, write, &b, &off)) g_buf_fwd[write]++;   // on the GPU from a dispatch's pending write (buf_fwd)
+    else if (own_alias(g_alias_key, (uint64_t)(uintptr_t)t->mem, bytes, g_vk.props.limits.minTexelBufferOffsetAlignment, &b, &off)) {}   // a range another binding of this shader wrote
     else { uint8_t *d = ar_alloc(bytes, &b, &off); if (!d) return VK_NULL_HANDLE;
         int inpool = mtl_addr((uint64_t)(uintptr_t)t->mem, bytes, NULL, NULL);
         if (inpool) memcpy(d, t->mem, bytes); else { memset(d, 0, bytes); RED_ONCE(103, "buffer texture outside every memory pool: reads 0"); }
@@ -1982,7 +2173,7 @@ static VkBufferView tbuf_view(const tex_t *t, int write, int cs) {   // cs: a di
     C->bv[C->nbv++] = v;
     return v;
 }
-// a storage image view of a texture: its own image (created with storage usage for NVN_TEXTURE_FLAGS_IMAGE), at the view's level and layers
+// a storage image view of a texture: its own image (created with storage usage for NVN_TEXTURE_FLAGS_IMAGE, or given it when first bound to an image slot: vt_storage_up), at the view's level and layers
 // A storage view: the image is viewed in the format the shader declares (Vulkan needs them to match), which must have its texel size; Unknown takes the image's own.
 // 0 when it cannot be (the draw is then skipped: a wrong-format storage image is undefined, and can hang the GPU)
 // A texture view's own format (view_t set_format): the image viewed in it when it is mutable and the texel sizes match; 0 = the image's
@@ -1994,16 +2185,50 @@ static VkFormat view_format(const vtex *v, const view_t *vv) {
     // a BC image decoded on the CPU (vt_create) holds the decoder's texels: a BC view of it is read as what that view's format decodes to, so a view in the image's own
     // BC format is the image itself and its sRGB twin is the decoded format's twin
     if (v->conv && f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK) { int c, px; f = bc_target(f, &c, &px); }
+    if (v->conv == CONV_U16H || v->conv == CONV_S16H) { int c, px; VkFormat h = n16_twin(f, &c, &px); if (h) f = h; }   // a 16-bit normalized view of an image made as halves
     if (!f || f == v->fmt) return VK_FORMAT_UNDEFINED;
     if (v->fixed_fmt && f != srgb_twin(v->fmt)) { RED_ONCE(121, "texture view in format %d over an image of format %d, which lists only its own and its sRGB twin (DM_VK_UBWC=0 views it in any): read in the image's", f, v->fmt); return VK_FORMAT_UNDEFINED; }
     if (!v->mutable_ || !fmt_bytes(f) || fmt_bytes(f) != fmt_bytes(v->fmt)) { RED_ONCE(118, "texture view in format %d over an image of format %d: read in the image's", f, v->fmt); return VK_FORMAT_UNDEFINED; }
     return f;
 }
 static int g_bind_bad;   // set by stage_set when a binding has no valid descriptor: the draw / dispatch is skipped
+static uint64_t g_e5_need;   // compute: the storage image bindings stage_set bound to E5B9G9R9 textures (vk_dispatch takes cpipe_e5 for them)
+// An image slot's texture made without storage use takes it (vt_storage_up), unless it is a target of the pass a draw prepared (rp_prepare ran before stage_set): rp_start would
+// begin that pass's framebuffer, made on the image the upgrade replaces. A dispatch's copy ends the pass, and the next rp_prepare makes the targets' views again
+// DM_VK_STORAGE_UP (env.txt): 0 leaves such a texture as before (bound as it is, an sRGB one skipped). 1 (default) upgrades one whose own format the GPU stores to, and still
+// skips one that would be stored through its UNORM twin (sRGB): with that, Ocarina of Time's title runs its upscaler's compute, which on the Pad 3's Adreno 830 drew noise over the
+// whole picture and took the GPU from 24 to 108 ms a frame (DeathKhan's nx2android fork met the same and replaced the upscaler). 2: those too, through the twin
+static int st_up_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("DM_VK_STORAGE_UP"); m = e && *e >= '0' && *e <= '2' ? *e - '0' : 1; if (m != 1) LOG("[vk] DM_VK_STORAGE_UP=%d: %s", m, m ? "a texture bound to an image slot without storage use takes it, an sRGB one through its UNORM twin" : "a texture bound to an image slot without storage use is bound as it is"); } return m; }
+static int img_up(vtex *v, int compute) {
+    int m = st_up_mode(); if (!m) return 1;
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, v->fmt, &fp);
+    int e5 = v->fmt == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && e5_store_on();   // stored through an R32_UINT view (vt_storage_up, spv_e5.h)
+    if (e5 && !compute) { RED_ONCE(126, "texture ser=%llu %ux%u E5B9G9R9 is bound to an image slot of a draw: only compute shaders are rewritten to pack it (spv_e5.h), skipped", (unsigned long long)v->serial, v->w, v->h); return 0; }
+    if (m == 1 && !e5 && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {   // said once for each format: a later one, once hidden behind the first, can be another cause
+        static uint8_t told[256]; static int other; int f_ = (int)v->fmt;
+        if (f_ >= 0 && f_ < 256 ? !told[f_] : !other) { if (f_ >= 0 && f_ < 256) told[f_] = 1; else other = 1;
+            LOG("[RED] [vk] texture ser=%llu %ux%u format %d, made without storage use, is bound to an image slot in a format the GPU cannot store to: skipped (DM_VK_STORAGE_UP=2 stores an sRGB one through its UNORM twin; said once for each format)", (unsigned long long)v->serial, v->w, v->h, v->fmt); }
+        return 0; }
+    if (!compute) { int hit = P.dv == v; for (int i = 0; i < 8; i++) hit |= P.cv[i] == v;
+        if (hit) { RED_ONCE(124, "texture ser=%llu, made without storage use, is bound to an image slot of a draw that renders to it: skipped", (unsigned long long)v->serial); return 0; } }
+    return vt_storage_up(v);
+}
 static VkImageView storage_view(vtex *v, const view_t *vv, VkImageViewType vt, VkFormat decl) {
     VkFormat f = decl ? decl : v->fmt;
     if (f != v->fmt && (v->conv || !fmt_bytes(v->fmt) || fmt_bytes(v->fmt) != fmt_bytes(f))) { RED_ONCE(110, "image of format %d bound where the shader declares format %d: skipped", v->fmt, f); return VK_NULL_HANDLE; }
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, f, &fp);
+    // an sRGB format the GPU cannot store to is stored through its UNORM twin, texels as the shader writes them, as Maxwell's image stores do and the Mac's linear-twin
+    // views (nvn_mtl.m img_fit); the image takes STORAGE for such views (vt_storage_up). Only into an image that has it: with DM_VK_STORAGE_UP=0 an sRGB image without it was
+    // viewed through its twin all the same, an invalid storage view, and Ocarina of Time's title then ran its movie compositor at 8 fps instead of skipping it as before
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !v->conv && (v->usage & VK_IMAGE_USAGE_STORAGE_BIT) && srgb_twin(f)) {
+        VkFormatProperties tp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, srgb_twin(f), &tp);
+        if (tp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) { f = srgb_twin(f); fp = tp; }
+    }
+    // E5B9G9R9, which no GPU here stores to, through an R32_UINT view: the compute shader bound to it packs RGB9E5 (cpipe_e5, spv_e5.h)
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !v->conv && (v->usage & VK_IMAGE_USAGE_STORAGE_BIT) && f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && e5_store_on()) {
+        VkFormatProperties tp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, VK_FORMAT_R32_UINT, &tp);
+        if (tp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) { f = VK_FORMAT_R32_UINT; fp = tp; }
+    }
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) || v->conv) { RED_ONCE(104, "image format %d is not storage-capable here: skipped", f); return VK_NULL_HANDLE; }
     g_view_fmt = f == v->fmt ? VK_FORMAT_UNDEFINED : f;
     VkImageView iv = view_get(v, vt, vv && vv->set_levels ? vv->base_level : 0, 1, vv && vv->set_layers ? vv->min_layer : 0, vv && vv->set_layers ? vv->nlayers : 0, VK_IMAGE_ASPECT_COLOR_BIT, NULL);
@@ -2204,6 +2429,7 @@ static void sr_put(sr_ent *e, VkDescriptorSetLayout l, VkDescriptorSet set) {   
 // the same descriptors in this recording (sr_find), else one from the chunk (ds_get; tf: of dsl_tf) written here. dseq: the chunk recorded when the draw's first stage began
 // (C->seq after cur()): nothing is written or taken once another is recorded (ds_moved), and the caller tells that 0 from another failure by ds_moved
 static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, const prog_t *pr, int prog_stage, uint32_t base_inst, uint64_t dseq) {
+    g_alias_key = s->key;
     int nst = nvn_stage_of(s->stage);
     VkDescriptorSet set = VK_NULL_HANDLE; *pset = VK_NULL_HANDLE;   // the writes name their set once it is known (below)
     // one write per binding; every element of an array is written (an unwritten descriptor is undefined)
@@ -2262,6 +2488,10 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
         // where the address is (dmsh_build.py reflect): c0's storage buffer table of the stage, compute's uniform buffer table (c0 + 0x210 + 16 r: a uniform buffer read through
         // global memory), or the game's own uniform buffer (c3 + slot: {address, size} at the offset); cb_offset counts words
         const rb_sbuf *sb = &s->sb[i]; uint32_t off = 4u * (uint32_t)sb->cb_off, base = (uint32_t)c_bases[nst] << 4;
+        if (sb->cb_slot == DMSH_GMEM_MAP_CB_SLOT && gm_on()) {   // not a game buffer: the raw pool table or the stores' write log (gfx_vk_gmem.inc); off, 16 zero bytes as below
+            VkDeviceSize ao, rng; if (!gm_bind(sb->cb_off, &b, &ao, &rng)) return 0;
+            bi[nbi] = (VkDescriptorBufferInfo){b, ao, rng}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)sb->binding, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[nbi++], NULL};
+            continue; }
         p_bind_buf tmp = {0}; const p_bind_buf *u = NULL;
         if (sb->cb_slot == 0 && nst == 5 && off >= 0x210 && off < 0x310 && !((off - 0x210) % 16)) u = &D.ubo[5][(off - 0x210) / 16];
         else if (sb->cb_slot == 0 && base && off >= base && off - base < 0x100 && !((off - base) % 16)) u = &D.ssbo[nst][(off - base) / 16];
@@ -2273,10 +2503,18 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
         // faulted (Super Mario Bros. Wonder on Android: SIGSEGV in memcpy from stage_set); read as unbound, as copies and indirect arguments outside every pool are
         if (u && u->addr && !mtl_addr(u->addr, n, NULL, NULL)) { RED_ONCE(118, "storage buffer of shader %s at %#llx (%zu bytes) is in no memory pool: it reads 0", s->key, (unsigned long long)u->addr, n); u = NULL; n = 16; }
         if (!u || !u->addr) RED_ONCE(91, "storage buffer of shader %s (c%d +%#x) is not a bound buffer: it reads 0", s->key, sb->cb_slot, off);
-        VkDeviceSize ao;   // ao: the arena offset (off above is the c0 / uniform buffer word)
+        if (s->gm && gm_check_on() && u && u->addr) gm_check(s, sb->cb_slot, off, u->addr, n);   // DM_VK_RAW_GMEM_CHECK (gfx_vk_gmem.inc)
+        VkDeviceSize ao, ipr;   // ao: the arena offset (off above is the c0 / uniform buffer word); ipr: the range bound in place
         int wr_ = (sb->flags & 1) != 0;   // written by the shader
         if (u && u->addr && (!wr_ || s->stage == SH_CS) && sb_fwd(u->addr, n, wr_, &b, &ao)) g_buf_fwd[wr_]++;   // on the GPU from a dispatch's pending write (buf_fwd)
-        else if (u && u->addr && !wr_) { if (!ucopy((const void *)(uintptr_t)u->addr, n, (n + 15) & ~(size_t)15, &b, &ao)) return 0; }   // read only: shared as uniforms are
+        else if (u && u->addr && !wr_ && gm_inplace(u->addr, n, &b, &ao, &ipr)) {   // read only, in a placed pool: bound there (gfx_vk_gmem_inplace.inc)
+            bi[nbi] = (VkDescriptorBufferInfo){b, ao, ipr}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)sb->binding, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[nbi++], NULL};
+            continue; }
+        else if (u && u->addr && own_alias(s->key, u->addr, n, g_vk.props.limits.minStorageBufferOffsetAlignment, &b, &ao)) {}   // a range another binding of this shader wrote
+        else if (u && u->addr && !wr_) { if (!sb_keep(u->addr, n, &b, &ao) && !ucopy((const void *)(uintptr_t)u->addr, n, (n + 15) & ~(size_t)15, &b, &ao)) return 0; }   // read only: kept between frames (sb_keep), or shared as uniforms are
+        else if (u && u->addr && gm_inplace_w(u->addr, n, s->stage == SH_CS, &b, &ao, &ipr)) {   // written, in a placed pool: bound there, its write-back only a note (gfx_vk_gmem_inplace.inc)
+            bi[nbi] = (VkDescriptorBufferInfo){b, ao, ipr}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)sb->binding, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[nbi++], NULL};
+            continue; }
         else if (u && u->addr) { uint8_t *d = ar_alloc((n + 15) & ~(size_t)15, &b, &ao); if (!d) return 0; memcpy(d, (const void *)(uintptr_t)u->addr, n);
             if (sb->flags & 1) {   // written by the shader: what it changed is copied back when the chunk completes
                 wb_t *w = wb_add(); uint8_t *snap = malloc(n); if (snap) memcpy(snap, (const void *)(uintptr_t)u->addr, n);   // from guest memory, as d was: the arena may be write-combined (ar_mem_type)
@@ -2358,7 +2596,9 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
             if (tbuf) { VkBufferView v = rg ? tbuf_view(&rg->t, 1, s->stage == SH_CS) : VK_NULL_HANDLE; bvs[nbv + e] = v ? v : dummy_tbuf(); continue; }
             const tc_ent *ce = tex_once() ? tc_el(tc, ci++, tid) : NULL; const treg_t *ri = ce ? (ce->r.ok ? &ce->r : NULL) : rg;   // as the textures above
             VkImageView iv = VK_NULL_HANDLE; vtex *v = !ri ? NULL : ce ? ce->v : vt_get(&ri->t);
+            if (v && !(v->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !img_up(v, s->stage == SH_CS)) { g_bind_bad = 1; v = NULL; }   // made without storage use (vt_storage_up)
             if (v) { iv = storage_view(v, ri->has_v ? &ri->v : NULL, vt, t->fmt); if (!iv) g_bind_bad = 1; }
+            if (iv && v->fmt == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && s->stage == SH_CS) { if (t->binding < 64) g_e5_need |= 1ull << t->binding; else g_bind_bad = 1; }   // its pipeline packs RGB9E5 there (cpipe_e5)
             if (!iv) iv = dummy_storage(vt, t->fmt);
             if (!iv) g_bind_bad = 1;
             ii[nii + e] = (VkDescriptorImageInfo){VK_NULL_HANDLE, iv, VK_IMAGE_LAYOUT_GENERAL};
@@ -2394,8 +2634,8 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
 static int fwd_hit(chunk *c, int nwb, uintptr_t lo, uintptr_t hi, VkBuffer *b, VkDeviceSize *o, int *res) {
     for (int k = 0; k < c->ncop; k++) if (c->cop[k].dst < hi && lo < c->cop[k].dst + c->cop[k].n) { *res = 0; return 1; }
     for (int i = nwb - 1; i >= 0; i--) { const wb_t *w = &c->wb[i]; if (!wb_hits(w, lo, hi)) continue;
-        *res = w->fwd && w->st < 0 && w->rows == 1 && lo >= (uintptr_t)w->dst && hi <= (uintptr_t)w->dst + w->row_bytes;
-        if (*res) { *b = c->ar[-1 - w->st].b; *o = (VkDeviceSize)w->off + (VkDeviceSize)(lo - (uintptr_t)w->dst); }
+        *res = w->fwd && (w->st < 0 || w->inpl) && w->rows == 1 && lo >= (uintptr_t)w->dst && hi <= (uintptr_t)w->dst + w->row_bytes;   // (in place: read where it was written)
+        if (*res) { *b = w->inpl ? w->ipb : c->ar[-1 - w->st].b; *o = (VkDeviceSize)w->off + (VkDeviceSize)(lo - (uintptr_t)w->dst); }
         return 1; }
     return 0;
 }
@@ -2615,6 +2855,7 @@ static void dep_log(vshader *const sh[4], const rd_rng *r, const char *kd, const
 // such draw after one GPU write-back a round trip: Final Fantasy Resonance's opening reads buffer textures in most draws, ~100 syncs a frame, 15.5 fps on the Odin 2 and 10 on the Pad 3
 static void draw_view(vshader *const sh[4], const p_draw_idx *di, int vtx) {   // vtx: the vertex streams too (a draw; 0 for a dispatch)
     if (vk_safe()) { g_fwd_nwb = 0; cpu_view(); return; }
+    if (gm_view(sh)) { g_fwd_nwb = 0; return; }   // raw global memory reads anything at the GPU's time: with DM_VK_RAW_GMEM_SYNC=1 every pending write-back landed (gfx_vk_gmem.inc)
     rd_rng r[16 + 1 + 4 * 32 + 4 * 32]; char kd[16 + 1 + 4 * 32 + 4 * 32], K = 'v'; signed char ks[16 + 1 + 4 * 32 + 4 * 32], KS = -1; int n = 0, over = 0;
     #define RNG(a, s) do { uintptr_t a_ = (uintptr_t)(a); uint64_t s_ = (s); if (a_ && s_) { if (n < (int)(sizeof r / sizeof *r)) { kd[n] = K; ks[n] = KS; r[n++] = (rd_rng){a_, a_ + (uintptr_t)s_}; } else over = 1; } } while (0)
     #define FWD(f, a, s, w) do { VkBuffer fb_; VkDeviceSize fo_; int w_ = (w); if ((w_ && !cs) || !f((a), (s), w_, &fb_, &fo_)) RNG(a, s); } while (0)   // a dispatch's pending write: read on the GPU (buf_fwd)
@@ -2718,7 +2959,9 @@ static void pipe_key_build(pipe_key *k, int prim) {
       for (int s = 0; s < 16; s++) if (!(streams >> s & 1)) k->stream[s] = (vs_st){0, 0};
       for (uint32_t i = 0; i < 8; i++) if (i >= k->ncolor || !(k->color.blend_en >> i & 1)) memset(&k->blend[i], 0, sizeof k->blend[i]);
       if (k->ncolor < 8) k->chmask.mask &= (1u << (4 * k->ncolor)) - 1;
-      k->color.alpha_func = 0;
+      // the alpha test's function stays in the key while a test runs (a fragment shader and a float colour 0): its pipeline's fragment module is the
+      // alpha-test variant, made by the function and the reference (ps_alpha_mod, VkSpecializationInfo)
+      if (!(k->sh[1] && !k->tf && k->color.alpha_func && k->color.alpha_func != NVN_ALPHA_FUNC_ALWAYS && !(k->ncolor && is_int_fmt(k->rk.color[0])))) k->color.alpha_func = 0;
       if (k->ncolor < 8) k->color.blend_en &= (1u << k->ncolor) - 1;   // enables of targets the pass does not have, and which of the three polygon offsets is on (the pipeline
       k->poly.offset_en = k->poly.offset_en != 0;                       // takes one depth-bias switch): 186,825 keys listed after a few sessions of Super Mario Bros. Wonder
       if (k->color.logic_op != NVN_LOGIC_OP_COPY && !g_vk_feat.logicOp) k->color.logic_op = NVN_LOGIC_OP_COPY;   // drawn as copy anyway (pipe_make)
@@ -2793,6 +3036,7 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     VkCommandBuffer c = C->cb;
     occl_begin();
     bf_pipeline(c, pp->p);   // binds the command buffer already holds are left out (bf_*)
+    if (pp->alpha) vkCmdPushConstants(c, pp->pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof D.alpha_ref, &D.alpha_ref);   // the alpha test's reference, data rather than a key (spv_alpha.h)
     for (int i = 0; i < 4; i++) if (k.sh[i]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(k.sh[i]->set & 3), 1, &sets[i], k.sh[i]->ndyn, dyn[i]);
     if (pool && !pool_bind(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl)) { g_drop[3]++; return 0; }
     // dynamic state: the viewport (see the file header for the origin), the scissor, stencil, blend constants, depth bias
@@ -2815,6 +3059,10 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
     { float db[3] = {D.po.units, g_vk_feat.depthBiasClamp ? D.po.clamp : 0, D.po.factor}; if (!bf_same(c, BF_DB, g_bf.db, db, sizeof db)) vkCmdSetDepthBias(c, db[0], db[1], db[2]); }
     // indices: copied, quads made triangles; vertex range for the vertex data copy
     int64_t vlo = 0, vhi = 0; uint32_t count = dw ? (uint32_t)dw->count : (uint32_t)di->count, inst = (uint32_t)(dw ? dw->instances : di->instances); if (!inst) inst = 1;
+    // More instances than any Switch game draws (2^24): the GPU would work through them until the driver's hang recovery cut the submission short, and the game drew no
+    // frame after. Final Fantasy Resonance's first field on the Adreno 730 asks 1 to 3.8 billion of one quad every frame, its own count (not found yet). A mitigation
+    if (inst > (1u << 24)) { RED_ONCE(177, "a draw of %u instances (%#x) skipped, shaders %s %s, %u %s: more than any Switch game draws; the GPU would run it until its hang "
+                                    "recovery (said once; every such draw is skipped)", inst, inst, k.sh[0] ? k.sh[0]->key : "-", k.sh[1] ? k.sh[1]->key : "-", count, di ? "indices" : "vertices"); return 1; }
     int quads = prim == 7, qstrip = prim == 8; VkBuffer ib = VK_NULL_HANDLE; VkDeviceSize ioff = 0; uint32_t icount = count; int i32 = 0;
     if (di) {
         int isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4; const uint8_t *src = (const uint8_t *)(uintptr_t)di->ibuf; uint32_t mx = 0, mn = UINT32_MAX;
@@ -2892,9 +3140,26 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
 typedef struct { VkPipeline p; VkPipelineLayout pl; } cpipe_t;
 static nvn_hmap g_cpipes = {.klen = 8};
 static uint64_t g_dispatches;
+static cpipe_t *cpipe_make(vshader *s, cpipe_t *cp, lmod **mod);
 static cpipe_t *cpipe_get(vshader *s) {
     cpipe_t *cp = nvn_hm_get(&g_cpipes, &s); if (cp) return cp->p ? cp : NULL;
     cp = calloc(1, sizeof *cp); nvn_hm_put(&g_cpipes, &s, cp);
+    return cpipe_make(s, cp, &s->mod);
+}
+// The compute pipeline whose storage images at the bindings of mask are E5B9G9R9 textures bound through R32_UINT views (stage_set's g_e5_need): its module packs RGB9E5 there
+// (spv_e5.h). Same layout as cpipe_get's, so the set stage_set wrote binds to it. Kept per shader for two sets of bindings (Ocarina of Time's a335c1db6270c355 always binds
+// one), so a shader alternating between them makes no pipeline again; a third set is refused, its dispatches skipped with a red line. NULL: it cannot be (red in lm_code)
+static cpipe_t *cpipe_e5(vshader *s, uint64_t mask) {
+    for (int i = 0; i < 2; i++) if (s->cpe5[i] && s->e5[i] == mask) { cpipe_t *cp = s->cpe5[i]; return cp->p ? cp : NULL; }
+    int slot = !s->cpe5[0] ? 0 : !s->cpe5[1] ? 1 : -1;
+    if (slot < 0) { RED_ONCE(127, "compute shader %s binds E5B9G9R9 textures at a third set of image bindings (%#llx): its pipelines are kept for two, so this dispatch is skipped", s->key, (unsigned long long)mask); return NULL; }
+    char p[700]; snprintf(p, sizeof p, "%s/%s.spv", g_spv_dir, s->key);
+    lmod *m = lm_new_e(p, 0, 0, mask, NULL);
+    cpipe_t *cp = calloc(1, sizeof *cp); if (!cp) return NULL;
+    s->cpe5[slot] = cp; s->e5[slot] = mask; if (!m) return NULL;   // kept with no pipeline: not tried again
+    return cpipe_make(s, cp, &m);
+}
+static cpipe_t *cpipe_make(vshader *s, cpipe_t *cp, lmod **mod) {
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo ec = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; vkCreateDescriptorSetLayout(g_vk.dev, &ec, NULL, &g_empty_dsl); }
     VkDescriptorSetLayout sl[POOL_SET + 1] = {s->dsl, g_empty_dsl, g_empty_dsl, g_empty_dsl, g_pool_dsl};   // the pool set after empty ones (gfx_vk_pool.inc)
     VkPipelineLayoutCreateInfo lc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = s->pool ? POOL_SET + 1 : 1, .pSetLayouts = sl};
@@ -2902,7 +3167,7 @@ static cpipe_t *cpipe_get(vshader *s) {
     VkComputePipelineCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = cp->pl,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main"}};   // its module: lm_pipeline
     const char *pbk[4] = {s->key, NULL, NULL, NULL}; int pb = pb_begin('c', pbk, 0, 0, 0, 0);
-    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); VkResult pr = lm_pipeline(NULL, &pc, &pc.stage, &s->mod, 1, &cp->p);
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); VkResult pr = lm_pipeline(NULL, &pc, &pc.stage, mod, 1, &cp->p);
     pb_end(pb);
     atomic_fetch_add(&g_cpso_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_cpso_made, 1);
     if (pr != VK_SUCCESS) { static int n; if (n++ < 16) LOG("[RED] [vk] compute pipeline of shader %s failed", s->key); cp->p = VK_NULL_HANDLE; return NULL; }
@@ -2942,11 +3207,12 @@ static int vk_dispatch(const p_dispatch *dp) {
     memcpy(g_cdim, g, sizeof g_cdim);
     VkDescriptorSet set; int ok; uint32_t dyn[18];
     for (int t = 0;; t++) {   // t 1: the set taken again from the chunk recorded now when a sync inside stage_set closed the one it came from (ds_moved)
-        g_bind_bad = 0; if (!cur()) return 0; uint64_t dseq = C->seq; int got = stage_set(s, 0, &set, dyn, pr, pst, 0, dseq); ok = got && !g_bind_bad;
+        g_bind_bad = 0; g_e5_need = 0; if (!cur()) return 0; uint64_t dseq = C->seq; int got = stage_set(s, 0, &set, dyn, pr, pst, 0, dseq); ok = got && !g_bind_bad;
         if (got || !ds_moved(dseq)) break;
         if (ds_again(t, 2)) return 0;
     }
     if (!ok) return 0;
+    if (g_e5_need) { cpipe_t *ce = cpipe_e5(s, g_e5_need); if (!ce) return 0; cp = ce; }   // E5B9G9R9 storage images: the pipeline that packs RGB9E5 into their R32_UINT views
     VkCommandBuffer c = cb(); if (!c) return 0;
     cb_barrier();
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p);
@@ -3013,21 +3279,44 @@ static VkPipeline clear_pipe(const cpk_t *k) {
 static int is_int_fmt(VkFormat f) {
     VkClearColorValue t = clear_value(f, (const float[4]){1.5f, 0, 0, 0}); return t.uint32[0] == 1;   // clear_value converts only for integer formats
 }
-static int clear_in_pass(const vtex *v, unsigned level, int depth) {
-    if (!rp_prepare() || (depth && !P.key.depth)) return 0;
+// The pass a clear of colour slot `slot` (-1: the depth target) is made in: a layered one when the target's view covers more than one layer or slice, as a layered draw
+// gets, so the clear reaches all of them in either order, clear then draw or draw then clear (as nvn_mtl.m clears a view of more layers than its pass in a pass of its
+// own: rendering.md, "Clears of layered render targets in a pass that is not layered"). In a pass of one layer, a clear before the first layered draw cleared slice 0
+// alone, and that draw reopened the pass layered and loaded the other slices as they were. full: the clear writes every channel / stencil bit, so it can be a rect of every
+// layer (clear_rect_layers); a masked clear is a draw of layer 0 whatever the pass, so it asks for no layered pass, which would only end the open one. → *nl: the layers
+// the view covers (1: one), 1 for a masked clear
+static int clear_rp_prepare(int slot, int full, uint32_t *nl) {
+    vtex *v = NULL; const view_t *vw = NULL; *nl = 1;
+    if (slot >= 0 && slot < R.rt.n && R.rt.color[slot]) { v = vt_get(R.rt.color[slot]); vw = R.rt.has_cview[slot] ? &R.rt.cview[slot] : NULL; }
+    else if (slot < 0 && R.rt.depth) { v = vt_get(R.rt.depth); vw = R.rt.has_dview ? &R.rt.dview : NULL; }
+    if (v && full) { uint32_t lv = vw && vw->set_levels ? vw->base_level : 0, ly = vw && vw->set_layers ? vw->min_layer : 0; if (lv < v->levels) *nl = rt_layers(v, vw, lv, ly); }
+    return rp_prepare_(*nl > 1);
+}
+// A full clear in the bound targets' pass when its target is the pass's size and the pass has every layer its view covers; else (DM_VK_LAYERED=0, or a pass whose other
+// targets have fewer layers) the clear is made outside the pass, on the whole view (gfx_vk.c clear_color, clear_ds)
+static int clear_in_pass(const vtex *v, int slot, unsigned level, int depth) {
+    uint32_t nl; if (!clear_rp_prepare(slot, 1, &nl) || (depth && !P.key.depth) || (nl > 1 && P.layers < nl)) return 0;
     return (v->w >> level ? v->w >> level : 1) == P.w && (v->h >> level ? v->h >> level : 1) == P.h;
 }
+// A clear in the pass covers every layer of its framebuffer (clear_rp_prepare above makes it layered for a view of several): NVN clears the whole bound target, and in a layered pass (a 3D or array target attached whole for a draw
+// that writes the layer, rp_prepare) a rect of layer 0 alone left the other slices with what earlier frames drew. A full clear of a 3D target is in the pass whenever its
+// size matches (its one array layer: gfx_vk.c clear_color), so a volume drawn slice by slice and cleared each frame was cleared at slice 0 only: Final Fantasy Resonance
+// adds its lights into 32x32x32 volumes with additive blending, and in shirai91/nx2android's replay the fog boxes that read them changed every frame on its first road
+// (37c76f613 there). The masked clears below are a draw of layer 0, which a layered pass cannot widen without a layer-writing shader: a red line says when one meets it
+static VkClearRect clear_rect_layers(VkRect2D r) { return (VkClearRect){r, 0, P.layers ? P.layers : 1}; }
 // A colour clear of target idx limited by the scissor and / or a channel mask (gfx_vk.c clear_color takes the full ones)
 static void clear_color_pass(const p_clear_color *cc) {
     bf_reset();   // its pipeline and dynamic state are set behind the bind filter (bf_*)
-    if (!rp_prepare() || !rp_start()) return;
+    uint32_t nl; if (!clear_rp_prepare(cc->index, (cc->mask & 0xf) == 0xf, &nl) || !rp_start()) return;
     VkRect2D r = clear_rect(); if (!r.extent.width || !r.extent.height) return;
     int ci = dup_slot(cc->index); VkFormat f = P.key.color[ci];
+    if (nl > 1 && P.layers < nl) RED_ONCE(172, "clear of colour slot %d in a pass of %u layers, its view %u: the layers past the pass are not cleared", cc->index, P.layers, nl);
     if ((cc->mask & 0xf) == 0xf) {
         VkClearAttachment at = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)ci, {.color = clear_value(f, cc->rgba)}};
-        VkClearRect cr = {r, 0, 1}; vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
+        VkClearRect cr = clear_rect_layers(r); vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
     }
     if (is_int_fmt(f)) { RED_ONCE(109, "masked clear of an integer target (format %d): not done", f); return; }
+    if (P.layers > 1) RED_ONCE(171, "masked clear in a layered pass of %u layers: layer 0 alone is cleared", P.layers);
     cpk_t k; memset(&k, 0, sizeof k); k.rp = P.rp; k.ncolor = P.key.ncolor; k.idx = (uint32_t)ci; k.mask = (uint32_t)cc->mask & 0xf; k.samples = P.key.samples;
     VkPipeline p = clear_pipe(&k); if (!p) return;
     float pc[5] = {cc->rgba[0], cc->rgba[1], cc->rgba[2], cc->rgba[3], 0};
@@ -3038,13 +3327,15 @@ static void clear_color_pass(const p_clear_color *cc) {
 // A depth-stencil clear limited by the scissor and / or a partial stencil mask
 static void clear_ds_pass(const p_clear_ds *cd, VkImageAspectFlags a) {
     bf_reset();   // as clear_color_pass
-    if (!rp_prepare() || !rp_start() || !P.key.depth) return;
+    uint32_t nl; if (!clear_rp_prepare(-1, !(a & VK_IMAGE_ASPECT_STENCIL_BIT) || (cd->stencil_mask & 0xff) == 0xff, &nl) || !rp_start() || !P.key.depth) return;
+    if (nl > 1 && P.layers < nl) RED_ONCE(172, "depth-stencil clear in a pass of %u layers, its view %u: the layers past the pass are not cleared", P.layers, nl);
     VkRect2D r = clear_rect(); if (!r.extent.width || !r.extent.height) return;
     uint32_t sm = (uint32_t)cd->stencil_mask & 0xff;
     if (!(a & VK_IMAGE_ASPECT_STENCIL_BIT) || sm == 0xff) {
         VkClearAttachment at = {a, 0, {.depthStencil = {cd->depth, (uint32_t)cd->stencil}}};
-        VkClearRect cr = {r, 0, 1}; vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
+        VkClearRect cr = clear_rect_layers(r); vkCmdClearAttachments(C->cb, 1, &at, 1, &cr); return;
     }
+    if (P.layers > 1) RED_ONCE(171, "masked clear in a layered pass of %u layers: layer 0 alone is cleared", P.layers);
     cpk_t k; memset(&k, 0, sizeof k); k.rp = P.rp; k.ncolor = P.key.ncolor; k.idx = 99; k.samples = P.key.samples; k.stencil_mask = sm; k.depth = (a & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
     VkPipeline p = clear_pipe(&k); if (!p) return;
     float pc[5] = {0, 0, 0, 0, cd->depth};

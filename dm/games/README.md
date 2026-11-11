@@ -135,12 +135,14 @@ One row per profile; the notes are each profile's `README.md`.
 | [Paper Mario: The Origami King](0100A3900C3E2000/README.md) | `0100A3900C3E2000` | 1.0.1 | 8.3.1 | Intelligent Systems' engine on NintendoWare | NVN |
 | [Paper Mario: The Thousand-Year Door](0100ECD018EBE000/README.md) | `0100ECD018EBE000` | 1.0.1 | 15.3.2 | Intelligent Systems' engine on NintendoWare | NVN |
 | [Patrick's Parabox](0100E44016C22000/README.md) | `0100E44016C22000` | 1.0.1 | 13.3.7 | Unity 2020.3.30f1 IL2CPP | NVN |
+| [Persona 3 Portable](0100DCD01525A000/README.md) | `0100DCD01525A000` | 1.0.2 | 14.3.0 | Atlus in-house (CRI middleware) | NVN |
 | [Persona 4 Golden](010062B01525C000/README.md) | `010062B01525C000` | 1.0.2 | 14.3.0 | Atlus in-house (CRI middleware) | NVN |
 | [Persona 5 Royal](01005CA01580E000/README.md) | `01005CA01580E000` | 1.0.2 | 13.3.2 | Atlus GFD / Needle (CRI middleware) | NVN |
 | [Pikmin 4](0100B7C00933A000/README.md) | `0100B7C00933A000` | 1.1.1 | 10.4.8 | Unreal Engine 4.26.2 | NVN |
 | [Pokémon Brilliant Diamond](0100000011D90000/README.md) | `0100000011D90000` | 1.3.0 | 11.4.3 | Unity 2019.4.27f1 IL2CPP | NVN |
 | [Pokémon Legends: Arceus](01001F5010DFA000/README.md) | `01001F5010DFA000` | 1.1.1 | 11.4.0 | Game Freak's engine (between Sword's and Trinity) | NVN |
 | [Pokémon Legends: Z-A](0100F43008C44000/README.md) | `0100F43008C44000` | 2.0.2 | 19.3.11 | Game Freak's Trinity engine | NVN |
+| [Pokémon: Let's Go, Pikachu!](010003F003A34000/README.md) | `010003F003A34000` | 1.0.0 (base) | 5.4.150 | Game Freak's engine (before Sword's) | NVN |
 | [Pokémon Pokopia](0400A3A01EE4C000/README.md) | `0400A3A01EE4C000` | v655360 (Switch 2) | 20.5.25 (Ounce) | Koei Tecmo's KTGL | NVN2 |
 | [Pokémon Scarlet](0100A3D008C5C000/README.md) | `0100A3D008C5C000` | 1.0.0 | 13.3.5 | Game Freak's Trinity engine | NVN |
 | [Pokémon Shield](01008DB008C2C000/README.md) | `01008DB008C2C000` | 1.3.2 | 7.3.2 | Game Freak's engine (before Trinity) | NVN |

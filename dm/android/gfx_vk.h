@@ -18,11 +18,12 @@
     X(vkCreateAndroidSurfaceKHR) X(vkCreateBuffer) X(vkCreateBufferView) X(vkCreateCommandPool) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) \
     X(vkCreateDescriptorSetLayout) X(vkCreateDevice) X(vkCreateFence) X(vkCreateFramebuffer) X(vkCreateGraphicsPipelines) X(vkCreateImage) \
     X(vkCreateImageView) X(vkCreatePipelineCache) X(vkCreatePipelineLayout) X(vkCreateQueryPool) X(vkCreateRenderPass) X(vkCreateSampler) \
-    X(vkCreateSemaphore) X(vkCreateShaderModule) X(vkCreateSwapchainKHR) X(vkDestroyBuffer) X(vkDestroyBufferView) X(vkDestroyFramebuffer) \
-    X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyPipeline) X(vkDestroyPipelineLayout) X(vkDestroyShaderModule) X(vkDestroySurfaceKHR) X(vkDestroySwapchainKHR) \
+    X(vkCreateSemaphore) X(vkCreateShaderModule) X(vkCreateSwapchainKHR) X(vkDestroyBuffer) X(vkDestroyBufferView) X(vkDestroyCommandPool) X(vkDestroyDescriptorPool) \
+    X(vkDestroyDescriptorSetLayout) X(vkDestroyFence) X(vkDestroyFramebuffer) X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyPipeline) X(vkDestroyPipelineLayout) \
+    X(vkDestroyShaderModule) X(vkDestroySurfaceKHR) X(vkDestroySwapchainKHR) \
     X(vkDeviceWaitIdle) X(vkEndCommandBuffer) X(vkEnumerateDeviceExtensionProperties) X(vkEnumeratePhysicalDevices) X(vkFlushMappedMemoryRanges) X(vkFreeMemory) \
     X(vkGetBufferMemoryRequirements) X(vkGetDeviceProcAddr) X(vkGetDeviceQueue) X(vkGetImageMemoryRequirements) X(vkGetPhysicalDeviceFeatures) \
-    X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceProperties) \
+    X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPipelineCacheData) X(vkGetQueryPoolResults) X(vkGetSwapchainImagesKHR) X(vkInvalidateMappedMemoryRanges) X(vkMapMemory) X(vkQueuePresentKHR) \
     X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkResetCommandPool) X(vkResetDescriptorPool) X(vkResetFences) X(vkUnmapMemory) X(vkUpdateDescriptorSets) \
@@ -37,18 +38,21 @@ void vk_driver_dirs(const char *ext, const char *internal);
 int vk_driver_load(void);
 void vk_driver_instance(VkInstance inst);
 const char *vk_driver_name(void);
+int vk_fp_host(void);   // vk_driver.c: the driver's compiles run with FPCR 0 (DM_VK_FP_HOST); the pipeline cache's file is named for it
 
 typedef struct {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qf;
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mp;
     int has_bc, has_astc, has_surface, has_swapchain;
+    int has_display_timing;   // VK_GOOGLE_display_timing enabled: frames start on the display's vsyncs and are shown at a given time (gfx_vk_vsync.inc)
     pthread_mutex_t qmu;   // every vkQueueSubmit / vkQueuePresentKHR / vkQueueWaitIdle on q
 } vkb_ctx;
 vkb_ctx *vkb(void);        // made at first use; NULL when the device has no usable Vulkan
 
 // The window texture the game presented last (NVN QueuePresentTexture), for the front end to draw: always in VK_IMAGE_LAYOUT_GENERAL.
 // vkb_frame_lock holds it (the texture is not destroyed meanwhile) until vkb_frame_unlock; 0 = no frame yet
-typedef struct { VkImage img; VkFormat fmt; uint32_t w, h; int crop[4]; uint64_t n; int flip; } vkb_frame;   // flip: stored bottom-up (NVN's lower-left window origin), shown flipped
+typedef struct { VkImage img; VkFormat fmt; uint32_t w, h; int crop[4]; uint64_t n; int flip; uint64_t show_at; } vkb_frame;   // flip: stored bottom-up (NVN's lower-left window origin), shown flipped;
+                                                                                                                      // show_at: when to show it (CLOCK_MONOTONIC ns, 0 = as soon as drawn; gfx_vk_vsync.inc)
 int vkb_frame_lock(vkb_frame *f);
 void vkb_pipeline_cache_save(void);   // the driver's compiled pipelines to DM_PIPELINE_CACHE, when they grew (the app paused or stopped)
 void vkb_frame_unlock(void);
