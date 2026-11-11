@@ -96,6 +96,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** Ocarina of Time (Switch 2) on an Ayn Odin 3 (the fork's measurements: frame time p50 33.3 ms instead of 50, back to hold 2 within 22 frames of a heavier moment), and Tears of the Kingdom on a Legion Y700 (one probe instead of 27 in 66 s).
 - **Check:** `make -C dm/gfx/tests GAME=01007EF00011E000 t_fstep && dm/gfx/tests/t_fstep`: 83 checks. The new ones (a stretched GPU at hold 3, an odd heavier frame, a scene that got heavier, a light reference) fail on the controller before.
 
+### A trial back to the shortest hold that fails on hitches alone
+
+- **Symptom:** a game that can run at its target sits at the longer hold for seconds after start-up. Pokémon Legends: Arceus at 60 fps on an Ayn Odin 3 stayed at 30 fps on its title screen until present 276-491 (5-8 s).
+- **Cause:** stalls there (late frames whose cost is 0.13-0.34 vsyncs) ended the first trials back to hold 1, and every failed trial doubled the hold-off (1, 2, 4 s), as one that failed on the scene's cost does.
+- **Fix:** `nvn_fstep.h`: a trial back to kmin whose late frames all cost what fits kmin (`late_cmax <= FSTEP_FIT * kmin`) failed on hitches, not on the cost, and keeps the hold-off as it was, up to `FSTEP_HITCH_MAX` (4) such failures in a row. A trial that holds forgets them. Trials to a longer hold, probes and trials by `kheld` double it as before. From DeathKhan/nx2android `961f6382b`, author kept.
+- **Found on:** Pokémon Legends: Arceus (at 60 fps by the fork's frame-step cuts) on an Ayn Odin 3, the fork's measurements: 60 to stay at present 278 instead of 490, then hold 1 for 1,800 of 1,800 frames and game time 1.000 of real time. Ocarina of Time at its Kokiri spot unchanged there (hold 2 for 1,800 of 1,800 frames).
+- **Check:** `t_fstep`: 88 checks (the hitch-only path, its limit, the reset on a held trial, and a cost-driven failure still doubling).
+
 ### A derived profile drops the frame step its build lacks
 
 - **Symptom:** a game whose profile has a frame step (`FRAME_STEP` in its `patches.py`) runs at double speed when packed from another update; the log has no `frame step in whole vsyncs` line, and the frame counter shows 60.
