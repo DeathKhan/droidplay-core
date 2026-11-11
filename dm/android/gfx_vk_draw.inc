@@ -696,6 +696,7 @@ static uint32_t ar_mem_type(uint32_t bits) {
 #define AR_USAGE (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | \
                   VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)   // also gfx_vk_readback.inc rb_speed
 // the current chunk's (gfx_vk.c): blocks kept and reused when it completes
+static uint64_t g_ar_bytes, g_ar_blocks;   // every chunk's arena blocks together (they are kept: the raw memory line reports them)
 static int ar_new(VkDeviceSize n) {
     if (C->nar == C->car) { C->car = C->car ? 2 * C->car : 8; C->ar = realloc(C->ar, C->car * sizeof *C->ar); }
     arena_blk *a = &C->ar[C->nar]; memset(a, 0, sizeof *a);
@@ -705,7 +706,7 @@ static int ar_new(VkDeviceSize n) {
     uint32_t mt = ar_mem_type(mr.memoryTypeBits);
     VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt};
     if (mt == UINT32_MAX || vkAllocateMemory(g_vk.dev, &ma, NULL, &a->m) != VK_SUCCESS) { vkDestroyBuffer(g_vk.dev, a->b, NULL); return 0; }
-    vkBindBufferMemory(g_vk.dev, a->b, a->m, 0); vkMapMemory(g_vk.dev, a->m, 0, n, 0, (void **)&a->p); a->n = n; C->nar++;
+    vkBindBufferMemory(g_vk.dev, a->b, a->m, 0); vkMapMemory(g_vk.dev, a->m, 0, n, 0, (void **)&a->p); a->n = n; C->nar++; g_ar_bytes += n; g_ar_blocks++;
     return 1;
 }
 // n bytes aligned to 256 (the largest minimum uniform / storage offset alignment); the arena's blocks are reused after each submission completes
@@ -2545,6 +2546,7 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
         } else if (slot >= 3 && slot - 3 < 16) { const p_bind_buf *u = &D.ubo[nst][slot - 3];
             if (u->addr && u->size) { src = (const void *)(uintptr_t)u->addr; n = u->size > 0x10000 ? 0x10000 : (size_t)u->size;
                 size_t rd = s->cb[i].ext && n > s->cb[i].ext ? s->cb[i].ext : n;   // in a memory pool still, as storage buffers below (else it reads 0)
+                if (s->gm) gm_lazy_ptrs(u->addr, rd);   // its pointers' chunks placed too (gfx_vk_gmem_lazy.inc): a raw load may take its address from a uniform buffer
                 if (!mtl_addr(u->addr, rd, NULL, NULL)) { RED_ONCE(119, "uniform buffer slot %d of shader %s at %#llx is in no memory pool: it reads 0", slot - 3, s->key, (unsigned long long)u->addr); src = NULL; n = 16; } }
             else { static int nlog; if (nlog < 8) { nlog++; LOG("[RED] [vk] shader %s reads uniform slot %d, which has no buffer bound: it reads 0", s->key, slot - 3); } } }
         size_t nall = n;   // (ext_check)
@@ -2588,6 +2590,7 @@ static int stage_set(vshader *s, int tf, VkDescriptorSet *pset, uint32_t *dyn, c
             if (u && u->addr) bc_words("", (const void *)(uintptr_t)u->addr, n, 32); }
         if (!u || !u->addr) RED_ONCE(91, "storage buffer of shader %s (c%d +%#x) is not a bound buffer: it reads 0", s->key, sb->cb_slot, off);
         if (s->gm && gm_check_on() && u && u->addr) gm_check(s, sb->cb_slot, off, u->addr, n);   // DM_VK_RAW_GMEM_CHECK (gfx_vk_gmem.inc)
+        if (s->gm && u && u->addr) gm_lazy_ptrs(u->addr, n);   // chunks its pointers reach, placed (gfx_vk_gmem_lazy.inc)
         VkDeviceSize ao, ipr;   // ao: the arena offset (off above is the c0 / uniform buffer word); ipr: the range bound in place
         int wr_ = (sb->flags & 1) != 0;   // written by the shader
         if (u && u->addr && (!wr_ || s->stage == SH_CS) && sb_fwd(u->addr, n, wr_, &b, &ao)) g_buf_fwd[wr_]++;   // on the GPU from a dispatch's pending write (buf_fwd)
