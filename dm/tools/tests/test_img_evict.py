@@ -41,6 +41,8 @@ class ImageEviction(unittest.TestCase):
                        '__attribute__((visibility("default"))) void sweep(ie_ent *e, uint32_t n, uint64_t now, uint64_t age, uint8_t *mark) { ie_sweep(e, n, now, age, mark); }\n'
                        '__attribute__((visibility("default"))) double psi(const char *b) { return ie_psi_some10(b); }\n'
                        '__attribute__((visibility("default"))) int level(double v) { return ie_psi_level(v); }\n'
+                       '__attribute__((visibility("default"))) uint64_t meminfo(const char *b, const char *k) { return ie_meminfo_kb(b, k); }\n'
+                       '__attribute__((visibility("default"))) int swap(uint64_t f, uint64_t t, unsigned p, uint64_t *last) { return ie_swap_level(f, t, p, last); }\n'
                        '__attribute__((visibility("default"))) uint64_t target(int l, uint64_t live, uint64_t *cap) { return ie_target(l, live, cap); }\n'
                        '__attribute__((visibility("default"))) uint64_t pick(ie_cand *c, uint32_t n, uint64_t need, uint8_t *mark) { return ie_pick(c, n, need, mark); }\n')
         subprocess.run([*CC, '-shared', '-fPIC', '-O1', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/android'), str(src), '-o', str(cls.tmp / 'e.so')], check=True)
@@ -50,6 +52,8 @@ class ImageEviction(unittest.TestCase):
         cls.lib.sweep.argtypes = [ctypes.POINTER(Ent), ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8)]
         cls.lib.psi.argtypes, cls.lib.psi.restype = [ctypes.c_char_p], ctypes.c_double
         cls.lib.level.argtypes = [ctypes.c_double]
+        cls.lib.meminfo.argtypes, cls.lib.meminfo.restype = [ctypes.c_char_p, ctypes.c_char_p], ctypes.c_uint64
+        cls.lib.swap.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint64)]
         cls.lib.target.argtypes, cls.lib.target.restype = [ctypes.c_int, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)], ctypes.c_uint64
         cls.lib.pick.argtypes, cls.lib.pick.restype = [ctypes.POINTER(Cand), ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8)], ctypes.c_uint64
 
@@ -106,6 +110,24 @@ class ImageEviction(unittest.TestCase):
         self.assertEqual(self.lib.psi(b'full avg10=3.00 avg60=0 avg300=0 total=0\n'), -1)
         self.assertEqual(self.lib.psi(b''), -1)
         self.assertEqual([self.lib.level(v) for v in (-1, 0, 4.99, 5, 14.99, 15, 80)], [0, 0, 0, 1, 1, 2, 2])
+
+    def test_swap_from_meminfo(self):
+        text = b'MemTotal:       11893412 kB\nMemAvailable:     801196 kB\nSwapTotal:      12582908 kB\nSwapFree:        4446376 kB\n'
+        self.assertEqual(self.lib.meminfo(text, b'SwapTotal:'), 12582908)
+        self.assertEqual(self.lib.meminfo(text, b'SwapFree:'), 4446376)
+        self.assertEqual(self.lib.meminfo(text, b'Shmem:'), 0)
+
+    def swap(self, frees, total=12 * 1024 * 1024, pct=40):   # GiB of SwapFree in turn, with ~12 GiB of swap at lmkd's 40 %: the line 4.8 GiB, holding under 6.0
+        last = ctypes.c_uint64(0)
+        return [self.lib.swap(int(f * 1024 * 1024), total, pct, ctypes.byref(last)) for f in frees]
+
+    def test_swap_holds_near_lmkds_line_and_shrinks_as_it_falls(self):
+        self.assertEqual(self.swap([8, 6.1, 5.9, 5.0]), [0, 0, 1, 1])   # under the line plus a quarter: holding
+        self.assertEqual(self.swap([5.0, 4.7, 4.6, 4.5, 4.3, 4.2, 3.9]), [1, 2, 1, 1, 2, 1, 2])   # under it: an eighth as it crosses, again each further 32nd (0.375 GiB)
+        self.assertEqual(self.swap([4.7, 5.0, 4.7]), [2, 1, 2])   # back over the line and under it again: a new crossing
+        self.assertEqual(self.swap([4.7, 7, 4.7]), [2, 0, 2])
+        self.assertEqual(self.swap([1], total=0), [0])   # no swap
+        self.assertEqual(self.swap([1], pct=0), [0])
 
     def target(self, steps):
         cap = ctypes.c_uint64(0)

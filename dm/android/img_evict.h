@@ -49,6 +49,23 @@ static inline uint64_t ie_target(int level, uint64_t live, uint64_t *cap) {
     if (*cap < IE_FLOOR) *cap = IE_FLOOR;
     return *cap;
 }
+// Swap, the pressure an app may read where PSI is closed to it (/proc/meminfo; the Galaxy Z Fold 8 denies both PSI files). lmkd ends the game when SwapFree falls under
+// its low-swap line (ro.lmk.swap_free_low_percentage of SwapTotal) while the device thrashes or its free memory is under the min watermark: on the Fold "device is low
+// on swap (4.58 < 5.03 GB) and thrashing", about 40 % of its 12 GB. Images are memory the system cannot page out, so every one the game keeps pushes more of the rest
+// into swap. Holding from the line plus a quarter; shrinking under it, once as SwapFree crosses it and again each time it falls a further 32nd of the swap (it recovers
+// slowly after images go, so shrinking at every scan under the line would empty the images down to IE_FLOOR)
+#define IE_SWAP_LOW_PCT 40
+// A /proc/meminfo field in kB ("SwapFree:"); 0 when it isn't there
+static inline uint64_t ie_meminfo_kb(const char *buf, const char *key) { const char *p = buf ? strstr(buf, key) : NULL; return p ? strtoull(p + strlen(key), NULL, 10) : 0; }
+// The level from swap; *last is SwapFree at the last shrink (0: none since SwapFree was last over the line)
+static inline int ie_swap_level(uint64_t free_kb, uint64_t total_kb, unsigned low_pct, uint64_t *last) {
+    if (!total_kb || !low_pct) { *last = 0; return 0; }
+    uint64_t low = total_kb / 100 * low_pct, hold = low + low / 4;
+    if (free_kb >= low) *last = 0;
+    if (free_kb >= hold) return 0;
+    if (free_kb < low && (!*last || free_kb + total_kb / 32 <= *last)) { *last = free_kb; return 2; }
+    return 1;
+}
 // An image the pressure rule may take (its content made again by its next lookup, no lookup for a few presents): its last lookup, its bytes, the caller's pointer
 typedef struct { uint64_t last_present, bytes; void *p; } ie_cand;
 static inline int ie_cand_cmp(const void *x, const void *y) { const ie_cand *a = x, *b = y; return a->last_present != b->last_present ? (a->last_present < b->last_present ? -1 : 1) : 0; }
