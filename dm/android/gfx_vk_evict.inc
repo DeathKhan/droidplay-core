@@ -26,7 +26,7 @@
 #define EV_ALIAS_AGE 30
 #define EV_EVERY 30
 #define EV_EVERY_PRESSED 10
-#define EV_MIN_AGE 3
+#define EV_MIN_AGE 30   // (3 on the Fold in Saria's scene, where swap holds the rule on throughout: 28,343 images made again against 4,943, 13.1 fps against 14.2)
 static int ev_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_IMAGE_EVICT"); v = !(e && *e == '0'); } return v; }
 static uint64_t ev_env(const char *name, long def) { const char *e = getenv(name); return (uint64_t)(e && atol(e) > 0 ? atol(e) : def); }
 static uint64_t ev_age(void) { static uint64_t a; if (!a) a = ev_env("DM_VK_IMAGE_EVICT_AGE", EV_AGE); return a; }
