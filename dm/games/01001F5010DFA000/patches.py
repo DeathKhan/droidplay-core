@@ -8,7 +8,7 @@ from nso_asm import ADRP, B
 #   not 0, read once at start-up (the loader writes the target before the game runs); at target 0 it stays 1, the Switch's 30
 # - The frame period. The game steps its time by a stored period, not by the clock: the frame-time object's constructor (main+0x277bda4) stores 33,333,334 ns in four {0, ns} pairs
 #   (object +0x78 to +0xb0), and its interface at +0x70 (vtable main+0x4171538) reads and sets them: [0] main+0x278303c returns the address of pair idx, [1] main+0x2783048 sets
-#   a pair from the table {16,666,667, 33,333,334} at main+0x397e8d0, [2] main+0x277bef4 sets a pair's ns. With interval 1 alone a frame shown every vsync still stepped 1/30 s and
+#   a pair from the table {16,666,667, 33,333,334, 50,000,000, 66,666,667} at main+0x397e8d0, [2] main+0x277bef4 sets a pair's ns. With interval 1 alone a frame shown every vsync still stepped 1/30 s and
 #   the game ran at double speed (Odin 3, Adreno 830, 2026-11-10; with the period at 16,666,667 ns, 60 fps ran at normal speed and 30 fps at half). The stub in the getter stores
 #   the host's step (the vsyncs the frame stays on screen, state page +0x20) times 16,666,667 ns in the pair asked for, before the caller reads it: 60 fps steps 1/60 s, 30 fps
 #   (target 30, heat, a movie, late frames) 1/30 s. The getter is in this vtable only (no other reference in main). Before the host has decided a step, and at target 0, the
