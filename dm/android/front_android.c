@@ -763,7 +763,9 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
     int game = atomic_load(&g_state) == ST_GAME;
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
-            if (app->window) { if (g_started) vk_window_up(app->window); else vk_window_first(app->window); }
+            // a window that comes back (Home and back to the game) has a new swapchain with nothing in it: the newest frame is shown again, which a game held by the
+            // pause menu would not do itself (the picture behind the menu stayed black until Resume)
+            if (app->window) { if (g_started) { vk_window_up(app->window); g_shown = 0; } else vk_window_first(app->window); }
             if (!g_started) { g_started = 1; start_host(); gamepad_start(); }
             break;
         case APP_CMD_TERM_WINDOW: vk_window_down(); break;
