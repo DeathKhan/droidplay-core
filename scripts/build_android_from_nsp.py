@@ -76,6 +76,7 @@ ANDROID_TESTED = {
     '0100B1C0249B4000',   # Frostpunk (Playable – major issues through day 1 into the first night)
     '0100152000022000',   # Mario Kart 8 Deluxe (Playable – minor issues through the first 50cc race)
     '01006A800016E000',   # Super Smash Bros. Ultimate
+    '0100E95004038000',   # Xenoblade Chronicles 2 (In-game, blocked: no characters drawn)
     '01006BB00C6F0000',   # The Legend of Zelda: Link's Awakening
     '010040801A4C8000',   # Blasphemous 2 (In-game into the weapon room at 60 fps; Playable needs a person; 1.0.1 from a derived profile)
     '01002DA013484000',   # The Legend of Zelda: Skyward Sword HD
