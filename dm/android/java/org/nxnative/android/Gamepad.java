@@ -352,7 +352,9 @@ public final class Gamepad extends View {
     // ---- The pause menu: ≡ (or a controller's Mode / Menu key, front_android.c) opens it and the game is held under it (nativePause) until it closes ----
     // Rows that every device and game has: nothing here is saved but the touch layout, which the layout button saves too. Touch: a row is chosen where the finger lifts
     // on the row it went down on, ≡ again resumes. A controller: up / down, A chooses, left / right change a row's value, B resumes (menuKey, from the native input queue)
-    static final int M_RESUME = 0, M_LAYOUT = 1, M_FPS = 2, M_LEAVE = 3, M_N = 4;
+    static final int M_RESUME = 0, M_LAYOUT = 1, M_FPS = 2, M_SAVE = 3, M_LEAVE = 4;   // M_SAVE is the launcher's screen: a game app, which has none, has no such row
+    int menuN() { return hasLauncher() ? 5 : 4; }
+    int menuId(int row) { return row < M_SAVE || hasLauncher() ? row : row + 1; }
     static final int MK_TOGGLE = 0, MK_UP = 1, MK_DOWN = 2, MK_LEFT = 3, MK_RIGHT = 4, MK_OK = 5, MK_BACK = 6;   // front_android.c's
     static final float K_MENU_W = 300, K_MENU_HEAD = 48, K_MENU_ROW = 46, K_MENU_PAD = 10;
     boolean menuOpen; int menuSel, menuDown = -1; Paint menuPaint;
@@ -366,18 +368,20 @@ public final class Gamepad extends View {
         menuOpen = open; invalidate();
     }
     RectF menuBox() {
-        float u = baseU(), w = Math.min(K_MENU_W * u, getWidth() * 0.9f), h = (K_MENU_HEAD + M_N * K_MENU_ROW + K_MENU_PAD) * u, cx = getWidth() / 2f, cy = getHeight() / 2f;
+        float u = baseU(), w = Math.min(K_MENU_W * u, getWidth() * 0.9f), h = (K_MENU_HEAD + menuN() * K_MENU_ROW + K_MENU_PAD) * u, cx = getWidth() / 2f, cy = getHeight() / 2f;
         return new RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2);
     }
     RectF menuRow(int i) { RectF b = menuBox(); float u = baseU(), t = b.top + (K_MENU_HEAD + i * K_MENU_ROW) * u; return new RectF(b.left + K_MENU_PAD * u, t, b.right - K_MENU_PAD * u, t + K_MENU_ROW * u); }
-    int menuRowAt(float x, float y) { for (int i = 0; i < M_N; i++) if (menuRow(i).contains(x, y)) return i; return -1; }
-    String menuLabel(int i) { return i == M_RESUME ? "Resume" : i == M_LAYOUT ? "Touch controls" : i == M_FPS ? "Frame-rate counter" : hasLauncher() ? "Back to the launcher" : "Home screen"; }
-    String menuValue(int i) { return i == M_LAYOUT ? (tap ? "Tap" : full ? "3D" : "2D") : i == M_FPS ? (fpsOn ? "On" : "Off") : null; }
+    int menuRowAt(float x, float y) { for (int i = 0, n = menuN(); i < n; i++) if (menuRow(i).contains(x, y)) return i; return -1; }
+    String menuLabel(int i) { i = menuId(i); return i == M_RESUME ? "Resume" : i == M_LAYOUT ? "Touch controls" : i == M_FPS ? "Frame-rate counter" : i == M_SAVE ? "Export or import the save…" : hasLauncher() ? "Back to the launcher" : "Home screen"; }
+    String menuValue(int i) { i = menuId(i); return i == M_LAYOUT ? (tap ? "Tap" : full ? "3D" : "2D") : i == M_FPS ? (fpsOn ? "On" : "Off") : null; }
     void menuAct(int i) {
+        i = menuId(i);
         performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
         if (i == M_RESUME) menuSet(false);
         else if (i == M_LAYOUT) nextLayout();
         else if (i == M_FPS) fpsSet(!fpsOn);
+        else if (i == M_SAVE) { menuSet(false); toLauncher(true); }   // the game's screen there has the Save rows (LauncherSaves.java), which ask before closing the game: a save is never swapped under a running host
         else if (i == M_LEAVE) { menuSet(false); toLauncher(); }   // as ≡ did: the game goes on behind the launcher, and Play there comes back to it
         invalidate();
     }
@@ -394,7 +398,7 @@ public final class Gamepad extends View {
     void menuKeyUi(int k) {
         if (k == MK_TOGGLE) { menuSet(!menuOpen); return; }
         if (!menuOpen) return;
-        if (k == MK_UP) menuSel = (menuSel + M_N - 1) % M_N; else if (k == MK_DOWN) menuSel = (menuSel + 1) % M_N;
+        if (k == MK_UP) menuSel = (menuSel + menuN() - 1) % menuN(); else if (k == MK_DOWN) menuSel = (menuSel + 1) % menuN();
         else if (k == MK_OK) menuAct(menuSel);
         else if (k == MK_BACK) menuSet(false);
         else if ((k == MK_LEFT || k == MK_RIGHT) && menuValue(menuSel) != null) menuAct(menuSel);
@@ -410,7 +414,7 @@ public final class Gamepad extends View {
         p.setTextSize(15 * u); Paint.FontMetrics fm = p.getFontMetrics();
         p.setColor(Color.argb(150, 255, 255, 255)); p.setTextAlign(Paint.Align.CENTER); c.drawText("Paused", b.centerX(), b.top + K_MENU_HEAD * u / 2 - (fm.ascent + fm.descent) / 2, p);
         p.setTextSize(17 * u); fm = p.getFontMetrics();
-        for (int i = 0; i < M_N; i++) {
+        for (int i = 0, n = menuN(); i < n; i++) {
             RectF r = menuRow(i); float y = r.centerY() - (fm.ascent + fm.descent) / 2; String v = menuValue(i);
             if (i == menuSel) { p.setColor(Color.argb(56, 255, 255, 255)); c.drawRoundRect(r, 10 * u, 10 * u, p); }
             p.setColor(Color.argb(235, 255, 255, 255)); p.setTextAlign(Paint.Align.LEFT); c.drawText(menuLabel(i), r.left + 14 * u, y, p);
@@ -426,7 +430,9 @@ public final class Gamepad extends View {
         try { a.getPackageManager().getActivityInfo(new android.content.ComponentName(a, Launcher.class), 0); return true; }
         catch (android.content.pm.PackageManager.NameNotFoundException e) { return false; }
     }
-    void toLauncher() {
+    void toLauncher() { toLauncher(false); }
+    // game: on the running game's own screen (the launcher's "game" extra, as the desktop app's Play sends it), which has its Save rows
+    void toLauncher(boolean game) {
         Context a = getContext(); android.content.Intent i = new android.content.Intent(a, Launcher.class);
         if (!hasLauncher()) {
             a.startActivity(new android.content.Intent(android.content.Intent.ACTION_MAIN).addCategory(android.content.Intent.CATEGORY_HOME)
@@ -434,7 +440,9 @@ public final class Gamepad extends View {
             nativeLog("gamepad: menu: a game app has no launcher; to the home screen"); return;
         }
         i.addFlags(android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-        a.startActivity(i); nativeLog("gamepad: menu: back to the launcher");
+        String id = game ? a.getSharedPreferences("app", Context.MODE_PRIVATE).getString("running", null) : null;   // Launcher.play's note of the game it started
+        if (id != null) i.putExtra("game", id);
+        a.startActivity(i); nativeLog("gamepad: menu: " + (id != null ? "to the launcher's screen of " + id : "back to the launcher"));
     }
 
     // ---- Self-check (env.txt DM_PAD_TEST=1): touches made up and sent to this view (not to the screen), each control's result checked ----
@@ -501,7 +509,8 @@ public final class Gamepad extends View {
             boolean f = fpsOn; RectF mr = menuRow(M_FPS);
             press(mr.centerX(), mr.centerY()); release(mr.centerX(), mr.centerY()); check("its frame-rate counter row turns the counter " + (f ? "off" : "on"), fpsOn != f && menuOpen);
             press(mr.centerX(), mr.centerY()); release(mr.centerX(), mr.centerY()); check("and back", fpsOn == f);
-            menuKeyUi(MK_UP); check("a controller's up goes round to the last row", menuSel == M_LEAVE);
+            menuKeyUi(MK_UP); check("a controller's up goes round to the last row", menuId(menuSel) == M_LEAVE);
+            check("the save row is there with a launcher only", (menuN() == 5) == hasLauncher() && (menuId(3) == M_SAVE) == hasLauncher());
             menuKeyUi(MK_DOWN); menuKeyUi(MK_OK); check("down and A on Resume close it", !menuOpen);
             menuKeyUi(MK_TOGGLE); check("a controller's Mode key opens it", menuOpen);
             menuKeyUi(MK_BACK); check("and B closes it", !menuOpen);
