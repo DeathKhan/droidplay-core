@@ -30,7 +30,7 @@
 #      A one-game install of the same game (files/game, the layout before the launcher) is moved there instead of copied again, and its save is copied by the app
 # The picture comes from the Vulkan replay of NVN (dm/android/gfx_vk.c).
 # Needs: Python with lz4, capstone, fonttools and backports.zstd (not on Python 3.14), the .NET SDK 10, the Android SDK with an NDK, CMake 3.22 and build-tools (ANDROID_HOME or --sdk), adb, keytool (a JDK).
-import argparse, atexit, contextlib, datetime, functools, hashlib, json, os, platform, re, shutil, struct, subprocess, sys, tarfile, tempfile, threading, time
+import argparse, atexit, contextlib, datetime, errno, functools, hashlib, json, os, platform, re, shutil, struct, subprocess, sys, tarfile, tempfile, threading, time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -59,23 +59,36 @@ BUILD_TOOLS, PLATFORM = '36.0.0', 'android-35'   # build_apk.py's defaults
 # one needs no other build. Built beside the loader, and kept with it in the library
 VK_DRIVER_LIBS = ('libadrenotools.so', 'libhook_impl.so', 'libmain_hook.so')
 # Games played on an Android device: the rows of the README's Game Status whose tier is Playable – minor issues, Playable – major issues or In-game from a run
-# on current code, with a profile, kept in step with that table. The desktop app shows the others as not played there yet. Left out: In-game, blocked (Frostpunk,
-# Ocarina of Time) and Menus (Mario Kart World), and the rows from before the nxnative merge (†: Super Mario Bros. Wonder, Super Mario 3D World + Bowser's Fury),
-# which current code hasn't run
+# on current code, with a profile, kept in step with that table. The desktop app shows the others as not played there yet. Left out: In-game, blocked (Mario Kart
+# World, Ocarina of Time), and the rows from before the nxnative merge (†: Super Mario Bros. Wonder, Super Mario 3D World + Bowser's Fury), which current code
+# hasn't run
 ANDROID_TESTED = {
     '01008DB008C2C000',   # Pokémon Shield (Playable – minor issues through Route 2 into Professor Magnolia's house)
-    '010027400CDC6000',   # Divinity: Original Sin 2 - Definitive Edition (Playable – major issues through the first combat)
+    '010027400CDC6000',   # Divinity: Original Sin 2 - Definitive Edition (Playable – minor issues through the second fight below deck)
     '010003F003A34000',   # Pokémon: Let's Go, Pikachu! (Playable – minor issues through the rival's first battle)
     '0100000011D90000',   # Pokémon Brilliant Diamond (Playable – minor issues through Lake Verity's first battle)
     '0100DCD01525A000',   # Persona 3 Portable (Playable – minor issues through the first battle)
+    '0100300012F2A000',   # Advance Wars 1+2: Re-Boot Camp (Playable – minor issues through Field Training's first lesson)
     '01006F8002326000',   # Animal Crossing: New Horizons (Playable – major issues through the first night)
+    '0100ECD018EBE000',   # Paper Mario: The Thousand-Year Door (Playable – minor issues through the first battle; 1.0.0 from a derived profile)
     '0100000000010000',   # Super Mario Odyssey
+    '01004AB00A260000',   # DARK SOULS: REMASTERED (In-game into the Asylum cell at 30 fps; Playable needs a person; 1.0.0 from a derived profile)
+    '0100B1C0249B4000',   # Frostpunk (Playable – major issues through day 1 into the first night)
+    '0100152000022000',   # Mario Kart 8 Deluxe (Playable – minor issues through the first 50cc race)
     '01006A800016E000',   # Super Smash Bros. Ultimate
+    '0100E95004038000',   # Xenoblade Chronicles 2 (In-game, blocked: no characters drawn)
     '01006BB00C6F0000',   # The Legend of Zelda: Link's Awakening
+    '010040801A4C8000',   # Blasphemous 2 (In-game into the weapon room at 60 fps; Playable needs a person; 1.0.1 from a derived profile)
     '01002DA013484000',   # The Legend of Zelda: Skyward Sword HD
     '01007EF00011E000',   # The Legend of Zelda: Breath of the Wild (Playable – major issues through the Shrine of Resurrection onto the Great Plateau)
+    '010057D006492000',   # OCTOPATH TRAVELER (Playable – major issues through H'aanit's first battles)
+    '0100A3501946E000',   # OCTOPATH TRAVELER II (Playable – major issues through Hikari's first battle; 1.0.0 from a derived profile)
     '0100606026F12000',   # Final Fantasy Resonance
+    '01009D901BC56000',   # Donkey Kong Country Returns HD (In-game into 1-1 at 60 fps; Playable needs a person; 1.0.0 from a derived profile)
     '010069C01AB82000',   # SHIN MEGAMI TENSEI V: Vengeance (a contributor's report)
+    '01001F5010DFA000',   # Pokémon Legends: Arceus (In-game; washed-out picture, no characters on Mali)
+    '0100F43008C44000',   # Pokémon Legends: Z-A (In-game into Lumiose's station at 30 fps on Adreno, 1.0.0 and 2.0.2; Mali draws it nearly black)
+    '010074F013262000',   # Xenoblade Chronicles 3 (In-game, blocked: characters only in cutscenes, world striped; 1.0.0 from a derived profile)
 }
 
 
@@ -233,6 +246,63 @@ def standard_font(font):   # <font>/standard.ttf: a hinted TrueType font; withou
     if not dst.is_file() or dst.stat().st_size != Path(src).stat().st_size: shutil.copyfile(src, dst)
 
 
+# A full disk as a tool's log shows it: POSIX's strerror, and Windows' ERROR_DISK_FULL and ERROR_HANDLE_DISK_FULL as .NET (the translator) and Python print them
+DISK_FULL = re.compile(r'No space left on device|not enough space on the disk|The disk is full|\[Errno 28\]|ENOSPC', re.I)
+LOW_DISK = 1 << 30   # a step that failed with less than this free on its drive is taken for one that ran out of space
+_work = None   # the game's <id>_build once main knows it: the folder a full disk's message names when the error names no file (a write to an open file names none)
+
+
+def drive_of(p):   # the drive a path is on, as a player names it: C:\ on Windows, the volume's mount point elsewhere
+    p = Path(os.path.abspath(p))
+    if os.name == 'nt': return p.anchor or str(p)
+    while not os.path.ismount(p) and p != p.parent: p = p.parent
+    return str(p)
+
+
+def free_on(p):   # bytes free on the drive of path p (its nearest existing folder), or None
+    p = Path(os.path.abspath(p))
+    while not p.exists() and p != p.parent: p = p.parent
+    try: return shutil.disk_usage(p).free
+    except OSError: return None
+
+
+def disk_full(path):
+    """What to say when this computer ran out of space writing under path (a file or folder; None: unknown): the drive, what it has free, what to free. Pokémon Pokopia's
+    build on Windows ended in a traceback, OSError: [Errno 28] (droidplay-core#307), which named neither the drive nor what had filled it"""
+    where = f'{drive_of(path)} ' if path else ''
+    free = free_on(path) if path else None
+    text = (f'This computer ran out of disk space: the drive {where}' + (f'has {size_text(free)} free' if free is not None else 'is full') +
+            (f' (writing {path})' if path else '') + '. Free some space on it, or move the game\'s folder to a drive with more room, then build again: the steps already '
+            'done are kept. A game\'s <title ID>_build folder beside its files holds its extracted files and translated shaders, so deleting the folder of a game you no '
+            'longer build frees that much.')
+    try: old = [d for d in Path(tempfile.gettempdir()).glob('spv_*') if d.is_dir()]
+    except OSError: old = []
+    if old:   # before spv_build.py kept them under WORK, every failed translation left one in the system's temp folder, tens of GB for a big game
+        text += f' {len(old)} spv_… folder{"s" if len(old) > 1 else ""} in {tempfile.gettempdir()} {"were" if len(old) > 1 else "was"} left by failed shader translations of earlier versions: nothing uses them, so delete them.'
+    return text
+
+
+def filled(text):
+    """The path a full disk's lines in a log name, or None: the folder spv_build.py's own line says it couldn't write, else the file of the last error that names one
+    (Python's OSError, which doubles a Windows path's backslashes, and .NET's IOException end in : '<path>'). spv_build.py's temporary folder can be on another
+    drive than <id>_build: runner-a's check filled a small drive mounted at <id>_build/tmp, and the message named <id>_build's drive, with its 755 GB free"""
+    m = re.search(r'^\[RED\] spv_build: the disk is full: .* The drive with (.+?) has (?:[\d.]+ GB free|no free space it could read)', text, re.M)
+    if m: return m.group(1)
+    for ln in reversed(text.splitlines()):
+        if DISK_FULL.search(ln) and (q := re.search(r": '([^']+)'\s*$", ln)): return q.group(1).replace('\\\\', '\\') if '[Errno' in ln else q.group(1)
+    return None
+
+
+def translation_stopped(work, log):   # what build_shaders adds when spv_build.py stopped: its own reason (a [RED] spv_build: line), and a full disk's message when the disk filled
+    try: text = log.read_text(errors='replace')
+    except OSError: text = ''
+    own = [l[6:] for l in text.splitlines() if l.startswith('[RED] spv_build: ')]
+    where = filled(text) or work
+    free = free_on(where)
+    full = DISK_FULL.search(text) or (free is not None and free < LOW_DISK)
+    return ''.join(f'{l}\n' for l in own[-1:]) + (f'{disk_full(where)}\n' if full else '')
+
+
 def build_shaders(sv, dirs, work, logs, env, g, dlc_roms=(), derive=None, derived='', oodle=None):
     """The game's NVN shaders for the Vulkan replay: the split (build_ipa_from_nsp.py split_shaders, checked against the profile's tables), then
     dm/android/tools/spv_build.py (the in-repository translator, dmsh_xlate_bin's dll run by dotnet) into <work>/spv. Returns that folder (None when there are none) and the profile.
@@ -241,6 +311,9 @@ def build_shaders(sv, dirs, work, logs, env, g, dlc_roms=(), derive=None, derive
     failure of a registered profile's split stops the build: packed without shaders, AI: The Somnium Files played its sound over a black screen (droidplay-core#218).
     derived: why main packs from a profile derived from a registered one ('' for a registered or provisional profile). Its split failing stops the build too, though the profile
     is outside dm/games: its game has the shaders the registered tables list (Pokémon Pokopia's split failed on Windows, and the build packed it without them, droidplay-core#307).
+    A translation that stops (spv_build.py's exit code) stops the build for every profile: the shaders done by then are an arbitrary part of the game's, and packed with
+    them the game would draw some scenes and play others' sound over a black screen, as #218's did. Pokémon Pokopia's build went on to the install after its translation
+    stopped on a full disk (droidplay-core#307). A shader the translator can't handle is a [RED] line in the log, not a stop.
     oodle: build_ipa_from_nsp.py split_shaders' (a Mac host for the game's Oodle, mac_decoder), which puts the host in the split's inputs"""
     if not sv: return None, g
     sh = work / 'shader'
@@ -252,7 +325,8 @@ def build_shaders(sv, dirs, work, logs, env, g, dlc_roms=(), derive=None, derive
     dd = (lambda: promote('the installed DLC shader content differs from the registered tables')) if derive and not own else None
     dc = (lambda: promote('the reader decoded additional compute kernels from this registered build')) if derive and not own else None
     try: bi.split_shaders(sys.executable, REPO, [bi.rfs.source(dirs[v]) for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own,   # its own stage (a DLC's shaders too)
-                          oodle=oodle, dlc_roms=dlc_roms, derive_dlc=dd, derive_compute=dc)
+                          oodle=oodle, dlc_roms=dlc_roms, derive_dlc=dd, derive_compute=dc,
+                          targeted=not own and not derived)   # a profile that registers this version: first only the files its shader map names (docs/reference/packing.md)
     except BuildError as e:
         if not own: raise BuildError(f'{e}\nThe game is not packed: without its shaders it would play its sound over a black screen. Check that the folder holds the versions game profile '
                                      f'{g.id} registers (its game.tsv); if it does, report this build with {logs / "shader_split.log"}') from e
@@ -265,7 +339,11 @@ def build_shaders(sv, dirs, work, logs, env, g, dlc_roms=(), derive=None, derive
     out = work / 'spv'
     try: bi.run([sys.executable, REPO / 'dm/android/tools/spv_build.py', sh / 'pkg', out, '--xlate', REPO / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate.dll',
                  '--facts', g.table('shader_facts.tsv')], logs / 'spv_build.log', env=env)
-    except BuildError as e: bi.PROG.end(str(e), ok=False); say(f'[RED] shader translation failed (see {logs / "spv_build.log"}): the game is packed with the shaders translated so far'); return (out if out.is_dir() else None), g
+    except BuildError as e:
+        why = translation_stopped(work, logs / 'spv_build.log')
+        if why.startswith('spv_build: not enough free space'): raise BuildError(f'{e}\n{why}The game is not packed: its shaders were not translated.') from e   # spv_build.py's check, before it started
+        raise BuildError(f'{e}\n{why}Shader translation failed, so the game is not packed: with only the shaders translated so far, some of its scenes would draw nothing. '
+                         f'The shaders that were translated are kept for the next build. Report this build with {logs / "spv_build.log"}') from e
     last = [l for l in (logs / 'spv_build.log').read_text(errors='replace').splitlines() if l.startswith('spv_build:')]
     bi.PROG.end(last[-1][11:] if last else str(out))
     return out, g
@@ -851,6 +929,18 @@ TAR_FILES = 200   # a folder with more files than this goes over as one tar arch
 MANIFEST = '.nxnative_manifest'   # in a folder copied as a tar: each file's size and modification time, for the next copy to send only what changed
 
 
+def local_room(f, need, what):   # room on this computer for a file of need bytes the copy writes at f (what it holds now counts, as it is overwritten), or a plain stop
+    free = free_on(f.parent)
+    if free is None: return
+    have = f.stat().st_size if f.is_file() else 0
+    if free + have >= need + LOCAL_SPARE: return
+    raise BuildError(f'this computer has {size_text(free)} free on {drive_of(f)}: {what} needs {size_text(need)} there for the copy to the phone ({f}), plus '
+                     f'{size_text(LOCAL_SPARE)} left free. Free up {size_text(need + LOCAL_SPARE - free - have)} on that drive, then install again')
+
+
+LOCAL_SPARE = 64 << 20   # left free on this computer besides a copy's piece
+
+
 def tar_pieces(local, rels, most):   # rels (sorted) → lists of them of about most bytes each, in order; a larger file alone
     out, cur, n = [], [], 0
     for r in rels:
@@ -883,11 +973,13 @@ def push_tar(serial, local, parent, name, files, log, sync):
         adb(serial, 'push', man, f'{dst}/{MANIFEST}')
     for i, piece in enumerate(pieces, 1):
         bi.PROG.set(done=done, total=total, unit='B', note='packing' + (f' archive {i} of {len(pieces)}' if len(pieces) > 1 else ''))
-        with tarfile.open(tar, 'w', format=tarfile.USTAR_FORMAT) as t:
-            for r in piece:
-                ti = t.gettarinfo(local / r, arcname=r); ti.mode = 0o666; ti.uid = ti.gid = 0; ti.uname = ti.gname = ''
-                with open(local / r, 'rb') as fh: t.addfile(ti, fh)
-        try:
+        size = sum(-(-(local / r).stat().st_size // 512) * 512 + 512 for r in piece) + 1024   # the archive: each file in 512-byte blocks after its header, then two closing
+        local_room(tar, -(-size // 10240) * 10240, f'{name}\'s archive')                      # blocks, in tarfile's 10 KiB records
+        try:   # packing in it: an archive cut short by a full disk is removed too
+            with tarfile.open(tar, 'w', format=tarfile.USTAR_FORMAT) as t:
+                for r in piece:
+                    ti = t.gettarinfo(local / r, arcname=r); ti.mode = 0o666; ti.uid = ti.gid = 0; ti.uname = ti.gname = ''
+                    with open(local / r, 'rb') as fh: t.addfile(ti, fh)
             with counting('sending' + (f' archive {i} of {len(pieces)}' if len(pieces) > 1 else ''), total, 'B',
                           lambda base=done: (lambda n: None if n is None else base + n)(remote_size(serial, remote))):
                 adb(serial, 'push', tar, remote, log=log)
@@ -938,15 +1030,17 @@ def push_resumable(serial, local, remote, log):
         folder, file = remote.rsplit('/', 1)
         need_room(serial, folder, size - have + min(CHUNK, size - have), f'{file} ({size_text(size - have)} left to send)')
     piece, tmp = log.with_suffix('.piece'), remote + '.piece'
-    with counting('sending', size, 'B', lambda: (lambda a, b: None if a is None else a + (b or 0))(remote_size(serial, part), remote_size(serial, tmp))):
-        with open(local, 'rb') as f:
-            f.seek(have)
-            while have < size:
-                data = f.read(min(CHUNK, size - have)); piece.write_bytes(data)
-                adb(serial, 'push', piece, tmp, log=log)
-                adb(serial, 'shell', f'cat {sh_quote(tmp)} >> {sh_quote(part)} && rm {sh_quote(tmp)}')
-                have += len(data); moved()
-    piece.unlink(missing_ok=True)
+    if have < size: local_room(piece, min(CHUNK, size - have), f'{remote.rsplit("/", 1)[1]}\'s piece')   # Pokopia's full disk was found only at piece.write_bytes (#307)
+    try:   # the piece goes whatever stops the copy: a full disk, a lost phone (survives_drops takes it again), an adb error
+        with counting('sending', size, 'B', lambda: (lambda a, b: None if a is None else a + (b or 0))(remote_size(serial, part), remote_size(serial, tmp))):
+            with open(local, 'rb') as f:
+                f.seek(have)
+                while have < size:
+                    data = f.read(min(CHUNK, size - have)); piece.write_bytes(data)
+                    adb(serial, 'push', piece, tmp, log=log)
+                    adb(serial, 'shell', f'cat {sh_quote(tmp)} >> {sh_quote(part)} && rm {sh_quote(tmp)}')
+                    have += len(data); moved()
+    finally: piece.unlink(missing_ok=True)
     if remote_size(serial, part) != size: raise BuildError(f'{part} is not {size:,} bytes after the copy: run the install again')
     adb(serial, 'shell', f'mv -f {sh_quote(part)} {sh_quote(remote)}')
 
@@ -1284,23 +1378,32 @@ def provisional_profile(gamemod, nsp_dir, app):   # the provisional profile an e
     return gamemod.load(f'{app:016X}')
 
 
-def scan(src, keys, env, nsz=True):
+def title_id(text):   # --title-id / TITLE_ID → the title ID as a number, or None when empty; anything else than 16 hex digits is a BuildError
+    t = (text or '').strip()
+    if not t: return None
+    if not re.fullmatch(r'0[0-9A-Fa-f]{15}', t): raise BuildError(f'--title-id / TITLE_ID: {t!r} is no title ID (16 hex digits, e.g. 0100E870163CA000)')
+    return int(t, 16)
+
+
+def scan(src, keys, env, nsz=True, want=None):
     """The game in src as build_ipa_from_nsp.py's main finds it: (folder, title ID, fam, kind). src is a folder of NSPs / XCIs (kind None), a dump folder ('folder')
-    or a NUP container ('nup': a .nup file, or the one .nup in the folder); the folder is where <title ID>_build goes. A NUP and a dump are not encrypted: no keys"""
+    or a NUP container ('nup': a .nup file, or the one .nup in the folder); the folder is where <title ID>_build goes. A NUP and a dump are not encrypted: no keys.
+    want: the game to pack when the folder holds several (--title-id / TITLE_ID), as build_ipa_from_nsp.py's: a cartridge with more than one game (Batman: Arkham
+    Trilogy) stopped with the scan's "more than one game" error, which names an option this script didn't have"""
     nup = bi.nup_file(src)
     folder = src.parent if src.is_file() else src
     if nup:
-        app, fam = bi.scan_nup(nup)
+        app, fam = bi.scan_nup(nup, want)
         say(f'a NUP: {nup.name}, {app:016X}, {len(fam["updates"])} update(s), {len(fam["dlc"])} DLC')
         if fam['base'] is None: say(bi.pack_nup.NO_BASE)
         return folder, app, fam, 'nup'
     if bi.dump_folder(folder):
-        app, fam = bi.scan_dump(folder)
+        app, fam = bi.scan_dump(folder, want)
         say(f'a dump folder: {app:016X}, {len(fam["updates"])} update(s), {len(fam["dlc"])} DLC')
         return folder, app, fam, 'folder'
     if not keys: raise BuildError('give -k <prod.keys>: the game is in NSP / XCI files, which are encrypted')
     with bi.package_reader(REPO, keys, env) as packages:
-        app, fam = bi.scan_nsps(folder, packages.contents)
+        app, fam = bi.scan_nsps(folder, packages.contents, want)
         packages.check_keys(fam)
     if nsz: fam = bi.decompress_nsz(folder, app, fam, keys, env)
     return folder, app, fam, None
@@ -1312,11 +1415,11 @@ def game_files(fam, kind):   # what the game was read from, for the desktop app:
     return [{'name': p.name, 'bytes': p.stat().st_size} for p in [fam['base'], *[p for _, p in fam['updates']], *[p for _, _, p in fam['dlc']]] if p]
 
 
-def info(src, keys=None):
+def info(src, keys=None, want=None):
     sys.path.insert(0, str(REPO / 'dm/games')); import game as gamemod
     sys.path.insert(0, str(REPO / 'dm/tools')); import nacp
     env = dict(os.environ); bi.configure_dotnet(env)
-    nsp_dir, app, fam, kind = scan(src, keys, env, nsz=False)
+    nsp_dir, app, fam, kind = scan(src, keys, env, nsz=False, want=want)
     tid = f'{app:016X}'; g = gamemod.by_title(app); prov = False
     if g is None: g = provisional_profile(gamemod, nsp_dir, app); prov = g is not None   # an experimental build's: its art, versions and host show like a profiled game's
     out = {'title_id': tid, 'folder': str(nsp_dir), 'profile': bool(g), 'provisional': prov, 'name': g.get('name', '') if g else '', 'table': games_table().get(tid),
@@ -1355,6 +1458,8 @@ def main(argv):
     ap.add_argument('--apk-only', action='store_true', help='pack the app with every game host built on this computer and install it')
     ap.add_argument('--migrate', action='store_true', help="move a one-game install's files/game to files/games/<--title> on the phone")
     ap.add_argument('--title', help='the title ID for --migrate, --import-save and --restore-backup')
+    ap.add_argument('--title-id', default=os.environ.get('TITLE_ID', ''), help='the game to pack when the folder holds several (a cartridge with more than one game): '
+                    'its title ID, 16 hex digits (default: the TITLE_ID environment variable)')
     ap.add_argument('--import-save', metavar='PATH', help="send a save folder or archive (an emulator's, a JKSV / EdiZon / Checkpoint backup, a PC port's) for --title to the phone, "
                     'where DroidPlay asks before swapping it in')
     ap.add_argument('--restore-backup', metavar='FOLDER', help="send a game's save (--title) or every game's from a backup Back up saves pulled to this computer, to put back on the phone")
@@ -1384,7 +1489,7 @@ def main(argv):
     if not (a.check or a.info) and os.environ.get('NXNATIVE_JOURNAL', '1') != '0': bi.PROG = Journaled(bi.PROG.mode, argv)
     if a.check or a.info:   # stdout carries the JSON alone: messages on the way (say) go to stderr
         if a.info and not a.nsp_dir: raise BuildError('--info needs the NSP folder')
-        with contextlib.redirect_stdout(sys.stderr): out = check(a.sdk) if a.check else info(Path(a.nsp_dir).expanduser().resolve(), Path(a.keys).expanduser().resolve() if a.keys else None)
+        with contextlib.redirect_stdout(sys.stderr): out = check(a.sdk) if a.check else info(Path(a.nsp_dir).expanduser().resolve(), Path(a.keys).expanduser().resolve() if a.keys else None, title_id(a.title_id))
         print(json.dumps(out, indent=1)); return
     if a.setup: setup(a.sdk, a.accept_android_licenses); return
     if a.apk_only or a.migrate or a.import_save or a.restore_backup:
@@ -1425,7 +1530,7 @@ def main(argv):
     sys.path.insert(0, str(REPO / 'dm/tools')); import nacp; bi.nacp = nacp
     sdk = sdk_dir(a.sdk)
     env = dict(os.environ); bi.configure_dotnet(env)
-    nsp_dir, app, fam, kind = scan(src, keys, env)
+    nsp_dir, app, fam, kind = scan(src, keys, env, want=title_id(a.title_id))
     g = gamemod.by_title(app)
     if g is None:   # no game profile: surveyed and packed from a provisional profile outside the repository, as build_ipa_from_nsp.py does (the game may not boot)
         pdir = nsp_dir / f'{app:016X}_build' / 'profile'
@@ -1453,6 +1558,7 @@ def main(argv):
         elif not all(v in have for v in need): derived = f'the folder has no {", ".join(v for v in need if v not in have)}, whose files game profile {g.id}\'s shader tables were made from'
         if derived: say(f'{derived}: packing {pkg_ver} from a profile derived from it')
     work = nsp_dir / f'{g.id}_build'; logs = work / 'logs'; ex = work / 'extract'
+    global _work; _work = work
     ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
     env.update(DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'), DM_TARGET='android', PYTHONUTF8='1')   # the tools' text files in UTF-8 on Windows too (its default is the ANSI code page)
     patched = work / f'patched_android_{pkg_ver}'
@@ -1576,6 +1682,9 @@ if __name__ == '__main__':
     try: main(sys.argv[1:]); code = 0
     except BuildError as e:
         bi.PROG.close(ok=False); bi.PROG.say(f'[RED] {e}'); sys.exit(1)
+    except OSError as e:   # a full disk anywhere (Windows' ERROR_DISK_FULL is ENOSPC too): said plainly, not as a traceback
+        if e.errno != errno.ENOSPC: raise
+        bi.PROG.close(ok=False); bi.PROG.say(f'[RED] {disk_full(e.filename or _work)}'); sys.exit(1)
     except SystemExit as e: code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1); raise
     except KeyboardInterrupt: code = 130; raise
     finally:

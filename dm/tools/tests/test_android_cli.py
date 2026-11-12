@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 from typing import Any
 import unittest
 from unittest import mock
@@ -100,6 +101,27 @@ class Json(unittest.TestCase):
             assert line, f'README.md: no "- **{tier}:**" line under Playable now'
             want = sorted(name(r[0]) for r in rows if r[2].lstrip('*').startswith(tier))
             self.assertEqual(sorted(name(r[0]) for r in rows if name(r[0]) in line.group(1)), want, f'README.md: the "{tier}" line under Playable now')
+
+    def test_game_status_captures_show_their_rows_tier(self):   # each capture's chip names its row's tier, so a row that moves tier moves its chip too
+        readme = (REPO / 'README.md').read_text(encoding='utf-8')
+        table = readme.split('| Game | Device | State |\n|---|---|---|\n', 1)[1].split('\n\n', 1)[0]
+        rows = [[c.strip() for c in line[1:-1].split('|')] for line in table.splitlines()]
+        name = lambda game: re.sub(r' \(Switch 2\)$', '', game.strip('*')).rsplit(' ', 1)[0]
+        chips = {'Playable – minor issues': 'playable-minor', 'Playable – major issues': 'playable-major', 'In-game, blocked': 'in-game-blocked',
+                 'In-game': 'in-game', 'Menus': 'menus', 'Boots': 'boots', "Doesn't run": 'doesnt-run'}   # "In-game, blocked" before the "In-game" it starts with
+        tier = {name(r[0]): next(t for t in chips if r[2].lstrip('*').startswith(t)) for r in rows}
+        self.assertIn('<a id="tiers"></a>', readme)
+        cells = re.findall(r'<td [^>]*><img src="docs/images/android/[^"]+"[^>]*>(.*?)</td>', readme)
+        self.assertGreater(len(cells), 10)
+        for cell in cells:
+            game = re.search(r'<b><a href="dm/games/[0-9A-F]{16}/README\.md">([^<]+)</a></b>', cell)
+            assert game, f'README.md: a capture without its game: {cell[:80]}'
+            chip = re.search(r'<br><a href="#tiers"><img src="docs/badges/([a-z-]+)\.svg" height="20" alt="([^"]+)"></a><br>', cell)
+            assert chip, f'README.md: the capture of {game.group(1)} has no tier chip under its name'
+            self.assertIn(game.group(1), tier, f'README.md: the capture of {game.group(1)} has no row in the status table')
+            want = tier[game.group(1)]
+            self.assertEqual((chip.group(1), chip.group(2)), (chips[want], want), f'README.md: the chip of {game.group(1)}')
+            self.assertIn(f'>{want}</text>'.replace("'", '&#39;'), (REPO / f'docs/badges/{chips[want]}.svg').read_text(encoding='utf-8'))
 
 
 class Windows(unittest.TestCase):
@@ -315,6 +337,29 @@ public class UnzipCheck { public static void main(String[] a) throws Exception {
         self.assertEqual(sorted(p.name for p in dst.iterdir()), sorted(p.name for p in spv.iterdir()))
         self.assertTrue(all((dst / p.name).read_bytes() == p.read_bytes() for p in spv.iterdir()))
         self.assertFalse((self.tmp / 'outside.spv').exists())
+
+
+class Cartridges(unittest.TestCase):   # a cartridge with several games (Batman: Arkham Trilogy): --title-id / TITLE_ID names the one to pack, as build_ipa_from_nsp.py's does
+    def test_title_id_is_parsed(self):
+        self.assertIsNone(ba.title_id(''))
+        self.assertEqual(ba.title_id(' 0100E870163CA000 '), 0x0100E870163CA000)
+        for bad in ('Asylum', '0100E870163CA00', '1100E870163CA000'):
+            with self.assertRaises(ba.BuildError): ba.title_id(bad)
+
+    def test_scan_passes_the_choice_to_the_folder_scan(self):
+        seen = []
+        class Reader:
+            contents = None
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def check_keys(self, fam): pass
+        def scan_nsps(folder, contents_of, want=None): seen.append(want); return want, {'base': None, 'updates': [], 'dlc': []}
+        with mock.patch.object(ba.bi, 'nup_file', return_value=None), mock.patch.object(ba.bi, 'dump_folder', return_value=False), \
+             mock.patch.object(ba.bi, 'package_reader', lambda *a, **k: Reader()), mock.patch.object(ba.bi, 'scan_nsps', scan_nsps):
+            _, app, _, kind = ba.scan(Path(tempfile.gettempdir()), Path('prod.keys'), {}, nsz=False, want=0x0100E870163CA000)
+            ba.scan(Path(tempfile.gettempdir()), Path('prod.keys'), {}, nsz=False)
+        self.assertEqual((app, kind), (0x0100E870163CA000, None))
+        self.assertEqual(seen, [0x0100E870163CA000, None])
 
 
 class Setup(unittest.TestCase):   # --setup (dm/android/tools/host_setup.py): what --check finds missing, installed where the script looks; nothing is downloaded here
@@ -828,6 +873,47 @@ class Phone(Base):
         self.assertEqual(len(files[f'{dst}/{ba.MANIFEST}'].decode().splitlines()), ba.TAR_FILES + 10)
         self.assertFalse(any(k.endswith('.tar') for k in files))   # no archive left on the phone
         self.assertTrue(any('archives' in m for m in self.said), self.said)
+
+    def test_a_large_copys_piece_goes_whatever_stops_it(self):   # droidplay-core#307: Pokopia's full disk stopped the copy at piece.write_bytes, and the piece was left
+        big = self.tmp / 'RomFS.img'; big.write_bytes(bytes(range(256)) * 9000); piece = self.tmp / 'logs' / 'p.piece'
+        files: dict[str, bytes] = {}; pushed: list = []
+        real = Path.write_bytes
+        def full(p, data):   # the second piece finds the disk full partway through its write
+            if p == piece and pushed: real(p, data[:1000]); raise OSError(28, 'No space left on device')
+            return real(p, data)
+        with mock.patch.object(ba, 'adb', self.phone_fs(files, pushed)), mock.patch.object(ba, 'CHUNK', 1 << 20), mock.patch.object(Path, 'write_bytes', full):
+            with self.assertRaises(OSError): ba.push_resumable('S', big, '/r/RomFS.img', self.tmp / 'logs' / 'p.log')
+        self.assertFalse(piece.exists())
+        self.assertEqual(len(files['/r/RomFS.img.partial']), 1 << 20)   # the next install goes on from the piece the phone has
+        def lost(c):   # an adb error that isn't a drop: the copy stops there
+            if c[0] == 'push': raise ba.BuildError('adb push failed (exit status 1): no output')
+            return False
+        with mock.patch.object(ba, 'adb', self.phone_fs(files, pushed, lost)), mock.patch.object(ba, 'CHUNK', 1 << 20):
+            with self.assertRaises(ba.BuildError): ba.push_resumable('S', big, '/r/RomFS.img', self.tmp / 'logs' / 'p.log')
+        self.assertFalse(piece.exists())
+
+    def test_a_copy_without_room_for_its_piece_on_this_computer_stops_first(self):
+        big = self.tmp / 'RomFS.img'; big.write_bytes(bytes(range(256)) * 9000)
+        files: dict[str, bytes] = {}; pushed: list = []
+        usage = SimpleNamespace(total=1 << 40, used=1 << 40, free=(1 << 20) + ba.LOCAL_SPARE - 1)   # a byte short of a 1 MiB piece and the spare
+        with mock.patch.object(ba, 'adb', self.phone_fs(files, pushed)), mock.patch.object(ba, 'CHUNK', 1 << 20), mock.patch.object(ba.shutil, 'disk_usage', return_value=usage):
+            with self.assertRaisesRegex(ba.BuildError, r"this computer has 68 MB free on .+: RomFS\.img's piece needs 1 MB there for the copy to the phone \(.+p\.piece\), plus 67 MB "
+                                        r'left free\. Free up 0 MB on that drive, then install again'):
+                ba.push_resumable('S', big, '/r/RomFS.img', self.tmp / 'logs' / 'p.log')
+        self.assertEqual(pushed, []); self.assertFalse((self.tmp / 'logs' / 'p.piece').exists())
+
+    def test_a_folders_archive_goes_whatever_stops_its_packing(self):   # the archive cut short by a full disk while it was packed, then no room for the next
+        spv = self.tmp / 'spv'; spv.mkdir()
+        for i in range(ba.TAR_FILES + 1): (spv / f'{i:04}.spv').write_bytes(b'x' * 100)
+        tar = self.tmp / 'logs' / 'p.tar'
+        def full(self, tarinfo, fileobj=None): raise OSError(28, 'No space left on device')
+        with mock.patch.object(ba.tarfile.TarFile, 'addfile', full), self.assertRaises(OSError):
+            ba.push_dir('S', spv, f'{ba.REMOTE}/games/{GID}', 'spv', self.tmp / 'logs' / 'p.log', sync=True)
+        self.assertFalse(tar.exists())
+        usage = SimpleNamespace(total=1 << 40, used=1 << 40, free=ba.LOCAL_SPARE)
+        with mock.patch.object(ba.shutil, 'disk_usage', return_value=usage), self.assertRaisesRegex(ba.BuildError, r"spv's archive needs 0 MB there for the copy to the phone"):
+            ba.push_dir('S', spv, f'{ba.REMOTE}/games/{GID}', 'spv', self.tmp / 'logs' / 'p.log', sync=True)
+        self.assertFalse(tar.exists()); self.assertFalse(any(c[0] == 'push' and c[-1].endswith('.tar') for c in self.cmds), self.cmds)
 
     def test_a_large_dlc_image_goes_on_from_what_the_phone_holds(self):   # issue #169's Booster Course Pass is gigabytes
         aoc = self.tmp / 'aoc'; aoc.mkdir(); (aoc / '1.img').write_bytes(bytes(range(256)) * 9000); (aoc / '2.img').write_bytes(b'small')
