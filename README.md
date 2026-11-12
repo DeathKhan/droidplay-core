@@ -115,7 +115,8 @@ Every page of the app, uninstalling, and running it from source: [DroidPlay for 
   frame-rate counter, rumble), then **Play**.
 - **Controls:** touch controls are drawn over the game in three layouts, 2D, 3D and Tap, switched with the round button at the top. A controller works as
   player 1 and hides them.
-- **Back to the list:** the **≡** button at the top returns to the list while the game keeps running; **Play** on the same game resumes it.
+- **Pause and back to the list:** the **≡** button at the top pauses the game and opens a small menu: resume, the touch layout, the frame-rate counter, and back to
+  the list, where **Play** on the same game resumes it.
 - **Saves** stay in the app's storage, so updating the app keeps them. DroidPlay for Windows backs them up to your computer from its **Phones** page.
 - **Game apps:** **Manage › Build a game app…** in DroidPlay for Windows makes one game into an app of its own, with its own icon and saves, to copy to a
   device and install there. It's for your own devices only: it carries the game, so never share it.
