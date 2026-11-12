@@ -498,6 +498,12 @@ public final class Gamepad extends View {
     // ---- The software keyboard's text box (front_text_input): shown on the UI thread, the caller blocks until it is confirmed (the text) or cancelled (null) ----
     // Text comes and goes as UTF-8 bytes: a JNI string is modified UTF-8, which has no character outside the BMP (front_android.c text_input_thread).
     // OK stays disabled while the text is shorter than minChars, as the console's keyboard keeps it: a game that set a minimum does not check the length itself.
+    // The form hosts built before that look up (an app can carry one, for a game kept on its tested host): strings, no minimum
+    public static String ask(Activity a, String title, String sub, String guide, String initial, int maxChars) {
+        byte[] r = ask(a, bytes(title), bytes(sub), bytes(guide), bytes(initial), maxChars, 0);
+        return r == null ? null : text(r);
+    }
+    static byte[] bytes(String s) { return s == null ? null : s.getBytes(java.nio.charset.StandardCharsets.UTF_8); }
     static String text(byte[] b) { return b == null ? "" : new String(b, java.nio.charset.StandardCharsets.UTF_8); }
     public static byte[] ask(final Activity a, byte[] title8, byte[] sub8, byte[] guide8, byte[] initial8, final int maxChars, int minChars) {
         final String title = text(title8), sub = text(sub8), guide = text(guide8), initial = text(initial8);

@@ -31,6 +31,7 @@ int main(int argc, char **argv);   // main.c
 void dm_focus_set(int st);
 void dm_audio_suspend(int on);
 void dm_gfx_suspend(int on);
+extern int g_swkbd_min_chars;   // hle_swkbd.c: this input's minimum length from ShowKeyboardArg; the applet keeps OK disabled until then, and so does the box (front_mac.m)
 
 enum { ST_START, ST_SELFTEST, ST_PASS, ST_FAIL, ST_GAME, ST_ENDED, ST_CRASHED, ST_DEMO };
 static int g_demo_frames;   // frames the NVN picture check presented (nvn_demo.c)
@@ -169,7 +170,7 @@ static void *guest_thread(void *p) {
         }
         const char *tt = getenv("DM_TEXT_TEST");   // env.txt: the software keyboard's box, as a game's swkbd call shows it (hle_swkbd.c), once after the demo
         if (tt && atoi(tt)) {   // with a minimum of 2 characters, as a game's ShowKeyboardArg sets one; 2 types "Zelda" and a character outside the BMP, 9 bytes of UTF-8
-            extern int g_swkbd_min_chars; char out[64] = ""; g_swkbd_min_chars = 2; int r = front_text_input("Name", "Check of the text box", "Type a name", "Link", 10, out, sizeof out); g_swkbd_min_chars = -1;
+            char out[64] = ""; g_swkbd_min_chars = 2; int r = front_text_input("Name", "Check of the text box", "Type a name", "Link", 10, out, sizeof out); g_swkbd_min_chars = -1;
             LOG("text box check: result %d, text \"%s\" (%d bytes)", r, out, (int)strlen(out));
         }
     }
@@ -267,7 +268,6 @@ static void *text_input_thread(void *p) {
 }
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     if (!g_gp || out_cap <= 0) return -1;
-    extern int g_swkbd_min_chars;   // hle_swkbd.c: this input's minimum length from ShowKeyboardArg; the applet keeps OK disabled until then, and so does the box (front_mac.m)
     text_req q = {title, sub, guide, initial, max_chars, g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0, out_cap, -1, out}; pthread_t th;
     if (pthread_create(&th, NULL, text_input_thread, &q)) return -1;
     pthread_join(th, NULL);
