@@ -362,10 +362,15 @@ public final class Gamepad extends View {
         if (open == menuOpen) return;
         if (open) {
             reset();   // every touch released first
-            if (!nativePause(true)) { toLauncher(); return; }   // no game to hold (the status screen): ≡ leaves, as it did
+            if (!hold(true)) { toLauncher(); return; }   // no game to hold (the status screen), or a host that cannot hold one: ≡ leaves, as it did
             menuSel = M_RESUME; menuDown = -1;
-        } else nativePause(false);
+        } else hold(false);
         menuOpen = open; invalidate();
+    }
+    // An app can carry hosts built before the menu (a game kept on its tested host): they register no nativePause, and the call throws. Such a host has no menu
+    boolean hold(boolean on) {
+        try { return nativePause(on); }
+        catch (UnsatisfiedLinkError e) { nativeLog("gamepad: menu: this game's host is older than the pause menu"); return false; }
     }
     RectF menuBox() {
         float u = baseU(), w = Math.min(K_MENU_W * u, getWidth() * 0.9f), h = (K_MENU_HEAD + menuN() * K_MENU_ROW + K_MENU_PAD) * u, cx = getWidth() / 2f, cy = getHeight() / 2f;
@@ -425,10 +430,14 @@ public final class Gamepad extends View {
 
     // The launcher in front (the game's process keeps running behind it): Play there resumes this game, or asks before closing it for another (Launcher.java). A game app
     // (apk/AndroidManifest.game.xml, java GameStart) has no launcher: the home screen comes in front instead, the game paused behind it, and the app's icon brings it back
+    int launcher = -1;   // asked once: the menu's rows read it at every draw
     boolean hasLauncher() {   // asked of the package manager: an explicit intent's resolveActivity names its component without looking it up
-        Context a = getContext();
-        try { a.getPackageManager().getActivityInfo(new android.content.ComponentName(a, Launcher.class), 0); return true; }
-        catch (android.content.pm.PackageManager.NameNotFoundException e) { return false; }
+        if (launcher < 0) {
+            Context a = getContext();
+            try { a.getPackageManager().getActivityInfo(new android.content.ComponentName(a, Launcher.class), 0); launcher = 1; }
+            catch (android.content.pm.PackageManager.NameNotFoundException e) { launcher = 0; }
+        }
+        return launcher == 1;
     }
     void toLauncher() { toLauncher(false); }
     // game: on the running game's own screen (the launcher's "game" extra, as the desktop app's Play sends it), which has its Save rows
@@ -502,19 +511,20 @@ public final class Gamepad extends View {
         int g = gameTouches; press(getWidth() / 2f, getHeight() / 2f); check("a touch in the middle goes to the game's touch screen", gameTouches > g && game[0] >= 0);
         release(getWidth() / 2f, getHeight() / 2f); check("and is lifted", game[0] < 0);
         // the pause menu, with a game to hold (without one ≡ leaves for the launcher: not pressed here)
-        if (nativePause(true)) {
-            nativePause(false);
+        if (hold(true)) {
+            hold(false);
             press(menuCx(), menuCy()); release(menuCx(), menuCy()); check("≡ opens the pause menu", menuOpen);
             press(faceX(B_A), faceY(B_A)); check("no control under the menu reaches the game", lastBtn == 0); release(faceX(B_A), faceY(B_A));
             boolean f = fpsOn; RectF mr = menuRow(M_FPS);
             press(mr.centerX(), mr.centerY()); release(mr.centerX(), mr.centerY()); check("its frame-rate counter row turns the counter " + (f ? "off" : "on"), fpsOn != f && menuOpen);
             press(mr.centerX(), mr.centerY()); release(mr.centerX(), mr.centerY()); check("and back", fpsOn == f);
+            menuSel = M_RESUME;   // the taps left it on the counter's row
             menuKeyUi(MK_UP); check("a controller's up goes round to the last row", menuId(menuSel) == M_LEAVE);
             check("the save row is there with a launcher only", (menuN() == 5) == hasLauncher() && (menuId(3) == M_SAVE) == hasLauncher());
             menuKeyUi(MK_DOWN); menuKeyUi(MK_OK); check("down and A on Resume close it", !menuOpen);
             menuKeyUi(MK_TOGGLE); check("a controller's Mode key opens it", menuOpen);
             menuKeyUi(MK_BACK); check("and B closes it", !menuOpen);
-        } else nativeLog("gamepad check: no game is running: the pause menu not checked");
+        } else nativeLog("gamepad check: no game is running, or its host is older than the pause menu: not checked");
         nativeLog("gamepad check: " + checks + " checks, " + fails + " failed");
         while (full || tap) { press(swapCx(), swapCy()); release(swapCx(), swapCy()); }   // back to 2D
     }

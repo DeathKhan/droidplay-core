@@ -585,7 +585,9 @@ static void publish(void) {
     pthread_mutex_unlock(&g_in_mu);
 }
 // What holds the game, from the two things that can: the app in the background (on_cmd) suspends the audio, the menu suspends it too and stops the clock and the vibration.
-// One place, so coming back to the app with the menu still open does not start the audio under it
+// One place, so coming back to the app with the menu still open does not start the audio under it.
+// The menu owns the clock's freeze reason 1 here (dm.h: "background"; nothing else on this front freezes for it, only hle_oe.c's scripted background, a test's): the reasons are
+// flags, not counts, so a background freeze added to this front later needs a reason of its own, or leaving the app with the menu open would thaw the clock under it
 static void hold_sync(void) {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static int held;
     pthread_mutex_lock(&mu);
@@ -699,7 +701,12 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
             return 1;
         }
         // a controller's Back key (some send it for B or for their back / select button) is B: left to Android, Back closes the activity and the game with it, unsaved.
-        // The phone's own Back (gesture or key, a keyboard source) keeps doing that
+        // The phone's own Back (gesture or key, a keyboard source) keeps doing that, except with the pause menu open: there it resumes, as B does
+        if (!b && code == AKEYCODE_BACK && (src & AINPUT_SOURCE_GAMEPAD) != AINPUT_SOURCE_GAMEPAD) {
+            static int back_menu;   // the key-up of a Back that closed the menu is the menu's too
+            if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN) { back_menu = atomic_load(&g_menu); if (back_menu && !AKeyEvent_getRepeatCount(ev)) menu_key(MK_BACK); }
+            if (back_menu) { if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP) back_menu = 0; return 1; }
+        }
         if (!b && code == AKEYCODE_BACK && (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD) b = DM_BTN_B;
         if (!b) return 0;
         if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN) g_pad_btn |= b; else if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP) g_pad_btn &= ~b;

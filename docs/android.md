@@ -113,7 +113,7 @@ or **Build Game App** (an APK, or an XAPK for an installer app). Its README has 
   to the game's touch screen. Their size and how far in from the sides they sit are the settings screen's choices; a game app, which has none, takes `DM_PAD_SCALE` and
   `DM_PAD_INSET` from its `env.txt`. A physical controller works as player 1 and hides the touch controls (its A/B/X/Y by position, or by label for a controller with Nintendo's layout: [settings](settings.md#controller-face-buttons)); rumble goes to the controller or the phone, and shaking the phone
   shakes the controller. The **≡** button at the top (left of −), or a controller's Mode or Menu key where Android passes it on, opens the pause menu: the game is held
-  under it (its clock, sound and vibration stop, and no input reaches it) until **Resume**, ≡ again or B. Its rows change the touch layout and turn the frame-rate
+  under it (its clock, sound and vibration stop, and no input reaches it) until **Resume**, ≡ again, B or the phone's Back. Its rows change the touch layout and turn the frame-rate
   counter on or off for this run (the settings screen's choice is the one that is kept), **Export or import the save…** opens the game's screen in the launcher,
   where the Save rows are (they ask before closing the game: a save is not swapped under a running game), and **Back to the launcher** goes there while the game
   keeps running behind it: **Play** on the same game resumes it, and picking another game asks before closing the running one. A game app has no launcher: it has
