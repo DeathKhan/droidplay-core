@@ -83,6 +83,7 @@ ANDROID_TESTED = {
     '010057D006492000',   # OCTOPATH TRAVELER (Playable – major issues through H'aanit's first battles)
     '0100A3501946E000',   # OCTOPATH TRAVELER II (Playable – major issues through Hikari's first battle; 1.0.0 from a derived profile)
     '0100606026F12000',   # Final Fantasy Resonance
+    '01009D901BC56000',   # Donkey Kong Country Returns HD (In-game into 1-1 at 60 fps; Playable needs a person; 1.0.0 from a derived profile)
     '010069C01AB82000',   # SHIN MEGAMI TENSEI V: Vengeance (a contributor's report)
     '01001F5010DFA000',   # Pokémon Legends: Arceus (In-game; washed-out picture, no characters on Mali)
 }
