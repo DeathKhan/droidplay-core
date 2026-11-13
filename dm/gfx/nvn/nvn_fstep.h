@@ -126,7 +126,11 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         if (!--s->grace && s->ramp && s->plate && s->ptotal + FSTEP_GRACE <= FSTEP_PROBE_MAX && s->pb <= (1 - FSTEP_RAMP) * s->pa) { s->grace = FSTEP_GRACE; s->pa = s->pb = 0; s->plate = 0; }   // still getting cheaper: another window
     }
     int settling = s->settle > 0; if (settling) s->settle--;
-    if (late) { s->late++; s->late_run = grace || settling || soft ? 0 : s->late_run + 1; s->fit_run = s->fit_miss = 0; s->late_cmax = s->late_run <= 1 ? (s->late_run ? cost : 0) : fmax(s->late_cmax, cost); } else { s->late_run = 0; s->late_cmax = 0; }
+    if (late) {   // late_cmax follows late_run: a frame in grace, settling or soft-late neither counts in the run nor raises its highest cost
+        int counts = !(grace || settling || soft);
+        s->late++; s->late_run = counts ? s->late_run + 1 : 0; s->fit_run = s->fit_miss = 0;
+        if (counts) s->late_cmax = s->late_run == 1 ? cost : fmax(s->late_cmax, cost);
+    } else s->late_run = 0;
     if (!(s->k > kmin && s->gpu > 0 && s->gpu <= FSTEP_FIT * (s->k - 1))) s->gfit_run = s->gfit_miss = 0;   // the GPU does not fit the shorter hold (or none known): no run
     else if (!late || soft) s->gfit_run++;
     else if (++s->gfit_miss > FSTEP_GFIT_MISS) s->gfit_run = s->gfit_miss = 0;   // a late frame: up to FSTEP_GFIT_MISS of them in a run (Ocarina of Time's Kokiri Forest at hold 3: one in ten)
@@ -139,6 +143,7 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
             s->cref_at[s->ckmin] = s->cref;
         }
         s->ckmin = kmin; s->run = s->crun = 0; s->cref = kmin <= FSTEP_MAX ? s->cref_at[kmin] : 0;
+        s->hitch_fails = 0;   // one cap's hitches do not use up the next one's allowance
     }
     // A frame the screen showed on time while its cost did not fit (absorbed by present snapshots) is not what the hold costs: the probes would take it for the scene that held kmin
     int fits = !scr || cost <= held;
@@ -153,8 +158,9 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         if (want < s->k + 1) want = s->k + 1;
         if (want > kmax) want = kmax;
         // A trial back to kmin whose late frames all cost what fits kmin failed on hitches (a load, a stall), not on the scene's cost: the hold-off stays as it was, up to
-        // FSTEP_HITCH_MAX such failures in a row. Trials to a longer hold, probes and trials by kheld (Ocarina of Time's 20 -> 30 fps) double it as before
-        int hitch = s->trial && !s->probe && !s->mtrial && held == kmin && s->late_cmax <= FSTEP_FIT * held && s->hitch_fails < FSTEP_HITCH_MAX;
+        // FSTEP_HITCH_MAX such failures in a row. Trials to a longer hold, probes, trials by kheld (Ocarina of Time's 20 -> 30 fps) and GPU-fit trials (counted in gfail)
+        // double it as before
+        int hitch = s->trial && !s->probe && !s->mtrial && !s->gtrial && held == kmin && s->late_cmax <= FSTEP_FIT * held && s->hitch_fails < FSTEP_HITCH_MAX;
         if (hitch) { s->failed++; s->trial = 0; s->hitch_fails++; }
         else if (s->trial || (s->probe == 2 && s->since < hold_max)) { s->failed++; s->trial = 0; s->hold = s->hold * 2 < hold_max ? s->hold * 2 : hold_max; s->hitch_fails = 0;
             if (s->mtrial && ++s->mfail >= 3 && held <= FSTEP_MAX) s->kheld[held] = 0;   // (three failed trials by kheld: that hold's cost is no longer the scene's)

@@ -452,6 +452,24 @@ int main(void) {
         run(&c, 10, 0.2, 1, 3, 0); run(&c, 3, 1.5, 1, 3, 0);
         check(c.s.k == 2 && c.s.hold == 2 * FSTEP_HOLD0, "  a trial failing on its frames' cost doubles the hold-off");
     }
+    {   // Hitch-only failures next to the GPU-fit trials (3d9f479c): soft-late frames, GPU-fit trials and a change of cap
+        sim m = {0}; m.gpu = 0.5; run(&m, 120, 0.2, 1, 3, 0);
+        for (int i = 0; i < 3; i++) m.next = nvn_fstep_next(&m.s, 3.0, 0.3, 1, 3, 0, 0);
+        for (int i = 0; i < 400 && !m.s.trial; i++) run(&m, 1, 0.2, 1, 3, 0);
+        int tried = m.s.trial && m.s.k == 1 && !m.s.gtrial; run(&m, 10, 0.2, 1, 3, 0);
+        for (int i = 0; i < 2; i++) m.next = nvn_fstep_next(&m.s, 1.4, 1.4, 1, 3, 0, 0);   // soft late (GPU 0.5 fits 1): not in late_run, nor in late_cmax
+        for (int i = 0; i < 3; i++) m.next = nvn_fstep_next(&m.s, 3.0, 0.3, 1, 3, 0, 0);
+        snprintf(b, sizeof b, "hitches after soft-late frames of 1.4: still a hitch-only failure (late_cmax %.2f, hold %.0f)", m.s.late_cmax, m.s.hold);
+        check(tried && m.s.k == 2 && m.s.hold == FSTEP_HOLD0 && m.s.hitch_fails == 1 && m.s.late_cmax <= FSTEP_FIT, b);
+        run(&m, 1, 0.2, 2, 3, 0);
+        check(m.s.hitch_fails == 0, "  a change of cap forgets the hitch-only failures");
+        sim g = {0}; g.gpu = 0.5; run(&g, 120, 0.2, 1, 3, 0); run(&g, 3, 1.6, 1, 3, 0);   // hold 2 at a cost of 1.5 that does not fit 1, a GPU of 0.5 that does
+        for (int i = 0; i < 400 && !g.s.trial; i++) run(&g, 1, 1.5, 1, 3, 0);
+        int gtried = g.s.trial && g.s.gtrial && g.s.k == 1; run(&g, 35, 0.2, 1, 3, 0);
+        for (int i = 0; i < 3; i++) g.next = nvn_fstep_next(&g.s, 3.0, 0.3, 1, 3, 0, 0);
+        snprintf(b, sizeof b, "  a GPU-fit trial back to 1 failing on hitches doubles the hold-off and counts in gfail (hold %.0f, gfail %d)", g.s.hold, g.s.gfail);
+        check(gtried && g.s.k == 2 && g.s.hold == 2 * FSTEP_HOLD0 && g.s.gfail == 1 && g.s.hitch_fails == 0, b);
+    }
     {   // The pipeline's lateness at a hold the GPU fits (FSTEP_LATE_SOFT): Ocarina of Time on a OnePlus Pad 3, GPU 1.3 vsyncs, frames of 2.2 at hold 2 (late by 0.2)
         sim m = {0}; m.gpu = 1.3; run(&m, 120, 0.5, 1, 3, 0); run(&m, 60, 2.4, 1, 3, 0);
         check(m.s.k == 2 && m.s.ups == 1, "soft late: frames of 2.4 with 1.3 of GPU step from 1 to 2 and stay at 2 (not 3)");
