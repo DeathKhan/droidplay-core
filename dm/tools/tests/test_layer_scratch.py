@@ -11,8 +11,8 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[3]
-CC = (['xcrun', 'clang'] if sys.platform == 'darwin' and shutil.which('xcrun') else
-      [c] if (c := shutil.which('clang') or shutil.which('cc') or shutil.which('gcc')) else None)
+_CC = shutil.which('clang') or shutil.which('cc') or shutil.which('gcc')
+CC = ['xcrun', 'clang'] if sys.platform == 'darwin' and shutil.which('xcrun') else [_CC] if _CC else []   # empty: no C compiler
 SRC = '''#include "layer_scratch.h"
 #define X __attribute__((visibility("default")))
 X int g_takes(const lsc_slot *s, int n, uint32_t layers, uint32_t samples) { return lsc_takes(s, n, layers, samples); }
