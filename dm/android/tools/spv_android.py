@@ -12,16 +12,26 @@
 #     mapped to Vulkan's 0..1 (nvn_mtl.m adds the same as its main0_z entry point; Vulkan without VK_EXT_depth_clip_control has no other way);
 #   the uniform slots' size table (bank 25, which the translator's TranslationFlags.MetalUniformBounds reads before each read of c[3..16]) is taken out, its bound
 #     tests made true and its binding dropped from res.json (cbsize_strip): the reads are the ones the translator wrote before the table;
-#   res.json cbufs[].ext: how many bytes of each constant buffer the shader can read (cb_extents, on the final module; the .z / .tf variants add no constant buffer read).
-# Usage: spv_android.py <dmsh_xlate output dir> <out dir> [key ...]   (all keys of the input dir by default); prints one line per shader and a summary
-import itertools, json, struct, sys
+#   res.json cbufs[].ext: how many bytes of each constant buffer the shader can read (cb_extents; the .z / .tf variants add no constant buffer read);
+#   for a vertex shader, the constant buffer reads its position is made of can read their row through a value known only at run time (pos_rows), after cb_extents,
+#     which these reads would otherwise make the whole buffer: Qualcomm's Adreno 740 driver lost those rows in the position-only copy of a shader it bins with.
+#     A specialization constant the host sets only where it is needed turns them on; off, the rows are the constant ones.
+#   a task or mesh shader (res.json "mesh", spv_build.py), translated as compute, made a Vulkan task or mesh module (spv_mesh.py), a mesh shader's .z.spv with the depth
+#   -1..1 mapping as a vertex shader's; res.json stage 'ts' / 'ms' and prim_locs, the locations it writes per primitive.
+# Usage: spv_android.py [-j N] <dmsh_xlate output dir> <out dir> [key ...]   (all keys of the input dir by default); prints a line for each shader with a problem, and a summary
+#   The shaders are done in N processes (default: one per CPU), each writing its own shaders' files: a shader's files depend only on its own inputs, so they are the same as one
+#   process makes, and the lines come out in key order. This is pure Python, about 20 shaders a second on one core (most of it cb_extents), so in one process it was most of a
+#   big game's translation time: Ocarina of Time's 42,328 shaders took about 33 minutes after 3 of translating.
+import concurrent.futures as cf, functools, itertools, json, multiprocessing, os, struct, sys
 from pathlib import Path
 
-ANDROID_CHAIN = 5   # res.json 'android': bumped when this post-pass or spv_build.py's translation changes what they make (spv_build.py translates older outputs again).
+ANDROID_CHAIN = 6   # res.json 'android': bumped when this post-pass or spv_build.py's translation changes what they make (spv_build.py translates older outputs again).
                     # 5: the size table taken out (cbsize_strip), so a chain 4 output of the merged translator, which reads it, is translated again
+                    # 6: a vertex shader's position can read its constant buffer rows at run time (pos_rows, behind a specialization constant); with it, the translator types sampled array layers S32
+                    #    (StructuredProgram.GetSourceVarType), so a layer no longer goes through float locals (#135 and #147 shipped together)
 EXT_FROM = 3   # 4 added res.json cbufs[].ext (cb_extents) and nothing else: spv_build.py brings an output of chain 3 up to date from its .spv (add_ext), without the translator,
                # only while ANDROID_CHAIN is EXT_FROM + 1 (upgrade stamps that chain, so a later bump for a change to the .spv translates chain 3's outputs again)
-SET_OF = {'vs': 0, 'ps': 1, 'gs': 2, 'tc': 3, 'te': 3, 'cs': 0}
+SET_OF = {'vs': 0, 'ps': 1, 'gs': 2, 'tc': 3, 'te': 3, 'cs': 0, 'ms': 0, 'ts': 2}   # a mesh pipeline: mesh in the vertex shader's set, task in the geometry shader's
 OP_CAP, OP_EXT, OP_EXECMODE, OP_ENTRY, OP_DECORATE, OP_MEMBERDECORATE = 17, 10, 16, 15, 71, 72
 OP_FUNCTION, OP_FUNCTIONEND, OP_RETURN, OP_VARIABLE, OP_TYPEPOINTER, OP_TYPEINT, OP_TYPEFLOAT, OP_TYPEVECTOR, OP_CONSTANT = 54, 56, 253, 59, 32, 21, 22, 23, 43
 OP_ACCESSCHAIN, OP_LOAD, OP_STORE, OP_COMPOSITEEXTRACT, OP_COMPOSITEINSERT, OP_FADD, OP_FMUL, OP_LABEL = 65, 61, 62, 81, 82, 129, 133, 248
@@ -41,6 +51,22 @@ def parse(data):
         ins.append([op] + w[i + 1:i + n]); i += n
     return hdr, ins
 
+def unreadable(data):
+    """Why data isn't a whole SPIR-V module, or None. The translator writes each output with File.WriteAllBytes, which creates the file before it writes: a write that fails,
+    as on a full disk, leaves it empty or cut short, and parse stopped the post-pass at the first one (IndexError at w[0], droidplay-core#307). A module cut at an
+    instruction's end still parses, but no longer ends in OpFunctionEnd, as every module with a function does"""
+    if not data: return 'empty (0 bytes)'
+    if len(data) % 4 or len(data) < 24: return f'cut short ({len(data):,} bytes)'
+    w = struct.unpack('<%dI' % (len(data) // 4), data)
+    if w[0] != 0x07230203: return f'not SPIR-V ({len(data):,} bytes)'
+    i, last = 5, None
+    while i < len(w):
+        n = w[i] >> 16
+        if not n or i + n > len(w): return f'cut short ({len(data):,} bytes: an instruction runs past the end)'
+        last, i = w[i] & 0xffff, i + n
+    if last != OP_FUNCTIONEND: return f'cut short ({len(data):,} bytes: it does not end in OpFunctionEnd)'
+    return None
+
 def emit(hdr, ins):
     out = list(hdr)
     for x in ins: out.append((len(x) << 16) | x[0]); out.extend(x[1:])
@@ -49,8 +75,9 @@ def emit(hdr, ins):
 def ext_name(x):   # OpExtension's literal string
     return b''.join(struct.pack('<I', v) for v in x[1:]).split(b'\0')[0].decode()
 
-def process(data, stage, cbsize=None):
-    """→ (header, instructions, interlock removed, size table taken out: None when the shader has none, else True, or False when its use was not the translator's)"""
+def process(data, stage, cbsize=None, keep=()):
+    """→ (header, instructions, interlock removed, size table taken out: None when the shader has none, else True, or False when its use was not the translator's).
+    keep: variables whose descriptor set stays as it is (spv_meshemu.compute's buffers)"""
     hdr, ins = parse(data)
     stripped = None
     if cbsize is not None: hdr, ins, stripped = cbsize_strip(hdr, ins, cbsize)
@@ -58,7 +85,7 @@ def process(data, stage, cbsize=None):
     out = []
     for x in ins:
         op = x[0]
-        if op == OP_DECORATE and x[2] == DEC_DESCRIPTORSET: x = x[:3] + [s]
+        if op == OP_DECORATE and x[2] == DEC_DESCRIPTORSET and x[1] not in keep: x = x[:3] + [s]
         if op == OP_CAP and x[1] in INTERLOCK_CAPS: interlock = True; continue
         if op == OP_EXT and ext_name(x) == 'SPV_EXT_fragment_shader_interlock': continue
         if op == OP_EXECMODE and x[2] in INTERLOCK_MODES: continue
@@ -216,22 +243,28 @@ def cbsize_strip(hdr, ins, binding):
     hdr = list(hdr); hdr[3] = bound
     return hdr, out, True
 
+def pos_var(ins):
+    """→ (the position's Output variable, its member index in a gl_PerVertex block or None for a variable of its own), or None"""
+    member_pos = {x[1]: x[2] for x in ins if x[0] == OP_MEMBERDECORATE and x[3] == DEC_BUILTIN and x[4] == BUILTIN_POSITION}   # struct id → member index
+    direct_pos = {x[1] for x in ins if x[0] == OP_DECORATE and x[2] == DEC_BUILTIN and x[3] == BUILTIN_POSITION}
+    ptr_pointee = {x[1]: (x[2], x[3]) for x in ins if x[0] == OP_TYPEPOINTER}   # pointer type → (storage, pointee)
+    found = None
+    for x in ins:
+        if x[0] == OP_VARIABLE and x[3] == STORAGE_OUTPUT:
+            st, pointee = ptr_pointee[x[1]]
+            if x[2] in direct_pos: found = (x[2], None)
+            elif pointee in member_pos: found = (x[2], member_pos[pointee])
+    return found
+
 def z_variant(hdr, ins):
     """Before each OpReturn of the entry point: position.z = (position.z + position.w) * 0.5"""
     bound = hdr[3]
     def new():
         nonlocal bound; bound += 1; return bound - 1
     entry = next(x[2] for x in ins if x[0] == OP_ENTRY)
-    member_pos = {x[1]: x[2] for x in ins if x[0] == OP_MEMBERDECORATE and x[3] == DEC_BUILTIN and x[4] == BUILTIN_POSITION}   # struct id → member index
-    direct_pos = {x[1] for x in ins if x[0] == OP_DECORATE and x[2] == DEC_BUILTIN and x[3] == BUILTIN_POSITION}
-    ptr_pointee = {x[1]: (x[2], x[3]) for x in ins if x[0] == OP_TYPEPOINTER}   # pointer type → (storage, pointee)
-    var = idx = None
-    for x in ins:
-        if x[0] == OP_VARIABLE and x[3] == STORAGE_OUTPUT:
-            st, pointee = ptr_pointee[x[1]]
-            if x[2] in direct_pos: var, idx = x[2], None
-            elif pointee in member_pos: var, idx = x[2], member_pos[pointee]
-    if var is None: return None
+    pv = pos_var(ins)
+    if pv is None: return None
+    var, idx = pv
     tf = next((x[1] for x in ins if x[0] == OP_TYPEFLOAT and x[2] == 32), None)
     tv4 = next((x[1] for x in ins if x[0] == OP_TYPEVECTOR and x[2] == tf and x[3] == 4), None)
     ti = next((x[1] for x in ins if x[0] == OP_TYPEINT and x[2] == 32 and x[3] == 1), None)
@@ -257,6 +290,109 @@ def z_variant(hdr, ins):
         out.append(x)
     hdr = list(hdr); hdr[3] = bound
     return emit(hdr, out)
+
+# ---- The position's constant buffer rows read at run time (pos_rows) ----
+OP_EXTINST, OP_FNEGATE, OP_FSUB, OP_SLESSTHAN, OP_COMPOSITECONSTRUCT, OP_COPYOBJECT_ = 12, 127, 131, 177, 80, 83
+STORAGE_UNIFORM, STORAGE_FUNCTION, BUILTIN_INSTANCEINDEX, GLSL_FMA = 2, 7, 43, 50
+OP_SPECCONSTANTFALSE, DEC_SPECID = 49, 1
+POS_ROWS_SPEC = 7401   # the specialization constant (a bool, false unless the host sets it) that turns the run-time rows on: gfx_vk_posrows.inc POS_ROWS_SPEC_ID
+def pos_rows(hdr, ins):
+    """→ (header, instructions, reads changed). A vertex shader's constant buffer reads that its position is made of by arithmetic alone (OpFAdd, OpFSub, OpFMul,
+    OpFNegate, Fma, copies, selects, and the Function variables the translator keeps each value in, when stored once) read their row as row + (on ? min(gl_InstanceIndex, 0) : 0):
+    the same row (an instance index counts up from the draw's base instance, never below 0). `on` is a specialization constant (SpecId POS_ROWS_SPEC),
+    false unless the host sets it: false, the zero is a constant and the row folds back to the constant one, so a GPU the host leaves alone compiles the
+    shader as it did; true, the row is one the driver's compiler cannot know. Qualcomm's Adreno 740 driver
+    (V@0676.32, the Ayn Odin 2) bins a pass with a position-only copy of each vertex shader that has other outputs; in Final Fantasy Resonance's vertex shader
+    19274e72bf8f5d0d that copy read c3's rows 0-3 (Unreal's TranslatedWorldToClip, constant indices it loads ahead into constant registers) as garbage, the cards'
+    triangles were binned nowhere and the field's flames never drew; the full shader read them right, as Turnip and the Adreno 830 did. A run-time row is loaded
+    when it is read. These are the matrix the last transform multiplies by (16 reads in a shader of Unreal's); a value stored in more than one place ends the walk.
+    Run-time rows cost GPU time (on in every vertex shader, Animal Crossing's island took 25% more on the Odin 2), so the host turns them on only on Qualcomm's
+    Adreno 7xx driver and only for the vertex shaders a game's profile names (vk_pos_rows; gfx_vk_posrows.inc)"""
+    pv = pos_var(ins)
+    if pv is None: return hdr, ins, 0
+    var, member = pv
+    bound = hdr[3]
+    def new():
+        nonlocal bound; bound += 1; return bound - 1
+    entry = next(x[2] for x in ins if x[0] == OP_ENTRY)
+    const = {x[2]: x[3] for x in ins if x[0] == OP_CONSTANT}
+    ctype = {x[2]: x[1] for x in ins if x[0] == OP_CONSTANT}
+    ty = {x[1]: x for x in ins if x[0] in (OP_TYPEINT, OP_TYPEFLOAT, OP_TYPEVECTOR, OP_TYPEBOOL, OP_TYPESTRUCT_, OP_TYPEARRAY, OP_TYPERUNTIMEARRAY_)}
+    ptr = {x[1]: (x[2], x[3]) for x in ins if x[0] == OP_TYPEPOINTER}
+    glsl = {x[1] for x in ins if x[0] == 11 and ext_name([0, *x[2:]]) == 'GLSL.std.450'}
+    defs, stores, fn = {}, {}, None   # result id → (instruction, function); pointer → the values stored through it
+    for x in ins:
+        op = x[0]
+        if op == OP_FUNCTION: fn = x[2]
+        elif op == OP_FUNCTIONEND: fn = None
+        if op in (OP_LOAD, OP_ACCESSCHAIN, OP_FADD, OP_FSUB, OP_FMUL, OP_FNEGATE, OP_EXTINST, OP_COPYOBJECT_, OP_COMPOSITEEXTRACT, OP_COMPOSITECONSTRUCT, OP_SELECT, OP_VARIABLE):
+            defs[x[2]] = (x, fn)
+        elif op == OP_STORE: stores.setdefault(x[1], []).append(x[2])
+    def row_of(c):   # an access chain into member 0 (an array) of a Uniform block, every index a constant of a 32-bit integer: → its row index, else None
+        b = defs.get(c[3])
+        if len(c) < 6 or not b or b[0][0] != OP_VARIABLE or b[0][3] != STORAGE_UNIFORM or const.get(c[4]) != 0 or any(i not in const for i in c[5:]): return None
+        s = ty.get(ptr.get(b[0][1], (0, 0))[1])
+        if not s or s[0] != OP_TYPESTRUCT_ or ty.get(s[2], [0])[0] != OP_TYPEARRAY: return None
+        t = ty.get(ctype[c[5]])
+        return c[5] if t and t[0] == OP_TYPEINT and t[2] == 32 else None
+    todo = []   # the values stored into the position (the variable, or a chain into it: its member, then a component)
+    for x in ins:
+        if x[0] != OP_STORE: continue
+        d = defs.get(x[1])
+        if (x[1] == var and member is None) or (d and d[0][0] == OP_ACCESSCHAIN and d[0][3] == var and (member is None or const.get(d[0][4]) == member)):
+            todo.append(x[2])
+    marked, seen = set(), set()
+    while todo:
+        v = todo.pop()
+        if v in seen or v not in defs: continue
+        seen.add(v); x, f = defs[v]; op = x[0]
+        if f != entry: continue
+        if op in (OP_FADD, OP_FSUB, OP_FMUL): todo += x[3:5]
+        elif op in (OP_FNEGATE, OP_COPYOBJECT_, OP_COMPOSITEEXTRACT): todo.append(x[3])
+        elif op == OP_COMPOSITECONSTRUCT: todo += x[3:]
+        elif op == OP_SELECT: todo += x[4:6]   # either value: the merged translator's bounded read, (test ? read : 0), cbsize_strip leaves with its test true
+        elif op == OP_EXTINST and x[3] in glsl and x[4] == GLSL_FMA: todo += x[5:8]
+        elif op == OP_LOAD and x[3] in defs:
+            y, g = defs[x[3]]
+            if y[0] == OP_ACCESSCHAIN and g == entry and row_of(y) is not None: marked.add(y[2])
+            elif y[0] == OP_VARIABLE and y[3] == STORAGE_FUNCTION and len(stores.get(y[2], ())) == 1: todo.append(stores[y[2]][0])
+    if not marked: return hdr, ins, 0
+    glob, decs = [], []   # declarations added before the first function, decorations after the last
+    tb = next((x[1] for x in ins if x[0] == OP_TYPEBOOL), None)
+    if tb is None: tb = new(); glob.append([OP_TYPEBOOL, tb])
+    iv = next((x[1] for x in ins if x[0] == OP_DECORATE and x[2] == DEC_BUILTIN and x[3] == BUILTIN_INSTANCEINDEX), None)
+    it = ty.get(ptr.get(defs[iv][0][1], (0, 0))[1]) if iv in defs else None
+    if it is None or it[0] != OP_TYPEINT or it[2] != 32:   # no gl_InstanceIndex: one is declared (a signed int, an Input of the entry point)
+        rt = sorted({ctype[row_of(defs[c][0])] for c in marked})[0]
+        pi = next((x[1] for x in ins if x[0] == OP_TYPEPOINTER and x[2] == STORAGE_INPUT and x[3] == rt), None)
+        if pi is None: pi = new(); glob.append([OP_TYPEPOINTER, pi, STORAGE_INPUT, rt])
+        iv = new(); glob.append([OP_VARIABLE, pi, iv, STORAGE_INPUT]); decs.append([OP_DECORATE, iv, DEC_BUILTIN, BUILTIN_INSTANCEINDEX]); it = ty[rt]; add_iv = True
+    else: add_iv = False
+    zero, head = {}, []   # row type → its zero, computed at the top of the entry point: on ? min(gl_InstanceIndex, 0) : 0
+    on = new(); glob.append([OP_SPECCONSTANTFALSE, tb, on]); decs.append([OP_DECORATE, on, DEC_SPECID, POS_ROWS_SPEC])
+    li = new(); head.append([OP_LOAD, it[1], li, iv])
+    for t in sorted({ctype[row_of(defs[c][0])] for c in marked}):
+        c0 = next((x[2] for x in ins if x[0] == OP_CONSTANT and x[1] == t and x[3] == 0), None)
+        if c0 is None: c0 = new(); glob.append([OP_CONSTANT, t, c0, 0])
+        v = li
+        if t != it[1]: v = new(); head.append([OP_BITCAST, t, v, li])
+        lt, m, z = new(), new(), new(); head += [[OP_SLESSTHAN, tb, lt, v, c0], [OP_SELECT, t, m, lt, v, c0], [OP_SELECT, t, z, on, m, c0]]; zero[t] = z
+    last_dec = max(i for i, x in enumerate(ins) if x[0] in (OP_DECORATE, OP_MEMBERDECORATE))
+    out, in_entry, labelled, done_glob = [], False, False, False
+    for i, x in enumerate(ins):
+        op = x[0]
+        if op == OP_FUNCTION and not done_glob: out.extend(glob); done_glob = True
+        if op == OP_FUNCTION: in_entry = x[2] == entry; labelled = False
+        elif op == OP_FUNCTIONEND: in_entry = False
+        if in_entry and labelled and head and op != OP_VARIABLE: out.extend(head); head = []   # after the first block's variables
+        if in_entry and op == OP_LABEL: labelled = True
+        if op == OP_ENTRY and add_iv: x = x + [iv]
+        if op == OP_ACCESSCHAIN and in_entry and x[2] in marked:
+            r = row_of(x); n = new(); out.append([OP_IADD, ctype[r], n, r, zero[ctype[r]]]); x = x[:5] + [n] + x[6:]
+        out.append(x)
+        if i == last_dec: out.extend(decs)
+    hdr = list(hdr); hdr[3] = bound
+    return hdr, out, len(marked)
 
 OP_TYPEINT_, OP_TYPESTRUCT, OP_TYPERUNTIMEARRAY, OP_BITCAST, OP_IMUL, OP_IADD = 21, 30, 29, 124, 132, 128
 STORAGE_INPUT, STORAGE_SB, DEC_LOCATION, DEC_BLOCK, DEC_ARRAYSTRIDE, DEC_OFFSET, DEC_BINDING, BUILTIN_VERTEXINDEX = 1, 12, 30, 2, 6, 35, 33, 42
@@ -750,30 +886,98 @@ def upgrade(out, key):
     add_ext(res, parse((out / f'{key}.spv').read_bytes())[1]); res['android'] = EXT_FROM + 1   # the chain this makes, not ANDROID_CHAIN: after a later bump, retranslated
     rp.write_text(json.dumps(res), encoding='utf-8')
 
+def post(src, dst, k):
+    """Shader k of folder src made ready, its files written into dst → (its counts for main's summary: depth variant, without one, extents known, read whole, size table
+    taken out, run-time row reads, a compute form made; the lines it prints). A pool job's result is these few numbers and lines, never the shader's bytes"""
+    try: return post_one(src, dst, k)
+    except Exception as e: e.add_note(f'shader {k} in {src}'); raise   # the pool runs shaders out of order: the traceback names the one that stopped it
+
+def put(p, data):   # a file written whole or not at all: to a temporary name, then renamed (a full disk midway leaves no cut-short file under the real name)
+    t = p.with_name(p.name + '.tmp'); t.write_bytes(data); os.replace(t, p)
+
+def lost(dst, k, why):   # a shader whose translator output can't be read: its line, and no res.json of an older run left, so it counts as not translated and is translated again
+    (dst / f'{k}.res.json').unlink(missing_ok=True)
+    return (0, 0, 0, 0, 0, 0, 0), [f"[RED] {k}: the translator's output can't be read: {why} (a write that failed, as on a full disk): not translated"]
+
+def post_one(src, dst, k):
+    try: res = json.loads((src / f'{k}.res.json').read_text(encoding='utf-8'))
+    except FileNotFoundError: return lost(dst, k, 'no .res.json')
+    except ValueError: return lost(dst, k, '.res.json empty or cut short')
+    data = (src / f'{k}.spv').read_bytes()
+    if why := unreadable(data): return lost(dst, k, f'.spv {why}')
+    stage = res.get('stage', 'vs'); lines = []; nz = bad = ncs = nrows = nemu = 0; files = {}   # its files besides res.json, written before it (put): res.json makes it translated
+    cs = next((c['binding'] for c in res.get('cbufs') or [] if c.get('slot') == CBSIZE_BANK), None)
+    if res.get('mesh'):   # a task or mesh shader translated as compute (spv_build.py): the stage module, and a mesh shader's depth -1..1 variant
+        import spv_mesh
+        mesh = res.pop('mesh'); stage = res['stage'] = mesh['info']['kind']
+        kernel = data
+        try:
+            plain, res['prim_locs'] = spv_mesh.wrap(data, mesh['info'], mesh['lay'])
+            zdata = spv_mesh.wrap(data, mesh['info'], mesh['lay'], gl=True)[0] if stage == 'ms' else None
+        except ValueError as e:
+            return (0, 1, 0, 0, 0, 0, 0), [f'[RED] {k}: {e}: no {"task" if stage == "ts" else "mesh"} module']
+        data = plain
+        if zdata:
+            zh, zi, _, _ = process(zdata, stage, cs); files['.z.spv'] = emit(zh, zi); nz = 1
+        try:   # the emulation's forms (spv_meshemu.py): what a GPU without VK_EXT_mesh_shader runs instead (gfx_vk_meshemu.inc)
+            import spv_meshemu
+            cdata, keep, pk, direct = spv_meshemu.compute(kernel, mesh['info'], mesh['lay'])
+            ch, ci, _, _ = process(cdata, 'cs', cs, keep); files['.cs.spv'] = emit(ch, ci)
+            if stage == 'ms':
+                files['.pvs.spv'] = spv_meshemu.vertex(mesh['info'])
+                files['.pvs.z.spv'] = spv_meshemu.vertex(mesh['info'], gl=True)
+            res['mesh_emu'] = spv_meshemu.facts(mesh['info'], pk, direct); nemu = 1
+        except ValueError as e:
+            lines.append(f'[RED] {k}: {e}: no compute form (a GPU without VK_EXT_mesh_shader skips its draws)'); res['mesh_emu'] = None
+    hdr, ins, interlock, stripped = process(data, stage, cs)
+    if interlock: res.setdefault('notes', []).append('android: fragment shader interlock removed (no ordering of overlapping fragments)')
+    if stripped: res['cbufs'] = [c for c in res['cbufs'] if c.get('slot') != CBSIZE_BANK]; ncs = 1
+    elif stripped is False: lines.append(f'[RED] {k}: the uniform slots\' size table (c{CBSIZE_BANK}) is used other than the translator\'s bound tests use it: left in (it loses the device on Adreno 830)')
+    res['set'] = SET_OF.get(stage, 0); res['android'] = ANDROID_CHAIN
+    eb, ew = add_ext(res, ins)
+    if stage == 'vs':   # after add_ext: a run-time row would keep the whole buffer, and it reads the rows the constant one did
+        hdr, ins, nrows = pos_rows(hdr, ins)
+        res['vin'] = vin_types(ins)
+    files['.spv'] = emit(hdr, ins)
+    if stage == 'vs' and res.get('tf'):
+        files['.tf.spv'] = tf_variant(hdr, ins, res['tf'])
+    if stage == 'vs':
+        z = z_variant(hdr, ins)
+        if z: files['.z.spv'] = z; nz = 1
+        else: bad = 1; lines.append(f'[RED] {k}: no position output found, no depth -1..1 variant')
+    for suffix, b in files.items(): put(dst / f'{k}{suffix}', b)
+    put(dst / f'{k}.res.json', json.dumps(res).encode())   # last: a shader whose res.json is there has all its files (spv_build.py skips it on the next run)
+    return (nz, bad, eb, ew, ncs, nrows, nemu), lines
+
+CHUNK = 16   # shaders per pool job: ~0.8 s of work on average, so the pipe's round trips cost nothing and the last jobs still spread over the processes
+
+def jobs_default():
+    return (getattr(os, 'process_cpu_count', None) or os.cpu_count)() or 4   # the CPUs this process may use (3.13+), else the machine's
+
+def pool_size(j, n):   # processes for n shaders with -j j: 1 means none started
+    if sys.platform == 'win32': j = min(j, 61)   # ProcessPoolExecutor's limit on Windows (WaitForMultipleObjects); spv_build.py passes os.cpu_count()
+    return max(1, min(j, -(-n // CHUNK)))   # no more processes than jobs: a few shaders (an update's) are done here, with no pool to start
+
 def main():
-    src, dst = Path(sys.argv[1]), Path(sys.argv[2]); dst.mkdir(parents=True, exist_ok=True)
-    keys = sys.argv[3:] or sorted(p.stem for p in src.glob('*.spv') if not p.name.endswith('.reader.spv'))
-    n = nz = bad = eb = ew = ncs = 0
-    for k in keys:
-        res = json.loads((src / f'{k}.res.json').read_text(encoding='utf-8'))
-        stage = res.get('stage', 'vs')
-        cs = next((c['binding'] for c in res.get('cbufs') or [] if c.get('slot') == CBSIZE_BANK), None)
-        hdr, ins, interlock, stripped = process((src / f'{k}.spv').read_bytes(), stage, cs)
-        (dst / f'{k}.spv').write_bytes(emit(hdr, ins)); n += 1
-        if interlock: res.setdefault('notes', []).append('android: fragment shader interlock removed (no ordering of overlapping fragments)')
-        if stripped: res['cbufs'] = [c for c in res['cbufs'] if c.get('slot') != CBSIZE_BANK]; ncs += 1
-        elif stripped is False: print(f'[RED] {k}: the uniform slots\' size table (c{CBSIZE_BANK}) is used other than the translator\'s bound tests use it: left in (it loses the device on Adreno 830)')
-        res['set'] = SET_OF.get(stage, 0); res['android'] = ANDROID_CHAIN
-        b, w = add_ext(res, ins); eb += b; ew += w
-        if stage == 'vs': res['vin'] = vin_types(ins)
-        (dst / f'{k}.res.json').write_text(json.dumps(res), encoding='utf-8')
-        if stage == 'vs' and res.get('tf'):
-            (dst / f'{k}.tf.spv').write_bytes(tf_variant(hdr, ins, res['tf']))
-        if stage == 'vs':
-            z = z_variant(hdr, ins)
-            if z: (dst / f'{k}.z.spv').write_bytes(z); nz += 1
-            else: bad += 1; print(f'[RED] {k}: no position output found, no depth -1..1 variant')
-    print(f'spv_android: {n} shaders, {nz} depth variants, {bad} without one; constant buffers: {eb} with a known extent, {ew} read whole; the size table taken out of {ncs}')
+    a = sys.argv[1:]; j = jobs_default()
+    if a[:1] == ['-j']: j = int(a[1]); a = a[2:]
+    src, dst = Path(a[0]), Path(a[1]); dst.mkdir(parents=True, exist_ok=True)
+    keys = a[2:] or sorted(p.stem for p in src.glob('*.spv') if not p.name.endswith('.reader.spv'))
+    one = functools.partial(post, src, dst)
+    nz = bad = eb = ew = ncs = npr = nrows = nemu = 0
+    ex = None
+    if (n := pool_size(j, len(keys))) > 1:   # spawn on every host, as Windows has only spawn: the Mac's runs and tests cover what Windows runs
+        ex = cf.ProcessPoolExecutor(n, mp_context=multiprocessing.get_context('spawn'))
+    try:
+        for (z, b, e, w, c, r, m), lines in (ex.map(one, keys, chunksize=CHUNK) if ex else map(one, keys)):   # in key order, as one process prints them
+            for ln in lines: print(ln)
+            nz += z; bad += b; eb += e; ew += w; ncs += c; nrows += r; npr += r > 0; nemu += m
+    except BaseException:
+        if ex: ex.shutdown(cancel_futures=True)   # a shader that stops the post-pass stops it at once, not after every other job
+        raise
+    if ex: ex.shutdown()
+    print(f'spv_android: {len(keys)} shaders, {nz} depth variants, {bad} without one; constant buffers: {eb} with a known extent, {ew} read whole; the size table taken out of {ncs}; position rows read at run time in {npr} vertex shaders ({nrows} reads)'
+          + (f'; {nemu} task / mesh shaders in compute form too' if nemu else ''))
 
 if __name__ == '__main__':
     main()

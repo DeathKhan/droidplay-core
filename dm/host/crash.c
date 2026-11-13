@@ -2,6 +2,7 @@
 // Crash state: prints the faulting address, pc, lr (converted to module-relative offsets) and the registers; dispatches page fault hooks.
 // Only signal handling itself lives here: diagnostic features (probes / UI messages / sampling) are in diag.c, and this file does not depend on them (the graphics unit tests link only this file).
 #include "dm.h"
+#include "crash_text.h"
 #include <signal.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
@@ -27,6 +28,7 @@ static char g_watch_stage[2][256] = {"startup", "startup"};
 static unsigned g_watch_stall;
 static void (*g_dump_hook)(void);
 static void (*g_gfx_hook)(void);   // the graphics backend's part of a crash dump (crash_set_gfx_hook)
+static void (*g_pc_hook)(int sig, uint64_t pc, uint64_t lr, uint64_t fp);   // told where a crash is, before the dump (crash_set_pc_hook)
 static void (*g_wait_dump)(void);
 
 static uint64_t watch_now_ns(void) {
@@ -131,7 +133,7 @@ void dm_backtrace(uint64_t fp) {
 // ---------- Page fault hooks (write-protect dirty page tracking) ----------
 // Called in registration order before on_crash prints the crash state; returning 1 = handled (return directly and re-execute the faulting instruction); the crash path is taken only when all return 0.
 // Hooks run in signal handler context: only table lookups / atomic operations / mprotect are allowed, no memory allocation and no locking.
-#define MAX_FAULT_HOOK 4
+#define MAX_FAULT_HOOK 8   // the sandbox check, the dirty tracker, raw global memory's and the pool file's freeze windows, DM_PROBE_WATCH
 static int (*g_fault_hook[MAX_FAULT_HOOK])(void *addr, int is_write, void *uc);
 static void (*g_write_prep[MAX_FAULT_HOOK])(void *addr, size_t len);
 static int g_nfault_hook, g_nwrite_prep;
@@ -155,6 +157,8 @@ void crash_set_trap_hook(int (*fn)(ucontext_t *uc)) { g_trap_hook = fn; }
 void crash_set_dump_hook(void (*fn)(void)) { g_dump_hook = fn; }
 // The Android Vulkan backend lists the pipelines it is building (gfx_vk_draw.inc pb_dump): a crash in a driver's shader compiler (libllvm-qgl.so) said nothing of which one
 void crash_set_gfx_hook(void (*fn)(void)) { g_gfx_hook = fn; }
+// The Android host's driver guard: a crash in the code of a Vulkan driver the player chose (DM_VK_DRIVER) is recorded, so the next start runs the system's (vk_driver.c)
+void crash_set_pc_hook(void (*fn)(int sig, uint64_t pc, uint64_t lr, uint64_t fp)) { g_pc_hook = fn; }
 void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
 void crash_dump_now(const char *why) { fprintf(stderr, "[dm] state dump (%s): tick %u / stage %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
@@ -167,6 +171,13 @@ static void crash_gate(int sig) {
     if (none == me) _exit(128 + sig);
     for (;;) pause();
 }
+static int crash_rd(uint64_t a, void *to, size_t n) { vm_size_t got = 0; return vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)to, &got) == KERN_SUCCESS && got == n; }
+// `[dm] *xN text`: the text a register points at, when there is some (crash_text.h); an unaligned register can point into one too
+static void crash_text(int i, uint64_t a) {
+    unsigned char b[CRASH_TEXT_MAX]; char t[CRASH_TEXT_OUT]; int wide = 0;
+    int chars = a < 0x100000000ull ? 0 : crash_text_format(b, crash_text_read(a, b, crash_rd), !(a & 1), t, sizeof t, &wide);
+    if (chars) fprintf(stderr, "[dm] *x%d text (%s, %d characters): %s\n", i, wide ? "utf-16" : "utf-8", chars, t);
+}
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
@@ -175,6 +186,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
     }
     crash_gate(sig);
+    if (g_pc_hook) g_pc_hook(sig, DM_SS(uc).__pc, DM_SS(uc).__lr, DM_SS(uc).__fp);   // first: the dump below can hang or die
     // The stderr lock may be held by another thread (stuck or suspended): the fprintf below would hang with it, the time limit's SIGALRM could not end the run, and the log would get nothing.
     // If it still cannot be taken after 1 s, write a single line with write() (pc / lr as module offsets) and exit. When this thread itself holds the lock, ftrylockfile still succeeds (file locks are recursive), unaffected
     for (int i = 0; ftrylockfile(stderr); i++) {
@@ -206,10 +218,11 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     // What the registers point at: the first six words of each readable target (read with vm_read_overwrite, which fails instead of faulting); a word inside a module prints as a module offset, so an object's vtable names its class
     for (int i = 0; i < 29; i++) {
         uint64_t a = DM_SS(uc).__x[i], w[6]; vm_size_t got = 0;
-        if (a < 0x100000000ull || (a & 7) || vm_read_overwrite(mach_task_self(), (vm_address_t)a, sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) continue;
+        if (a < 0x100000000ull || (a & 7) || vm_read_overwrite(mach_task_self(), (vm_address_t)a, sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) { crash_text(i, a); continue; }
         fprintf(stderr, "[dm] *x%d:", i);
         for (int k = 0; k < 6; k++) off("", w[k]);
         fputc('\n', stderr);
+        crash_text(i, a);
     }
     // Stack scan: when the frame chain is broken (a return address was overwritten, pc = lr lands on garbage) the backtrace prints nothing; scan 512 words up from sp and list everything that resolves to a module / host symbol (nearest callers first)
     {   uint64_t sp = DM_SS(uc).__sp;   // The frame just popped (when a return address was overwritten, the bad value and the leftovers of whatever overwrote it sit below sp)

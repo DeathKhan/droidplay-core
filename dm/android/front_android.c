@@ -10,6 +10,7 @@
 //   before the first one, and without a game, a status screen. The device's Vulkan capabilities are written to the log at start.
 //   Input: touches are the touchscreen (hle_touch.c); a physical controller is player 1's (buttons by position, Nintendo's layout).
 #include "dm.h"
+#include "prev_file.h"   // the previous start's log and dumps (android_main)
 #include "front.h"
 #include "dm_input.h"
 #include "nvn_obj.h"
@@ -30,6 +31,8 @@ int main(int argc, char **argv);   // main.c
 void dm_focus_set(int st);
 void dm_audio_suspend(int on);
 void dm_gfx_suspend(int on);
+extern int g_swkbd_min_chars;   // hle_swkbd.c: this input's minimum length from ShowKeyboardArg; the applet keeps OK disabled until then, and so does the box (front_mac.m)
+void guest_clock_freeze_for(int reason, int on);   // hle_os.c
 
 enum { ST_START, ST_SELFTEST, ST_PASS, ST_FAIL, ST_GAME, ST_ENDED, ST_CRASHED, ST_DEMO };
 static int g_demo_frames;   // frames the NVN picture check presented (nvn_demo.c)
@@ -167,7 +170,10 @@ static void *guest_thread(void *p) {
             usleep(500000); u[0].value = u[1].value = (dm_vibration){0, 160, 0, 320}; dm_haptics_send(u, 2); LOG("rumble check: off");
         }
         const char *tt = getenv("DM_TEXT_TEST");   // env.txt: the software keyboard's box, as a game's swkbd call shows it (hle_swkbd.c), once after the demo
-        if (tt && atoi(tt)) { char out[64] = ""; int r = front_text_input("Name", "Check of the text box", "Type a name", "Link", 10, out, sizeof out); LOG("text box check: result %d, text \"%s\"", r, out); }
+        if (tt && atoi(tt)) {   // with a minimum of 2 characters, as a game's ShowKeyboardArg sets one; 2 types "Zelda" and a character outside the BMP, 9 bytes of UTF-8
+            char out[64] = ""; g_swkbd_min_chars = 2; int r = front_text_input("Name", "Check of the text box", "Type a name", "Link", 10, out, sizeof out); g_swkbd_min_chars = -1;
+            LOG("text box check: result %d, text \"%s\" (%d bytes)", r, out, (int)strlen(out));
+        }
     }
     int st = atomic_load(&g_state); if (st == ST_GAME || st == ST_SELFTEST) atomic_store(&g_state, ST_ENDED);
     return NULL;
@@ -192,6 +198,13 @@ static void start_host(void) {
     snprintf(buf, sizeof buf, "%s/main.fixups.tsv", code);
     if (exists(buf) && !getenv("DM_FORCE_SELFTEST")) {
         setenv("DM_ROOT", g_game, 0);
+        // An image somewhere else, which env.txt, launcher.txt or defaults.txt names (build_android_from_nsp.py --romfs-dir: an SD card's folder), wins over the game folder's.
+        // Said here in the player's words: the host's mount only finds no game files
+        const char *rf = getenv("DM_ROMFS");
+        if (rf && *rf && strncmp(rf, "fd:", 3) && access(rf, R_OK))
+            LOG("[RED] the game's RomFS %s (DM_ROMFS) %s: copy the game's RomFS.img there, or install the game again without --romfs-dir", rf, errno == EACCES
+                ? "can't be read by the app: Android 11 and later let it read only its own folders, Android/data/<its package> on the phone or its SD card"
+                : "is missing (the SD card taken out, or the image not copied yet)");
         snprintf(buf, sizeof buf, "%s/RomFS", g_game);   // a RomFS folder, or the packing script's RomFS image (hle_fs.c reads one as it is)
         if (!exists(buf)) snprintf(buf, sizeof buf, "%s/RomFS.img", g_game);
         if (exists(buf)) setenv("DM_ROMFS", buf, 0);
@@ -234,22 +247,36 @@ static jclass g_gp;   // org.nxnative.android.Gamepad (java/), from the activity
 // bottom of its stack (its implicit stack-overflow check), and it stays protected after the detach. The guest's main thread runs on its host thread's stack, which
 // QueryMemory reported to the SDK at start as that thread's stack (dm_android_stack_info), so Unity's conservative GC, which scans the whole range, faulted on the page
 // at its next collection (Brilliant Diamond 17 s after name entry: main+0x2944c0 under GC mark, the first page of the main thread's stack). No guest thread may attach.
-typedef struct { const char *title, *sub, *guide, *initial; int max_chars, out_cap, ok; char *out; } text_req;
+// Text crosses as UTF-8 in byte arrays, both ways: JNI's own strings (NewStringUTF, GetStringUTFChars) are modified UTF-8, where a character outside the BMP (an emoji) is
+// two 3-byte surrogates. The guest's 4-byte sequence is not valid input to NewStringUTF, and the surrogate bytes coming back are not UTF-8 to hle_swkbd.c.
+typedef struct { const char *title, *sub, *guide, *initial; int max_chars, min_chars, out_cap, ok; char *out; } text_req;
+static jbyteArray text_bytes(JNIEnv *e, const char *s) {
+    jsize n = s ? (jsize)strlen(s) : 0; jbyteArray a = (*e)->NewByteArray(e, n);
+    if (a && n) (*e)->SetByteArrayRegion(e, a, 0, n, (const jbyte *)s);
+    return a;
+}
 static void *text_input_thread(void *p) {
     text_req *q = p; JavaVM *vm = g_app->activity->vm; JNIEnv *e;
     if ((*vm)->AttachCurrentThread(vm, &e, NULL)) return NULL;
-    jmethodID m = (*e)->GetStaticMethodID(e, g_gp, "ask", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
-    jstring jt = (*e)->NewStringUTF(e, q->title ? q->title : ""), js = (*e)->NewStringUTF(e, q->sub ? q->sub : ""), jg = (*e)->NewStringUTF(e, q->guide ? q->guide : ""), ji = (*e)->NewStringUTF(e, q->initial ? q->initial : "");
-    jstring r = m ? (*e)->CallStaticObjectMethod(e, g_gp, m, g_app->activity->clazz, jt, js, jg, ji, (jint)q->max_chars) : NULL;
+    jmethodID m = (*e)->GetStaticMethodID(e, g_gp, "ask", "(Landroid/app/Activity;[B[B[B[BII)[B");
+    jbyteArray jt = text_bytes(e, q->title), js = text_bytes(e, q->sub), jg = text_bytes(e, q->guide), ji = text_bytes(e, q->initial);
+    jbyteArray r = m ? (*e)->CallStaticObjectMethod(e, g_gp, m, g_app->activity->clazz, jt, js, jg, ji, (jint)q->max_chars, (jint)q->min_chars) : NULL;
     if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionDescribe(e); (*e)->ExceptionClear(e); r = NULL; }
     q->ok = r != NULL;
-    if (q->ok) { const char *u = (*e)->GetStringUTFChars(e, r, NULL); snprintf(q->out, (size_t)q->out_cap, "%s", u ? u : ""); (*e)->ReleaseStringUTFChars(e, r, u); }
+    if (q->ok) {   // a text longer than the caller's buffer ends at a whole character
+        jsize n = (*e)->GetArrayLength(e, r); jbyte *b = (*e)->GetByteArrayElements(e, r, NULL);
+        if (!b) n = 0;
+        if (n > q->out_cap - 1) { n = q->out_cap - 1; while (n > 0 && (b[n] & 0xC0) == 0x80) n--; }
+        if (n) memcpy(q->out, b, (size_t)n);
+        q->out[n] = 0;
+        if (b) (*e)->ReleaseByteArrayElements(e, r, b, JNI_ABORT);
+    }
     (*vm)->DetachCurrentThread(vm);
     return NULL;
 }
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     if (!g_gp || out_cap <= 0) return -1;
-    text_req q = {title, sub, guide, initial, max_chars, out_cap, -1, out}; pthread_t th;
+    text_req q = {title, sub, guide, initial, max_chars, g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0, out_cap, -1, out}; pthread_t th;
     if (pthread_create(&th, NULL, text_input_thread, &q)) return -1;
     pthread_join(th, NULL);
     if (q.ok < 0) return -1;
@@ -261,9 +288,16 @@ void front_android_present(const tex_t *t, const int crop[4]) { (void)t; (void)c
 // ---------- Vulkan ----------
 static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_q; static uint32_t g_qf;
 static VkSurfaceKHR g_surf; static VkSwapchainKHR g_sc; static VkImage g_img[8]; static uint32_t g_nimg; static VkFormat g_fmt; static VkExtent2D g_ext2;
+static int g_sc_srgb, g_sc_has_srgb;   // the swapchain made in R8G8B8A8_SRGB; the surface lists it (sc_encoding)
 static VkCommandPool g_cpool; static VkCommandBuffer g_cb; static VkBuffer g_stg; static VkDeviceMemory g_stgm; static void *g_stgp; static VkDeviceSize g_stg_sz;
 static VkFence g_fence; static VkSemaphore g_acq, g_done;
-#define VKC(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { LOG("[RED] Vulkan: %s = %d", #x, r_); return 0; } } while (0)
+static char g_vk_why[160];   // the call that failed last, for the fallback's line (vk_window_first)
+static int vk_bad(const char *call, VkResult r) {
+    LOG("[RED] Vulkan: %s = %d", call, r);
+    snprintf(g_vk_why, sizeof g_vk_why, "%.*s: %s", (int)strcspn(call, "("), call, vk_result_str(r));
+    return 0;
+}
+#define VKC(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) return vk_bad(#x, r_); } while (0)
 
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
 // What the NVN replay will need from this GPU (BC textures, bindless descriptor pools, geometry and transform feedback, border colors)
@@ -296,7 +330,7 @@ static void vk_probe(void) {
 static int vk_init(void) {   // the NVN replay's device (gfx_vk.c vkb): the window's swapchain and the game's textures are on one queue
     if (g_inst) return 1;
     vkb_ctx *c = vkb();
-    if (!c || !c->has_surface || !c->has_swapchain) { LOG("[RED] Vulkan: no device with a window surface"); return 0; }
+    if (!c || !c->has_surface || !c->has_swapchain) { LOG("[RED] Vulkan: no device with a window surface"); snprintf(g_vk_why, sizeof g_vk_why, "no device with a window surface"); return 0; }
     g_inst = c->inst; g_pd = c->pd; g_dev = c->dev; g_q = c->q; g_qf = c->qf;
     vk_probe();
     VkCommandPoolCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_qf};
@@ -318,12 +352,15 @@ static int vk_window_up(ANativeWindow *w) {
     if (!vk_init()) return 0;
     VkAndroidSurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, .window = w};
     VKC(vkCreateAndroidSurfaceKHR(g_inst, &si, NULL, &g_surf));
-    VkBool32 ok = 0; vkGetPhysicalDeviceSurfaceSupportKHR(g_pd, g_qf, g_surf, &ok); if (!ok) { LOG("[RED] Vulkan: the queue cannot present"); return 0; }
+    VkBool32 ok = 0; vkGetPhysicalDeviceSurfaceSupportKHR(g_pd, g_qf, g_surf, &ok);
+    if (!ok) { LOG("[RED] Vulkan: the queue cannot present"); snprintf(g_vk_why, sizeof g_vk_why, "the queue cannot present"); return 0; }
     VkSurfaceCapabilitiesKHR cap; VKC(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_pd, g_surf, &cap));
     uint32_t nf = 0; vkGetPhysicalDeviceSurfaceFormatsKHR(g_pd, g_surf, &nf, NULL);
     VkSurfaceFormatKHR fm[32]; if (nf > 32) nf = 32; vkGetPhysicalDeviceSurfaceFormatsKHR(g_pd, g_surf, &nf, fm);
-    g_fmt = fm[0].format; VkColorSpaceKHR cs = fm[0].colorSpace;
-    for (uint32_t i = 0; i < nf; i++) if (fm[i].format == VK_FORMAT_R8G8B8A8_UNORM) { g_fmt = fm[i].format; cs = fm[i].colorSpace; }
+    g_fmt = fm[0].format; VkColorSpaceKHR cs = fm[0].colorSpace; g_sc_has_srgb = 0;
+    for (uint32_t i = 0; i < nf; i++) if (fm[i].format == VK_FORMAT_R8G8B8A8_SRGB) g_sc_has_srgb = 1;
+    VkFormat want = g_sc_srgb && g_sc_has_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;   // the frame's encoding (sc_encoding)
+    for (uint32_t i = 0; i < nf; i++) if (fm[i].format == want) { g_fmt = fm[i].format; cs = fm[i].colorSpace; }
     g_ext2 = cap.currentExtent.width != 0xFFFFFFFFu ? cap.currentExtent : (VkExtent2D){(uint32_t)ANativeWindow_getWidth(w), (uint32_t)ANativeWindow_getHeight(w)};
     // The picture is drawn upright in the window's orientation (the extent above) with the identity transform, and the compositor rotates it for the
     // display; the current transform (90° in landscape) would ask for a picture drawn pre-rotated
@@ -332,6 +369,7 @@ static int vk_window_up(ANativeWindow *w) {
         .imageFormat = g_fmt, .imageColorSpace = cs, .imageExtent = g_ext2, .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = xf, .compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR, .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = 1};
     if (!(cap.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)) sc.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (vk_driver_fail("swapchain")) { snprintf(g_vk_why, sizeof g_vk_why, "DM_VK_DRIVER_FAIL=swapchain"); return 0; }   // a test, with the surface made: its teardown is tried too
     VKC(vkCreateSwapchainKHR(g_dev, &sc, NULL, &g_sc));
     g_nimg = 8; VKC(vkGetSwapchainImagesKHR(g_dev, g_sc, &g_nimg, g_img));
     // Staging buffer the status picture is drawn into (host visible), copied to the swapchain image each refresh
@@ -345,6 +383,27 @@ static int vk_window_up(ANativeWindow *w) {
     VKC(vkAllocateMemory(g_dev, &ma, NULL, &g_stgm)); VKC(vkBindBufferMemory(g_dev, g_stg, g_stgm, 0)); VKC(vkMapMemory(g_dev, g_stgm, 0, g_stg_sz, 0, &g_stgp));
     LOG("window %ux%u, swapchain %u images, format %d", g_ext2.width, g_ext2.height, g_nimg, g_fmt);
     return 1;
+}
+static void vk_front_down(void) {   // everything vk_init and vk_window_up made, so the device can be made again (vk_window_first)
+    vk_window_down();
+    if (g_dev) {
+        if (g_acq) vkDestroySemaphore(g_dev, g_acq, NULL);
+        if (g_done) vkDestroySemaphore(g_dev, g_done, NULL);
+        if (g_fence) vkDestroyFence(g_dev, g_fence, NULL);
+        if (g_cpool) vkDestroyCommandPool(g_dev, g_cpool, NULL);   // and g_cb with it
+    }
+    g_acq = g_done = VK_NULL_HANDLE; g_fence = VK_NULL_HANDLE; g_cpool = VK_NULL_HANDLE; g_cb = VK_NULL_HANDLE;
+    g_inst = VK_NULL_HANDLE; g_pd = VK_NULL_HANDLE; g_dev = VK_NULL_HANDLE; g_q = VK_NULL_HANDLE;
+}
+// The first window comes before the host starts (on_cmd), so the front end's are the only Vulkan objects yet. When a DM_VK_DRIVER driver makes the device but can't put a
+// picture on the window (a surface or swapchain it fails), they, the device and the instance are destroyed and made again on the system's driver (gfx_vk.c vkb_fallback):
+// before this, the game ran with no picture. A later window can't do this, as the game's textures, buffers and pipelines live on the device by then
+static void vk_window_first(ANativeWindow *w) {
+    g_vk_why[0] = 0;
+    if (vk_window_up(w) || !vk_driver_name()) return;
+    char why[200]; snprintf(why, sizeof why, "the first window failed (%s)", g_vk_why[0] ? g_vk_why : "the line above says where");
+    vk_front_down();
+    if (vkb_fallback(why)) vk_window_up(w);
 }
 
 // ---------- Status picture: text drawn with android.graphics (JNI) into a bitmap, copied into the staging buffer ----------
@@ -390,6 +449,7 @@ static void status_draw(void) {
         text("Loading the game...", u, y, 0.55f * u, 0xFFFFD080); y += 0.8f * u;
     }
     if (st == ST_SELFTEST || st == ST_PASS) { text(getenv("DM_FORCE_SELFTEST") ? "Self test (from the launcher)" : "No game in Android/data/org.nxnative.android/files/games/" DM_GAME_ID "/", u, y, 0.55f * u, 0xFFA0A0A0); y += 0.8f * u; }
+    { int warn; const char *vn = vk_driver_note(&warn); if (vn) { text(vn, u, y, 0.55f * u, warn ? 0xFFFFD080 : 0xFFA0A0A0); y += 0.8f * u; } }   // the DM_VK_DRIVER driver, or why not
     pthread_mutex_lock(&g_txt_mu); snprintf(line, sizeof line, "%.120s", g_last); pthread_mutex_unlock(&g_txt_mu);
     text(line, u, (float)g_ext2.height - u, 0.45f * u, 0xFF909090);
     // bitmap → staging buffer (RGBA bytes; swapped to BGRA for a BGRA swapchain)
@@ -432,6 +492,17 @@ static uint64_t g_shown;
 // The swapchain follows the window: made again when the window's size differs from it, or when presenting reports it out of date. Launched while the screen was
 // locked, the app got a 1x1 window first and kept a 1x1 swapchain, which the compositor stretched over the screen (one texel of the picture: whole-screen colour flicker)
 static int g_sc_stale;
+// The swapchain in the presented frame's encoding. A blit from an sRGB image decodes it to linear, and one into a UNORM image stores linear values unencoded, so
+// Link's Awakening's RGBA8_SRGB window shown in a UNORM swapchain was a gamma too dark (its bytes are right: the dump's present.png showed them). With the
+// swapchain in sRGB as well, the blit decodes and encodes again and carries the frame's bytes. Made again when the frame's encoding changes, where the surface
+// lists R8G8B8A8_SRGB (Android's surfaces do); DM_VK_SC_SRGB=0 keeps UNORM, as before
+static int sc_encoding(VkFormat f) {   // 1: the swapchain is to be made again (the frame not shown)
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_SC_SRGB"); on = !(e && *e == '0'); }
+    int srgb = on && (f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
+    if (srgb == g_sc_srgb || (srgb && !g_sc_has_srgb)) return 0;
+    LOG("[front] the frame is %s (format %d): swapchain made again in %s", srgb ? "sRGB" : "not sRGB", (int)f, srgb ? "R8G8B8A8_SRGB" : "R8G8B8A8_UNORM");
+    g_sc_srgb = srgb; g_sc_stale = 1; return 1;
+}
 static void sc_follow_window(void) {
     if (!g_app || !g_app->window || !g_sc) return;
     int ww = ANativeWindow_getWidth(g_app->window), wh = ANativeWindow_getHeight(g_app->window);
@@ -478,6 +549,7 @@ static int frame_draw(void) {
     if (!g_sc || (st != ST_GAME && st != ST_DEMO)) return 0;
     vkb_frame fr; if (!vkb_frame_lock(&fr)) return 0;
     if (fr.n == g_shown) { vkb_frame_unlock(); return 1; }
+    if (sc_encoding(fr.fmt)) { vkb_frame_unlock(); return 1; }   // shown once the swapchain is made again (sc_follow_window)
     vkWaitForFences(g_dev, 1, &g_fence, 1, UINT64_MAX);
     uint32_t idx; VkResult r = vkAcquireNextImageKHR(g_dev, g_sc, 100000000ull, g_acq, VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) g_sc_stale = 1;   // made again before the next frame (sc_follow_window); not on SUBOPTIMAL, which the identity transform in landscape gives every frame
@@ -521,16 +593,43 @@ static int frame_draw(void) {
 // ---------- Input ----------
 // The touch controls (Gamepad.java) and a physical controller (the native input queue) are merged as dm/ios's DmGamepad.m does: buttons ORed, a tilted physical stick wins
 static int g_ctl_used;
-static uint64_t g_pad_btn; static int32_t g_axis[4];
+static uint64_t g_pad_btn, g_hat; static int32_t g_axis[4];   // g_hat: the directions a hat holds (they come as axes, not as keys)
 static pthread_mutex_t g_in_mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_touch_btn, g_shake_btn, g_pad_now; static int32_t g_touch_ax[4];
 static int tilted(int32_t x, int32_t y) { return (int64_t)x * x + (int64_t)y * y > (int64_t)4000 * 4000; }
+// The pause menu (Gamepad.java draws it and owns its rows; the ≡ button or a controller's Mode / Menu key opens it). While it is open the game is held as a suspended
+// application is: its audio suspended (the silent sink keeps the pacing), the guest clock frozen with clock reads waiting (reason 1, hle_os.c), vibration stopped, and
+// no input reaches it. g_swallow: the buttons held when the menu closed (the B or A that closed it) stay from the game until they are let go
+static _Atomic int g_menu, g_bg; static uint64_t g_swallow;
 static void publish(void) {
     pthread_mutex_lock(&g_in_mu);
     int32_t lx = g_touch_ax[0], ly = g_touch_ax[1], rx = g_touch_ax[2], ry = g_touch_ax[3];
     if (tilted(g_axis[0], g_axis[1])) { lx = g_axis[0]; ly = g_axis[1]; }
     if (tilted(g_axis[2], g_axis[3])) { rx = g_axis[2]; ry = g_axis[3]; }
-    dm_input_set(g_touch_btn | g_pad_now | g_shake_btn, lx, ly, rx, ry);
+    uint64_t b = g_touch_btn | g_pad_now | g_shake_btn; g_swallow &= b;
+    if (atomic_load(&g_menu)) dm_input_set(0, 0, 0, 0, 0); else dm_input_set(b & ~g_swallow, lx, ly, rx, ry);
     pthread_mutex_unlock(&g_in_mu);
+}
+// What holds the game, from the two things that can: the app in the background (on_cmd) suspends the audio, the menu suspends it too and stops the clock and the vibration.
+// One place, so coming back to the app with the menu still open does not start the audio under it.
+// The menu owns the clock's freeze reason 1 here (dm.h: "background"; nothing else on this front freezes for it, only hle_oe.c's scripted background, a test's): the reasons are
+// flags, not counts, so a background freeze added to this front later needs a reason of its own, or leaving the app with the menu open would thaw the clock under it
+static void hold_sync(void) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static int held;
+    pthread_mutex_lock(&mu);
+    int menu = atomic_load(&g_menu);
+    if (menu && !held) { dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_haptics_suspend(DM_HAPTICS_INACTIVE, 1); }
+    else if (!menu && held) { dm_haptics_suspend(DM_HAPTICS_INACTIVE, 0); guest_clock_freeze_for(1, 0); }
+    held = menu;
+    dm_audio_suspend(menu || atomic_load(&g_bg));
+    pthread_mutex_unlock(&mu);
+}
+static jboolean JNICALL n_pause(JNIEnv *e, jclass c, jboolean on) {   // → 0: no game is running, there is nothing to hold (the menu does not open)
+    (void)e; (void)c;
+    if (on && atomic_load(&g_state) != ST_GAME) return 0;
+    if (!on) { pthread_mutex_lock(&g_in_mu); g_swallow = g_touch_btn | g_pad_now; pthread_mutex_unlock(&g_in_mu); }
+    atomic_store(&g_menu, on ? 1 : 0); publish(); hold_sync();
+    LOG("pause menu %s", on ? "open: the game is held (audio, clock, vibration, input)" : "closed: the game goes on");
+    return 1;
 }
 static void pad_now(uint64_t b) { pthread_mutex_lock(&g_in_mu); g_pad_now = b; pthread_mutex_unlock(&g_in_mu); publish(); }
 static void JNICALL n_touchpad(JNIEnv *e, jclass c, jlong b, jint lx, jint ly, jint rx, jint ry) {
@@ -561,7 +660,8 @@ static void gamepad_start(void) {
     if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionDescribe(e); (*e)->ExceptionClear(e); c = NULL; }
     if (!c) { LOG("[RED] no Java side in the app (classes.dex): no touch controls, no text input"); return; }
     static const JNINativeMethod nm[] = {{"nativeTouchPad", "(JIIII)V", (void *)n_touchpad}, {"nativeGameTouch", "([I[F[FI)V", (void *)n_gametouch},
-        {"nativeShake", "(Z)V", (void *)n_shake}, {"nativeOpMode", "()I", (void *)n_opmode}, {"nativeDefaultLayout", "()I", (void *)n_layout}, {"nativeLog", "(Ljava/lang/String;)V", (void *)n_log}, {"nativeEnv", "(Ljava/lang/String;)Ljava/lang/String;", (void *)n_env}, {"nativeFrames", "()J", (void *)n_frames}};
+        {"nativeShake", "(Z)V", (void *)n_shake}, {"nativeOpMode", "()I", (void *)n_opmode}, {"nativeDefaultLayout", "()I", (void *)n_layout}, {"nativeLog", "(Ljava/lang/String;)V", (void *)n_log}, {"nativeEnv", "(Ljava/lang/String;)Ljava/lang/String;", (void *)n_env}, {"nativeFrames", "()J", (void *)n_frames},
+        {"nativePause", "(Z)Z", (void *)n_pause}};
     if ((*e)->RegisterNatives(e, c, nm, sizeof nm / sizeof *nm)) { (*e)->ExceptionClear(e); LOG("[RED] Gamepad natives not registered"); return; }
     g_gp = (*e)->NewGlobalRef(e, c);
     void dm_haptics_android_init(JavaVM *vm, jclass cls, JNIEnv *e); dm_haptics_android_init(g_app->activity->vm, g_gp, e);
@@ -572,9 +672,23 @@ static void gamepad_reset(void) {   // the app went away: nothing stays held
     if (g_gp) { JNIEnv *e = g_env; (*e)->CallStaticVoidMethod(e, g_gp, (*e)->GetStaticMethodID(e, g_gp, "reset_", "()V")); if ((*e)->ExceptionCheck(e)) (*e)->ExceptionClear(e); }
     g_pad_btn = 0; memset(g_axis, 0, sizeof g_axis); pad_now(0);
 }
+// DM_PAD_ABXY: how a controller's A, B, X and Y keys become the Switch's. position (the default): by where the button sits, as Android names them after an Xbox pad
+// (A bottom, B right, X left, Y top), so the Switch's A is the right-hand button. label: A to A and so on, for a controller whose firmware already gives those keys
+// Nintendo's labels: a Retroid Pocket G2 in its "Retro" layout sends BUTTON_A from its right button, which position turned into the Switch's B (droidplay-core#247)
+static int abxy_label(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PAD_ABXY"); v = e && !strcmp(e, "label"); } return v; }
+static uint64_t face_button(int32_t code) {
+    int i = code == AKEYCODE_BUTTON_A ? 0 : code == AKEYCODE_BUTTON_B ? 1 : code == AKEYCODE_BUTTON_X ? 2 : code == AKEYCODE_BUTTON_Y ? 3 : -1;
+    if (i < 0) return 0;
+    static const uint64_t pos[] = {DM_BTN_B, DM_BTN_A, DM_BTN_Y, DM_BTN_X}, lab[] = {DM_BTN_A, DM_BTN_B, DM_BTN_X, DM_BTN_Y};
+    static const char *const name[] = {"BUTTON_A", "BUTTON_B", "BUTTON_X", "BUTTON_Y"}, *const spos[] = {"B", "A", "Y", "X"}, *const slab[] = {"A", "B", "X", "Y"};
+    int label = abxy_label(); static int said;   // each key's mapping said once, so a player's log shows which button became which
+    if (!(said >> i & 1)) { said |= 1 << i; LOG("controller: Android's %s is the Switch's %s (by %s; DM_PAD_ABXY=%s maps by %s)", name[i], label ? slab[i] : spos[i],
+                                                  label ? "label" : "position", label ? "position" : "label", label ? "position" : "label"); }
+    return label ? lab[i] : pos[i];
+}
 static uint64_t key_button(int32_t code) {
-    switch (code) {   // by position: the bottom face button is the Switch's B, the right one A, the left one Y, the top one X
-        case AKEYCODE_BUTTON_A: return DM_BTN_B; case AKEYCODE_BUTTON_B: return DM_BTN_A; case AKEYCODE_BUTTON_X: return DM_BTN_Y; case AKEYCODE_BUTTON_Y: return DM_BTN_X;
+    uint64_t f = face_button(code); if (f) return f;   // A, B, X and Y: by position or by label (DM_PAD_ABXY)
+    switch (code) {
         case AKEYCODE_BUTTON_L1: return DM_BTN_L; case AKEYCODE_BUTTON_R1: return DM_BTN_R; case AKEYCODE_BUTTON_L2: return DM_BTN_ZL; case AKEYCODE_BUTTON_R2: return DM_BTN_ZR;
         case AKEYCODE_BUTTON_THUMBL: return DM_BTN_LS; case AKEYCODE_BUTTON_THUMBR: return DM_BTN_RS; case AKEYCODE_BUTTON_START: return DM_BTN_PLUS; case AKEYCODE_BUTTON_SELECT: return DM_BTN_MINUS;
         case AKEYCODE_DPAD_LEFT: return DM_BTN_LEFT; case AKEYCODE_DPAD_UP: return DM_BTN_UP; case AKEYCODE_DPAD_RIGHT: return DM_BTN_RIGHT; case AKEYCODE_DPAD_DOWN: return DM_BTN_DOWN;
@@ -582,18 +696,46 @@ static uint64_t key_button(int32_t code) {
     }
 }
 static int32_t ax(float v) { if (v > -0.12f && v < 0.12f) v = 0; return (int32_t)(v * DM_STICK_MAX); }
+// A controller in the pause menu: the popup that draws it takes no keys (not focusable), so they come here and go to Gamepad.menuKey. MK_*: its codes.
+// Each press counts once, a direction from the D-pad, the hat or the left stick; A (the Switch's, after DM_PAD_ABXY) chooses and B closes
+enum { MK_TOGGLE, MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_OK, MK_BACK };
+static void menu_key(int k) {
+    static jmethodID m; JNIEnv *e = g_env; if (!g_gp) return;
+    if (!m) m = (*e)->GetStaticMethodID(e, g_gp, "menuKey", "(I)V");
+    if (m) (*e)->CallStaticVoidMethod(e, g_gp, m, (jint)k);
+    if ((*e)->ExceptionCheck(e)) (*e)->ExceptionClear(e);
+}
+static void menu_nav(uint64_t b) {
+    static uint64_t was;
+    if (g_axis[1] > DM_STICK_MAX / 2) b |= DM_BTN_UP; else if (g_axis[1] < -DM_STICK_MAX / 2) b |= DM_BTN_DOWN;
+    if (g_axis[0] > DM_STICK_MAX / 2) b |= DM_BTN_RIGHT; else if (g_axis[0] < -DM_STICK_MAX / 2) b |= DM_BTN_LEFT;
+    uint64_t down = b & ~was; was = b;   // followed while the menu is closed too: what is held as it opens is not a press in it
+    if (!atomic_load(&g_menu)) return;
+    if (down & DM_BTN_UP) menu_key(MK_UP); if (down & DM_BTN_DOWN) menu_key(MK_DOWN); if (down & DM_BTN_LEFT) menu_key(MK_LEFT); if (down & DM_BTN_RIGHT) menu_key(MK_RIGHT);
+    if (down & DM_BTN_A) menu_key(MK_OK); if (down & DM_BTN_B) menu_key(MK_BACK);
+}
 static int32_t on_input(struct android_app *app, AInputEvent *ev) {
     (void)app;
     if (atomic_load(&g_state) != ST_GAME) return 0;
     int src = AInputEvent_getSource(ev);
     if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_KEY) {
         int32_t code = AKeyEvent_getKeyCode(ev); uint64_t b = key_button(code);
+        // a controller's Mode key (its logo or home button, where Android passes it on) and a Menu key open and close the pause menu
+        if (code == AKEYCODE_BUTTON_MODE || code == AKEYCODE_MENU) {
+            if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN && !AKeyEvent_getRepeatCount(ev)) menu_key(MK_TOGGLE);
+            return 1;
+        }
         // a controller's Back key (some send it for B or for their back / select button) is B: left to Android, Back closes the activity and the game with it, unsaved.
-        // The phone's own Back (gesture or key, a keyboard source) keeps doing that
+        // The phone's own Back (gesture or key, a keyboard source) keeps doing that, except with the pause menu open: there it resumes, as B does
+        if (!b && code == AKEYCODE_BACK && (src & AINPUT_SOURCE_GAMEPAD) != AINPUT_SOURCE_GAMEPAD) {
+            static int back_menu;   // the key-up of a Back that closed the menu is the menu's too
+            if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN) { back_menu = atomic_load(&g_menu); if (back_menu && !AKeyEvent_getRepeatCount(ev)) menu_key(MK_BACK); }
+            if (back_menu) { if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP) back_menu = 0; return 1; }
+        }
         if (!b && code == AKEYCODE_BACK && (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD) b = DM_BTN_B;
         if (!b) return 0;
         if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN) g_pad_btn |= b; else if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP) g_pad_btn &= ~b;
-        g_ctl_used = 1; pad_now(g_pad_btn); return 1;
+        g_ctl_used = 1; pad_now(g_pad_btn); menu_nav(g_pad_btn | g_hat); return 1;
     }
     if (AInputEvent_getType(ev) != AINPUT_EVENT_TYPE_MOTION) return 0;
     if (src & AINPUT_SOURCE_JOYSTICK) {
@@ -605,14 +747,16 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
         float hx = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_HAT_X, 0), hy = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_HAT_Y, 0);
         uint64_t b = g_pad_btn & ~(uint64_t)(DM_BTN_LEFT | DM_BTN_RIGHT | DM_BTN_UP | DM_BTN_DOWN);
         if (hx < -0.5f) b |= DM_BTN_LEFT; if (hx > 0.5f) b |= DM_BTN_RIGHT; if (hy < -0.5f) b |= DM_BTN_UP; if (hy > 0.5f) b |= DM_BTN_DOWN;
+        g_hat = b & ~g_pad_btn;
         // analog triggers on LTRIGGER / RTRIGGER, or BRAKE / GAS (Xbox controllers over Bluetooth, among others)
         float lt = fmaxf(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_LTRIGGER, 0), AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_BRAKE, 0));
         float rt = fmaxf(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RTRIGGER, 0), AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_GAS, 0));
         if (lt > 0.5f) b |= DM_BTN_ZL; else if (!(g_pad_btn & DM_BTN_ZL)) b &= ~(uint64_t)DM_BTN_ZL;
         if (rt > 0.5f) b |= DM_BTN_ZR; else if (!(g_pad_btn & DM_BTN_ZR)) b &= ~(uint64_t)DM_BTN_ZR;
-        g_ctl_used = 1; pad_now(b); return 1;
+        g_ctl_used = 1; pad_now(b); menu_nav(b); return 1;
     }
     if (src & AINPUT_SOURCE_TOUCHSCREEN) {   // the touch points as fractions of the window (the 16:9 picture once it is drawn)
+        if (atomic_load(&g_menu)) return 1;
         int act = AMotionEvent_getAction(ev) & AMOTION_EVENT_ACTION_MASK, up = AMotionEvent_getAction(ev) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
         size_t n = AMotionEvent_getPointerCount(ev); dm_touch t[16]; int k = 0;
         float w = (float)ANativeWindow_getWidth(g_app->window), h = (float)ANativeWindow_getHeight(g_app->window);
@@ -628,16 +772,33 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
 }
 
 // ---------- Lifecycle ----------
-static int g_started;
+static int g_started, g_job;
+// A start on a DM_VK_DRIVER driver counts as good (vk_driver.c vk_driver_ok) after 120 presented frames or 30 s of the game, or once the self test's picture check has drawn
+// on it, so a crash or hang before then makes the next start skip the driver once. A driver's first start compiles the game's pipelines with the status screen up, for over a
+// minute in Brilliant Diamond: that is not a failure, and so a hang in the driver after 30 s counts as good too (the records can't tell the two apart)
+static void driver_proven(void) {
+    static int done; static uint64_t t0; int st = atomic_load(&g_state);
+    if (done) return;
+    if (st == ST_PASS && g_demo_frames) { done = 1; vk_driver_ok(); return; }   // (ST_PASS comes once before the picture check too, when the self test passes)
+    if (st != ST_GAME) return;
+    if (!t0) t0 = mono_ns();
+    if (atomic_load(&g_frames) >= 120 || mono_ns() - t0 >= 30000000000ull) { done = 1; vk_driver_ok(); }
+}
 static void on_cmd(struct android_app *app, int32_t cmd) {
     int game = atomic_load(&g_state) == ST_GAME;
     switch (cmd) {
-        case APP_CMD_INIT_WINDOW: if (app->window) vk_window_up(app->window); if (!g_started) { g_started = 1; start_host(); gamepad_start(); } break;
+        case APP_CMD_INIT_WINDOW:
+            if (g_job) break;   // an Oodle job shows nothing and started without a window (android_main)
+            // a window that comes back (Home and back to the game) has a new swapchain with nothing in it: the newest frame is shown again, which a game held by the
+            // pause menu would not do itself (the picture behind the menu stayed black until Resume)
+            if (app->window) { if (g_started) { vk_window_up(app->window); g_shown = 0; } else vk_window_first(app->window); }
+            if (!g_started) { g_started = 1; start_host(); gamepad_start(); }
+            break;
         case APP_CMD_TERM_WINDOW: vk_window_down(); break;
         case APP_CMD_GAINED_FOCUS: if (game) dm_focus_set(1); break;
         case APP_CMD_LOST_FOCUS: gamepad_reset(); if (game) dm_focus_set(2); break;
-        case APP_CMD_PAUSE: vkb_pipeline_cache_save(); if (game) { dm_focus_set(3); dm_audio_suspend(1); } break;
-        case APP_CMD_RESUME: if (game) { dm_audio_suspend(0); dm_focus_set(1); } break;
+        case APP_CMD_PAUSE: vkb_pipeline_cache_save(); atomic_store(&g_bg, 1); if (game) { dm_focus_set(3); hold_sync(); } break;
+        case APP_CMD_RESUME: atomic_store(&g_bg, 0); if (game) { hold_sync(); dm_focus_set(1); } break;   // the audio stays suspended under an open pause menu
         default: break;
     }
 }
@@ -648,10 +809,23 @@ void android_main(struct android_app *app) {
     snprintf(g_int, sizeof g_int, "%s", app->activity->internalDataPath);
     snprintf(g_game, sizeof g_game, "%s/games/%s", g_ext, DM_GAME_ID);
     mkdirs(g_ext); mkdirs(g_int);
+    char lp[620]; snprintf(lp, sizeof lp, "%s/log.txt", g_ext); int kept = keep_prev(lp);   // the previous start's log (prev_file.h), before log_reader truncates it
     log_start();
     LOG("DroidPlay on Android: %s (%s), files %s, internal %s", DM_GAME_NAME, DM_GAME_ID, g_game, g_int);   // a log's first line
     env_file(g_ext, "env.txt", 1); env_file(g_game, "launcher.txt", 0); env_file(g_game, "defaults.txt", 0);
+    {   // and its dumps, before the host opens them: the frame table, and each audio output's PCM (<file>, <file>.<N>)
+        kept += keep_prev(getenv("DM_NVN_TSV")); const char *ad = getenv("DM_AUDIO_DUMP");
+        if (ad && *ad) { kept += keep_prev(ad); for (int i = 1; i < 8; i++) { char p[1024]; snprintf(p, sizeof p, "%s.%d", ad, i); kept += keep_prev(p); } }
+        if (kept) LOG("the previous start's log and dumps: %d file%s kept beside the new ones, with .prev before the extension (log.prev.txt)", kept, kept == 1 ? "" : "s");
+    }
     vk_driver_dirs(g_ext, g_int);   // DM_VK_DRIVER: a driver beside env.txt, run from a copy in the internal files
+    vk_driver_game(g_game, DM_GAME_ID);   // and its start records: games/<title ID>/vk_driver_result.txt
+    vk_start_game(g_game);   // and vk_start.txt, whatever driver runs
+    // An Oodle job (DM_OODLE_JOB: hle_oodle.c decodes before nnMain and exits; scripts/android_oodle.py) draws nothing, so it starts now, not at the first window. A build
+    // starts it on a phone nobody is watching, and with the screen off or locked the activity gets no window until someone wakes and unlocks it: Pokémon Legends: Z-A's
+    // jobs, sent after a long build on Windows, waited the build's 600 s each with nothing in log.txt past the settings (issues #403, #415)
+    const char *job = getenv("DM_OODLE_JOB");
+    if (job && *job) { g_job = g_started = 1; LOG("Oodle job: started without waiting for a window"); start_host(); }
     (*app->activity->vm)->AttachCurrentThread(app->activity->vm, &g_env, NULL);
     app->onAppCmd = on_cmd; app->onInputEvent = on_input;
     // The screen stays on while the game's window is up, as the launcher's does: Android counts only its own input events as activity, so a cutscene, a game
@@ -666,5 +840,6 @@ void android_main(struct android_app *app) {
             if (g_sc) break;
         }
         if (!frame_draw()) status_draw();
+        driver_proven(); vk_start_tick();
     }
 }

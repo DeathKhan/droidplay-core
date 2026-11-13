@@ -22,16 +22,21 @@ static int gm_seg_at(uintptr_t a) {   // the piece holding a, or -1 (caller hold
     return -1;
 }
 // a read-only storage buffer [addr, addr + n): 1 with *b, *off, *range the piece's buffer to bind; 0: copy it as before. The replay's thread, under g_bk, with a chunk open
-static int gm_inplace(uint64_t addr, size_t n, VkBuffer *b, VkDeviceSize *off, VkDeviceSize *range) {
-    if (!n || n > g_vk.props.limits.maxStorageBufferRange || !C || !g_ngm || !ip_on() || !gm_on()) return 0;
+// al: the binding's offset alignment (a storage buffer's for gm_inplace; 4 for an indirect dispatch's arguments, vk_dispatch)
+static int gm_inplace_al(uint64_t addr, size_t n, VkDeviceSize al, VkBuffer *b, VkDeviceSize *off, VkDeviceSize *range) {
+    if (!n || n > g_vk.props.limits.maxStorageBufferRange || !C || (!g_ngm && !atomic_load(&g_lz_any)) || !ip_on() || !gm_on()) return 0;   // (nothing placed yet but chunked pools: a binding may place its chunks)
     static struct { uint64_t a, n, seq; } memo[512];   // the stamps already made by this chunk: a buffer is often bound by many draws of one chunk
     unsigned h = (unsigned)((addr >> 6) ^ (addr >> 17) ^ n) & 511;
-    VkDeviceSize al = g_vk.props.limits.minStorageBufferOffsetAlignment ? g_vk.props.limits.minStorageBufferOffsetAlignment : 1;
+    if (!al) al = 1;
     pthread_mutex_lock(&g_gm_mu);
     int i = gm_seg_at((uintptr_t)addr);
-    if (i < 0) { pthread_mutex_unlock(&g_gm_mu); return 0; }
+    if (i < 0) {   // in a chunked pool, its chunks not placed yet: placed now, for this binding (gfx_vk_gmem_lazy.inc)
+        pthread_mutex_unlock(&g_gm_mu);
+        if (!gm_lazy_bind(addr, n)) return 0;
+        pthread_mutex_lock(&g_gm_mu);
+        if ((i = gm_seg_at((uintptr_t)addr)) < 0) { pthread_mutex_unlock(&g_gm_mu); return 0; } }
     const gm_seg *s = &g_gm[i]; VkDeviceSize o = (VkDeviceSize)(addr - s->lo);
-    if (addr + n > s->hi) { pthread_mutex_unlock(&g_gm_mu); g_ip_span++; return 0; }
+    if (addr + n > s->hi) { pthread_mutex_unlock(&g_gm_mu); g_ip_span++; gm_lazy_cross(addr); return 0; }   // (a chunked pool: made one allocation at the next submission, gfx_vk_gmem_lazy.inc)
     if (o % al) { pthread_mutex_unlock(&g_gm_mu); g_ip_unal++; return 0; }
     if (s->rd && !(memo[h].a == addr && memo[h].n == n && memo[h].seq == C->seq)) {
         uint64_t sq = C->seq; for (size_t p = (size_t)(o >> 12), e = (size_t)((o + n - 1) >> 12); p <= e; p++) s->rd[p] = sq;
@@ -50,12 +55,15 @@ static int gm_inplace(uint64_t addr, size_t n, VkBuffer *b, VkDeviceSize *off, V
 // DM_VK_INPLACE_WRITE=0 (env.txt): written ones copied and written back as before
 static int ip_w_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_INPLACE_WRITE"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_INPLACE_WRITE=0: written storage buffers are copied and written back as before"); } return v; }
 static uint64_t g_ip_wbinds, g_ip_wbytes;
+static int gm_inplace(uint64_t addr, size_t n, VkBuffer *b, VkDeviceSize *off, VkDeviceSize *range) {
+    return gm_inplace_al(addr, n, g_vk.props.limits.minStorageBufferOffsetAlignment, b, off, range);
+}
 static int gm_inplace_w(uint64_t addr, size_t n, int cs, VkBuffer *b, VkDeviceSize *off, VkDeviceSize *range) {
     if (!ip_w_on() || !gm_inplace(addr, n, b, off, range)) return 0;
     g_ip_binds--; g_ip_bytes -= n;   // (counted as written, not read)
     wb_t *w = wb_add(); if (!w) return 0;
     *w = (wb_t){0, (size_t)*off, n, 1, n, n, (uint8_t *)(uintptr_t)addr, NULL, cs}; w->ipb = *b; w->inpl = 1;
-    if (cs) C->nfwd++;
+    if (cs) C->nfwd++; else C->nipw++;   // a draw's: read where it lies by a later dispatch (gfx_vk_draw.inc fwd_hit)
     C->ip_wr = 1; g_ip_wbinds++; g_ip_wbytes += n;
     return 1;
 }

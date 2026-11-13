@@ -28,7 +28,10 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic(_Atomic uint8_t *) sparse; size_t cap; _Atomic int live; } range_t;   // sparse: per page, protected for a placement sparse tile (nvn_dirty_protect_sparse)
+// born: the clock when the range was registered. A page's generation starts at 0 then, so a stamp taken before that (content checked in a pool this memory held before, or while
+// it was in no pool) could not see a write made in between: the old pool's pages were made writable when it was destroyed, and the game wrote the next pool's data into them
+// without a fault. A stamp older than born therefore counts as written (nvn_dirty_since_cached, nvn_dirty_since_except)
+typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic(_Atomic uint8_t *) sparse; size_t cap; _Atomic int live; uint64_t born; } range_t;   // sparse: per page, protected for a placement sparse tile (nvn_dirty_protect_sparse)
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
@@ -123,14 +126,27 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         if (i <= q && st == PG_BUSY) release_page(r, i, count);   // another thread is changing it: wait, then unprotect it if it ended up protected
     }
 }
+// The ranges covering the pages of a host write, remembered per thread for the next write to the same pages while no pool was registered or retired since (g_rgen): a scan of
+// every registered range for each write cost 14.8 us on a Galaxy Z Fold 8 in Ocarina of Time's Kokiri Forest, where the completion thread writes about 2,200 counter reports a frame,
+// 16 bytes each at the next address of one pool (about 30 ms a frame on that thread, which then retired chunks slower than the GPU finished them, and the GPU went idle between them).
+// A page's ranges change only at a registration or a retirement, and a range registered since has no protected page yet, so a set remembered before it is still right to release
+static _Atomic uint64_t g_rgen = 1;   // registrations and retirements so far, + 1 (nvn_dirty_add_range, nvn_dirty_remove_range)
+enum { PW_MAX = 4, PW_N = 32 };   // ranges a page can be in (adjacent pools share their rounded boundary pages; more are not remembered); page spans remembered, by their first page
+typedef struct { uint64_t gen; uintptr_t lo, hi; int n, idx[PW_MAX]; } pw_t;
+static __thread pw_t t_pw[PW_N];
 static void prep_write(void *addr, size_t len) {
-    uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr);
+    uintptr_t a = (uintptr_t)addr, e = a + len;
     if (!len) return;
-    for (int i = 0; i < n; i++) {
-        range_t *r = rg(i);
-        if (!live_at(i) || e <= r->base || a >= r->end) continue;
-        uintptr_t lo = a > r->base ? a : r->base, hi = e < r->end ? e : r->end;
-        release_pages(r, (lo - r->base) >> g_shift, (hi - 1 - r->base) >> g_shift, &g_preps);
+    uintptr_t lo = a & ~(g_pg - 1), hi = (e + g_pg - 1) & ~(g_pg - 1); uint64_t gen = atomic_load_explicit(&g_rgen, memory_order_acquire);
+    pw_t *c = &t_pw[(lo >> g_shift) % PW_N];
+    int n = atomic_load(&g_nr), cached = c->gen == gen && lo >= c->lo && hi <= c->hi;
+    if (!cached) { c->gen = gen; c->lo = lo; c->hi = hi; c->n = 0; }
+    for (int k = 0; k < (cached ? c->n : n); k++) {
+        int i = cached ? c->idx[k] : k; range_t *r = rg(i);
+        if (!live_at(i) || hi <= r->base || lo >= r->end) continue;   // (base and end are page-aligned: the pages overlap when the bytes do)
+        if (!cached) { if (c->n < PW_MAX) c->idx[c->n++] = i; else c->gen = 0; }
+        uintptr_t l = a > r->base ? a : r->base, h = e < r->end ? e : r->end;
+        release_pages(r, (l - r->base) >> g_shift, (h - 1 - r->base) >> g_shift, &g_preps);
     }
 }
 
@@ -171,8 +187,10 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
         _Atomic uint8_t *sp = atomic_load(&r->sparse); if (sp) memset((void *)sp, 0, np);
     }
     r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen;
+    r->born = atomic_fetch_add(&g_now, 1) + 1; atomic_fetch_add(&g_now, 1);   // published by the release store of live below; stamps taken from now on are past it
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_rgen, 1, memory_order_release);   // (prep_write's remembered ranges)
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Pool destruction: first restore still-protected pages to writable (the pool memory may be reused for something else once returned to the game), then mark invalid
@@ -180,7 +198,7 @@ void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = NULL; int n = atomic_load(&g_nr);
     for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
+    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); atomic_fetch_add_explicit(&g_rgen, 1, memory_order_release); }
     pthread_mutex_unlock(&g_slot_mu);
 }
 // A zero-copy Metal buffer made while any of its pages is read-only drops every GPU write through it, with no error, even to pages never protected and even once its pages are writable again;
@@ -296,14 +314,15 @@ void nvn_dirty_protect_sparse(const void *addr, size_t len) {
 }
 uint64_t nvn_dirty_sparse_writes(void) { return atomic_load(&g_sparse_writes); }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
-// As nvn_dirty_since, with the caller's last range kept in *span (rechecked, scanned again only if it no longer holds the span; a slot reused by another pool over the same memory is as
-// good): a packaged texture keeps its handle (the scan over every range ran twice per texture lookup), and a sparse texture's page-table walk (hle_nvn.c vpt_walk) asks once per run of
+// As nvn_dirty_since, with the caller's last range kept in *span (rechecked, scanned again only if it no longer holds the span; a slot reused by another pool over the same memory
+// holds it too, and a stamp older than that pool's registration then counts as written: born): a packaged texture keeps its handle (the scan over every range ran twice per texture lookup), and a sparse texture's page-table walk (hle_nvn.c vpt_walk) asks once per run of
 // physical pages, which mostly lie in one pool, where find_span scans every registered range (about 4,300 in a Mario Kart World race)
 int nvn_dirty_since_cached(const void **span, const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;
     range_t *r = (range_t *)*span; uintptr_t a = (uintptr_t)addr;
     if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) { r = find_span(a, len); *span = r; }
     if (!r) return 1;   // When untracked, conservatively treat as dirty: better to upload more than to show stale content
+    if (stamp < r->born) return 1;   // checked before this pool was registered over the memory: what was written there in between left no generation (born)
     uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
@@ -317,9 +336,9 @@ size_t nvn_dirty_since_except(const void *span, const void *addr, size_t len, ui
     range_t *r = (range_t *)span; uintptr_t a = (uintptr_t)addr;
     if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) r = find_span(a, len);
     if (!r) return SIZE_MAX;
-    uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift; size_t n = 0;
+    uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift; size_t n = 0; int before = stamp < r->born;   // every page counts (born)
     for (uintptr_t i = p; i <= q; i++) {
-        if (atomic_load(&r->gen[i]) <= stamp) continue;
+        if (!before && atomic_load(&r->gen[i]) <= stamp) continue;
         uintptr_t lo = r->base + (i << g_shift), hi = lo + g_pg; int mine = 0;
         for (int k = 0; k < nex && !mine; k++) mine = ex[k][0] < hi && ex[k][1] > lo;
         if (mine) continue;

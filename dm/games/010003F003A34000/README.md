@@ -92,3 +92,39 @@ First run on Android, 2026-11-10: a Galaxy Z Fold 8 (SM-F971U1: Snapdragon 8 Eli
 - **Sound:** an audio dump: the title music at −20 to −27 dBFS and the bedroom's at −23 to −26 dBFS on the front pair; no underrun in 256,000 callbacks.
 - **`[RED]`:** the same two kinds.
 - **Not tried:** downstairs and Pallet Town, catches, aiming with motion.
+
+**Onto Route 2 and into Viridian Forest on the Z Flip 7**, 2026-11-10/11 (job q120): Let's Go's host from `main` at `90379f4e`, the game files from the same build folder (no shader translated again, none sent). Played by hand with adb input from the Pixel 9 Pro XL's save after the rival's battle (`saves/route1_after_rival`, a save made on an Android phone), about 40 minutes:
+
+- **The stretch:**
+  - Route 1's terraces north. Its ledges only drop, so the way up is at their ends: past the sign on the west side, then the gap between the ledge and the raised block in the middle.
+  - On the way: two wild catches with the buttons (a Rattata, a Pidgey). The Poké Mart clerk hands over a Potion. Youngster Ronny's battle is won (his Rattata against Pikachu's Thunder Shock, ₽60).
+  - Viridian City: the rival's advice about the Pokémon Center, then north through the town onto **Route 2**.
+  - Route 2's way round its ledges to the forest's gatehouse, and through it into **Viridian Forest**, where a wild Weedle was caught (its second throw; Pokédex 4 to 5).
+  - It stopped in the forest's first stretch of grass, before its Bug Catchers battled.
+- **Wild Pokémon walk into the player** on Route 1, Route 2 and in the forest, an encounter every few steps. Leaving each one is down three times to Run away, then A twice. A script that does that after every move (an orange pixel of the encounter menu's "Get ready" bar) made the walk possible by adb.
+- **Saves and Continue:** three commits, in Viridian City, on Route 2 and in Viridian Forest (play time 1:39). A cold start's title card showed Viridian Forest, and Continue loaded it there. Kept as `saves/viridian_forest_flip`.
+- **30 fps, but for one place:** 242 windows of 300 frames over the first 40-minute launch, frame p50 median 33.3 ms. GPU p50 median 11.8 ms, the most 15.2.
+- **Slower by the forest's first Bug Catcher, both times:** walking past him just inside the forest ran at 21–28 fps for about 90 s on the first visit and about 40 s after the Continue start, then held 30 again for the rest of the forest.
+  - The frame there is the game's own work: frame work p50 47 ms, against the replay's submit and present at 8.6 ms and the GPU at 13.7 ms.
+  - No pipelines were built and no textures uploaded in those frames, and the phone's thermal status was 0.
+  - Not compared with the Mac or another phone (none has been in the forest yet). The Android host doesn't log per-thread CPU, so which game thread is busy isn't known.
+- **Sound:** `DM_AUDIO_DUMP` over the Continue start (202 s): silent on the controller screen and the Continue menu, as on the other phones; the title music and then the forest's on the front pair. No underrun in 616 reports during play or 49 after the restart.
+- **`[RED]`:** the same two kinds; no crash, no hang, and nothing wrong seen in the picture (Route 1, Viridian City, Route 2, the gatehouse, the forest's light).
+- **Open, the Z Flip 7 (Xclipse): a dark band over the lower third of the picture in Viridian Forest.** Seen on 2026-11-11 (Let's Go's host from `main` 526e4b77 with enjoyerofslop/droidplay-core#252, the `viridian_forest_flip` save): from the first frame after Continue, a flat near-black band with a faint straight top edge covers the bottom ~28% of the game's picture, where the path and grass south of the player should be. It's there before and after a wild battle, the menus and a save; the battle scene itself fills the whole frame.
+  - Not compared yet with another phone or the Mac in the same place, and the q120 run's screenshots weren't kept. Whether the band is the game's own darkness, a missing draw (the forest's lower canopy or a fog or shadow layer), or Xclipse-only isn't known.
+  - 2026-11-12: the same band on the Pixel 9 Pro XL (Mali-G715) and the OnePlus Pad 3 (Adreno 830), from the same save (with 0.8.4 on both, and with `main` on the Pixel): so it isn't Xclipse-only. The field's frame holds no 16-bit packed texture.
+- **Not played:** Viridian Forest's trainers and its exit, Pewter City, aiming with motion.
+
+**Options → Open Pokémon GO Settings**, 2026-11-11 on the Z Flip 7 (enjoyerofslop/droidplay-core#220):
+- **Before the fix:** from the title's "Change your options" or the X menu's Options, the entry ended the game at once with `Break#1 reason=0` at `sdk+0xd989c`. The cause was `nn::bluetooth::RegisterGattOperationNotification`, which reached btm:u with no session ([Bluetooth LE at boot](../../../docs/reference/services.md#bluetooth-le-at-boot)).
+- **With the fix:** both routes show the Pokémon GO notice and then "Would you like to pair your game with a Pokémon GO account". Yes leads to "Searching for a Pokémon GO account…", which keeps searching, as a Switch with no phone nearby does, until B Quit returns to the options.
+- **After the menu:** Continue loaded `viridian_forest_flip`. The player walked, met a wild Pidgey and ran from it, opened the menu again, and made a save (`save commit #1`). There was no new `[RED]` line.
+
+**The menus' Pokémon and item sprites in the wrong colours (enjoyerofslop/droidplay-core#417), resolved** 2026-11-12:
+- **Before:** on every Android GPU, the party, bag and Catching Pocket sprites (68×56 RGB5A1 textures) had red and blue exchanged: a cyan Pikachu, a blue Pidgey, a brown Oddish, a blue Poké Ball and blue pocket frames. The menus' own art was right. Reported on an Adreno 825; reproduced with 0.8.4 on the OnePlus Pad 3 (Adreno 830) and the Pixel 9 Pro XL (Mali-G715).
+- **The fix:** [RGB565-family and RGBA4 textures in Vulkan's channel order](../../../docs/reference/rendering.md#rgb565-family-and-rgba4-textures-in-vulkans-channel-order-android).
+- **Checked** from `saves/viridian_forest_flip` on the Pad 3, the Pixel and the Galaxy Z Flip 7 (Xclipse 950): the party (yellow Pikachu, brown Pidgey, purple Rattata, blue Oddish), the bag's pocket frames and the Catching Pocket (red and white Poké Ball, red Razz Berry) in their own colours. A control host from `main` without the fix, on the same Pixel and save, still swapped them. The title, the X menu and the field are otherwise the same with and without it.
+
+## Found on this game
+
+- The party, bag and Catching Pocket sprites (RGB5A1) sampled with red and blue exchanged on Android: [RGB565-family and RGBA4 textures in Vulkan's channel order](../../../docs/reference/rendering.md#rgb565-family-and-rgba4-textures-in-vulkans-channel-order-android).

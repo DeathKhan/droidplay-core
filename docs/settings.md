@@ -3,8 +3,8 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
-- [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
+- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Fewer plants](#fewer-plants), [Keep the GPU clock up](#keep-the-gpu-clock-up), [Frame-rate counter](#frame-rate-counter)
+- [Controls](#controls): [Touch feedback](#touch-feedback), [Touch control size](#touch-control-size), [Touch control inset](#touch-control-inset), [Controller face buttons](#controller-face-buttons), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
 - [In-game menu](#in-game-menu)
@@ -89,6 +89,14 @@ iPhone and iPad. **Fit**, the default, shows the game's picture (16:9, or the ta
 
 Games whose profile supports it (Breath of the Wild, Animal Crossing: New Horizons). **iPhone Duo screen (1.43:1)** renders a taller picture of the Duo's own shape: the sides of 16:9 with more above and below, and the HUD at the screen's edges. **16:9** is the Switch's picture. The taller picture has about a quarter more pixels, so it runs a little slower and warmer.
 
+### Fewer plants
+
+Android, shown for a game whose profile names plants the app can leave out: The Legend of Zelda: Ocarina of Time. Off, the default, draws the forest as the game does. On leaves out the ferns, the flowers and the trees' canopies (seven of the game's mesh shaders), which cost about 3 ms of GPU time a frame on a phone: a OnePlus Pad 3 goes from 29.1 to 30.0 fps in Kokiri Forest (GPU 27.0 to 24.2 ms a frame). The trees stand bare. Sets `DM_VK_MESH_LEAVE_OUT`. The idea and the list are nebadasSwifty's (Banana Native #167).
+
+### Keep the GPU clock up
+
+Android, offered for every game on a phone with a Qualcomm Snapdragon GPU (an Adreno); a phone with another GPU doesn't show it, as it would do nothing there. Off, the default, leaves the GPU's clock to the phone, which lowers it whenever the GPU waits for the game. On holds it at its highest clock while the game runs. Some games run faster on some phones: Ocarina of Time on a cool Galaxy Z Fold 8 went from 21 to 26–29.5 fps in Kokiri Forest over 15 minutes. Others gain nothing: the same game on a Galaxy S25 Edge, which already raises its clock there, stayed at about 25 fps. And a warm phone can get slower: the same Fold, warm from an afternoon of games, answered the heat by holding its GPU at a lower limit than it uses on its own, 17.7 fps against 19.9. Either way the phone runs warmer and the battery runs down faster (the cool Fold's battery ended 15 minutes about 2 °C warmer than without it), so try it game by game and turn it off if the game gets slower. Sets `DM_VK_GPU_FLOOR=100`; the game's log says whether the phone took it (`GPU clock floor … taken`). Written after Banana Native's clock floor.
+
 ### Frame-rate counter
 
 Shows the frames per second at the top left.
@@ -98,6 +106,18 @@ Shows the frames per second at the top left.
 ### Touch feedback
 
 A light tap from the phone when you press an on-screen button.
+
+### Touch control size
+
+Android. How large the on-screen controls are, from 60 to 140 %. Above 100 % they stop growing where the stick, the D-pad or the buttons would meet the shoulder buttons or each other, so on a phone they grow to about 125 %.
+
+### Touch control inset
+
+Android. How far the stick, the D-pad and the A/B/X/Y buttons sit in from the sides of the screen, for a phone whose curved edge or grip leaves the stick too far out. 0 % is the standard layout; 100 % brings the stick's group and the buttons together in the middle. The shoulder buttons and the buttons at the top stay where they are. Each game keeps its own choice, and **Reset to tested defaults** puts both back.
+
+### Controller face buttons
+
+Android. How a controller's A, B, X and Y become the Switch's. **By position**, the default, puts the Switch's A on the right-hand button, B at the bottom, X at the top and Y on the left, wherever the controller's own letters are: right for an Xbox-style controller, whose A sits at the bottom. **By label** maps each letter to the same letter, for a controller that already gives its buttons Nintendo's layout, such as a Retroid Pocket in its Retro layout, where by position swaps A with B and X with Y. The game's log says which button each one became the first time it's pressed.
 
 ### Game rumble
 
@@ -274,7 +294,12 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Picture (iPhone and iPad) | `DM_PICTURE_FIT` | `fit` 16:9 with black bars, `fill` covers the screen, cropped |
 | Picture shape | `DM_SCREEN_ASPECT` | `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.43` the iPhone Duo's shape, `0` 16:9 |
 | Frame-rate counter | `DM_SHOW_FPS` | `1`, `0` |
+| Keep the GPU clock up (Android, Adreno) | `DM_VK_GPU_FLOOR` | `100` the highest clock, `0` off; `2` to `99` a floor at that share of it on a GPU whose GMU takes one |
 | Touch feedback | `DM_TOUCH_HAPTICS` | `1`, `0` |
+| Touch control size (Android) | `DM_PAD_SCALE` | `0.6` to `1.4` (default `1`) |
+| Touch control inset (Android) | `DM_PAD_INSET` | `0` to `1` (default `0`) |
+| Touch control height (Android) | `DM_PAD_RAISE` | `0` to `1` (default `0`) |
+| Controller face buttons (Android) | `DM_PAD_ABXY` | `position` (default), `label` |
 | Game rumble | `DM_RUMBLE` | `1`, `0` |
 | Rumble strength | `DM_RUMBLE_GAIN` | `0` to `3` |
 | Rumble cutoff | `DM_RUMBLE_MIN` | `0` to `0.9` |

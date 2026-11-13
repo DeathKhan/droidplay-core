@@ -190,6 +190,34 @@ Where this GPU differs from the Adreno above:
   - BC, ETC2 and ASTC textures; `maxStorageBufferRange` 128 MB.
 - **The cover screen** (1056 × 1066, 48 to 144 Hz) was off: the phone stayed open. The screenshots came from the inner screen with droidplay-core#154's `bench_android.py`.
 
+## A first test: Bayonetta 2 on a OnePlus Pad 3
+
+Bayonetta 2's first Android run (2026-11-10), on a OnePlus Pad 3 (Adreno 830, Qualcomm's driver 0x8032004a, Android 16) with the on-screen controls, from `main` at
+`898ac92f`. The dump is the **base game, 1.0 (`v0`)**; [its profile](../games/01007960049A0000/README.md) is upstream's, for update 1.2, so `build_android_from_nsp.py`
+packed 1.0 from a profile it derived from that one, with no change by hand: NVN, the same 1,856 BNSH shaders in `data000.cpk` as 1.2 (split in 2 min 18 s), all translated
+for Vulkan, none failing. Played by hand over adb (`DM_CTL` presses chosen from screenshots), on a fresh save of its own.
+
+- **From a new game into the prologue's first fights**, with nothing wrong seen in the picture, no crash and no red line:
+  - the title (up about 15 s after launch), Select Game (slot 1), the auto-save notice, Story, and Easy, whose offer of Automatic Mode was taken;
+  - the opening narration, which can't be skipped on a first play, then the prologue's first cutscene (skipped: Plus, Down, A, A);
+  - the chapter card (Prologue: World of Chaos), the Christmas street cutscene (skipped), and a card about the touch controls (the game sees handheld mode);
+  - the combat tutorial, where X's punches land on the angel and are rated, closed from its pause menu (Plus, Down ×4, A);
+  - Verse 1 on the jet: about three minutes of fights in Automatic Mode, angels downed, combos scored, halos gathered.
+- **60 fps in play**, the game's own rate (30 in its cutscenes, as on the Mac):
+
+  | Scene | fps | Frame p50 / p95 / p99 | GPU p50 / p95 | Draws |
+  |---|---|---|---|---|
+  | The combat tutorial | 60.0 | 16.65 / 19.45 / 21.2 ms | 8.0 / 11.4 ms | about 700 |
+  | Verse 1's fights on the jet | 59.9 | 16.64 / 19.16 / 21.3 ms (the longest 123 ms) | 9.95 / 12.3 ms | about 580 |
+
+- **Sound:** one 6-channel AudioOut (the Mac's runs show two), with no underrun. An audio dump (`DM_AUDIO_DUMP`) of the last 80 s of Verse 1 has the front pair at about
+  −28 dBFS RMS, the rear pair about −34, the centre and LFE quieter, peaks about −12.5 dBFS.
+- **Saves:** the auto-save shows SAVING. at Verse 1's start, and the host made 8 save commits. After a restart, Load Game lists slot 1 (Prologue, World of Chaos, Easy,
+  9 min 27 s). Loading it wasn't seen through: another session's benchmark took the device during the load.
+- **1.0's derived profile need not be in the repository:** the script derives it at every build from 1.2's (`v0 is not a version game profile 01007960049A0000
+  registers … packing v0 from a profile derived from it`), and it built and played as derived. Registering 1.0 would change upstream's profile, so it belongs upstream if anywhere.
+- **Not tried:** loading the save into the game, the prologue past Verse 1's first fights, Normal difficulty or manual combat, update 1.2 on Android, and the other devices.
+
 ## Known problems
 
 Numbered in the order they were found, so links to a number stay right:
@@ -321,7 +349,7 @@ Numbered in the order they were found, so links to a number stay right:
     - **What differs.** Its pipeline key is the horizontal pass's byte for byte but for the write mask, with the same D16 depth image. Only the target image differs: it is also the sixth colour target of the G-buffer passes.
     - **Not on the Odin 2.** Its Adreno 740 (driver 0x802a4000) runs the same draw without a hang: seven launches of the same save on main 1e4dd802 with droidplay-core#108, nothing skipped, no slow submission reported.
     - **Cause.** An earlier pass of the frame binds that target alone in colour slot 5, with slots 0–4 empty (`VK_ATTACHMENT_UNUSED`). That pass runs; the later one drawing into the target as slot 0 hangs. A scratch target in every empty slot below a used one stops it, and so does one in slot 0 alone. Filling only a G-buffer pass's empty slot 6 below slot 7, or zeroing the write masks of empty slots, doesn't.
-    - **Fix.** On Adreno 8xx a render pass with colour slot 0 empty below a used slot gets a scratch RGBA8 target there (`DM_VK_SLOT0_FILL`, [rendering.md](../../docs/reference/rendering.md#a-render-pass-with-colour-slot-0-empty-hangs-a-later-pass-on-the-adreno-830-android)). About one pass a frame gets it in BotW.
+    - **Fix.** On every Adreno on Qualcomm's driver (Adreno 8xx at first; the 730 crashed on such a pass in Mario Kart 8 Deluxe) a render pass with colour slot 0 empty below a used slot gets a scratch RGBA8 target there (`DM_VK_SLOT0_FILL`, [rendering.md](../../docs/reference/rendering.md#a-render-pass-with-colour-slot-0-empty-hangs-or-crashes-qualcomms-adreno-driver-android)). About one pass a frame gets it in BotW.
     - **Check** (main 4743c9da with the fix, BotW's defaults from droidplay-core#108): 30.0 fps in three runs, no hang report. With `DM_VK_SLOT0_FILL=0` the GPU is lost as before. The picture is still wrong there (problem 15).
 
 15. **Fixed: Breath of the Wild's Shrine of Resurrection was drawn dark and blurred on the Adreno 830**: Link unlit, the walls a blur, on the Pad 3 and the Galaxy S25 Edge (Samsung's driver 0x80320001), where the Odin 2 draws them right.
@@ -343,6 +371,16 @@ Numbered in the order they were found, so links to a number stay right:
       (droidplay-core#161).
     - **Rare long frames** of 90–120 ms remain in warm battles: a few pipelines the background builder leaves to the replay thread (a target drawn for the first
       time), about 48 ms each, and an 84 ms submission with none, not explained yet.
+
+17. **Fixed: Final Fantasy Resonance's first field had no flames on the Odin 2**: the pixel-art flames along the road were black holes, where the Pad 3 and the S25 Edge
+    drew them.
+    - Its 35 flame cards a frame (vertex shader `19274e72bf8f5d0d`) were binned nowhere. Qualcomm's Adreno 740 driver bins a pass with a position-only copy of
+      the vertex shader, and that copy read Unreal's clip matrix (c3 rows 0-3, constant indices) as garbage. Turnip (`DM_VK_DRIVER`) drew them.
+    - **Fix.** `spv_android.py` `pos_rows` (`ANDROID_CHAIN` 6) lets a vertex shader's position read its constant buffer rows at run time, behind a specialization constant the
+      replay sets only on Qualcomm's Adreno 7xx driver and only for the vertex shaders a game's profile names (FF's `vk_pos_rows`: the flames' vertex shader)
+      ([rendering.md](../../docs/reference/rendering.md#a-vertex-shaders-position-lost-in-the-adreno-740s-binning-copy)).
+    - **Check** (the Odin 2, main `b75f9719` against the fix, a warm-up and 2 runs each): FF's field at 42.1 fps on both, GPU 12.4 ms on main without the flames and
+      13.0 ms with them; Animal Crossing's island 8.6–8.8 ms on both, Skyward Sword HD's Skyloft 3.7–3.8 ms on both, as their profiles name no shader.
 
 ## Reading the numbers
 

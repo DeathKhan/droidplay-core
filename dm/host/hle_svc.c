@@ -28,7 +28,7 @@
 // with an 8 GB reservation, builds from developer accounts that cannot sign that entitlement (free accounts) would exit at this step.
 #define RESERVE DM_GAME_MEM_RESERVE   // SMBW: the heap needs only 1.47 GB, so the block stays at 5 GB (the total proven on a real device; a single 6 GB block can be reserved, but Metal etc. still need address space)
 static uint8_t *g_as;              // ASLR region base = the whole block
-static size_t g_reserve;           // its size: RESERVE less the profile's alias region plus the one in use (mem_init_once)
+static size_t g_reserve;           // its size: RESERVE less the profile's alias region plus the one in use, and on Android the heap region's growth to the app pool (mem_init_once)
 static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_cap;
 static size_t g_heap_seen;        // the largest heap opened so far: with the guest in files, SetHeapSize zeroes a heap that grows back below it
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
@@ -327,9 +327,26 @@ static void mem_init_once(void) {
 #endif
     const char *as = getenv("DM_ALIAS_SIZE");
     if (as && *as) { alias = (size_t)strtoull(as, NULL, 0); if (alias < 0x10000000 || (alias & (pg - 1))) die("DM_ALIAS_SIZE %s: at least 256 MB, in whole host pages", as); }
-    g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
+    size_t heap = RESERVE - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK - 0x10000000;
+#ifdef DM_ANDROID
+    // At least the app pool: Android builds never run the heap check that sizes a provisional profile's heap region (it boots the Mac host), and the guess can leave 128 MB
+    // (droidplay-core#291: Trails in the Sky 1st Chapter asks for 0x81200000). The region is address space; SetHeapSize's pool check still bounds the heap, as Horizon's does
+    size_t pool = ((size_t)DM_GAME_APP_POOL + 0x1fffff) & ~(size_t)0x1fffff;
+    if (heap < pool) heap = pool;
+#endif
+    g_reserve = 0x10000000 + heap + DM_GAME_MEM_STACK + alias;
+#ifdef DM_ANDROID
+    // 32 MB-aligned, as the Mac's mmap of a block this size happens to give it: Linux aligns it to a page, so the heap (256 MB in) started 32 KB-aligned, where Horizon's
+    // heap is at least 2 MB-aligned. Metroid Prime Remastered then crashed at its first nnMain steps, writing through 0x6aaac0 (docs/reference/memory.md)
+    { const size_t al = 0x2000000; uint8_t *raw = mmap(NULL, g_reserve + al, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+      if (raw == MAP_FAILED) die("reserve guest AS");
+      g_as = (uint8_t *)(((uintptr_t)raw + al - 1) & ~(uintptr_t)(al - 1));
+      if (g_as > raw) munmap(raw, (size_t)(g_as - raw));
+      if (raw + g_reserve + al > g_as + g_reserve) munmap(g_as + g_reserve, (size_t)(raw + g_reserve + al - (g_as + g_reserve))); }
+#else
     g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_as == MAP_FAILED) die("reserve guest AS");
+#endif
     guest_file_init();
     // Fixed partition (all inside the reserved block): 256 MB in front, the heap, the stacks, then the alias region. Mario: a heap region of 1.625 GB, stack 256 MB, alias 2.875 GB.
     // The alias region is last because a Switch's addresses stay below 2^39 and a 64 GB alias region cannot: macOS 27 reserves 0x1000000000-0x7000000000, which leaves exactly 64 GB below
@@ -339,8 +356,8 @@ static void mem_init_once(void) {
     // SMBW also defines a 1792000 KB (1.75 GB) VirtualAddressMemory in HeapDef (System/HeapSize): it is subtracted from the memory pool before the heap is opened (SetHeapSize asks for only 0x5be00000),
     //   and resource loading then MapPhysicalMemory's into the alias region after the node area on demand. With a 1.25 GB alias region only about 256 MB was left there, and 3 MB-class layout archives (WipeCourseIn / WipeWarp)
     //   got no address, were skipped, and crashed on a null pointer when used (main +0x373e04). So alias = node area + 1.75 GB + slack; the heap needs only 1.47 GB, and 2.625 GB is plenty.
-    // The alias and stack sizes come from the game profile (mem_alias / mem_stack, the Mac's alias region as above), the heap takes the rest of mem_reserve
-    g_heap  = g_as + 0x10000000; g_heap_cap = RESERVE - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK - 0x10000000;
+    // The alias and stack sizes come from the game profile (mem_alias / mem_stack, the Mac's alias region as above), the heap takes the rest of mem_reserve (on Android at least the app pool)
+    g_heap  = g_as + 0x10000000; g_heap_cap = heap;
     g_stack = g_heap + g_heap_cap; g_stack_cap = DM_GAME_MEM_STACK;
     g_alias = g_stack + g_stack_cap; g_alias_cap = alias;
     if (!(g_alias_bits = calloc((g_alias_cap >> 18) + 1, sizeof *g_alias_bits))) die("alias region page bitmap calloc");

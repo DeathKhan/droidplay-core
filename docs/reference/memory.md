@@ -83,6 +83,24 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Fix:** a boot that set `mem_alias` or `mem_reserve` is followed by another on the resized layout, up to `HEAP_CHECK_ROUNDS` (3) boots (`build_ipa_from_nsp.py` `heap_check`); the stamp names every boot's result and every key set. `test_nsp_incremental.py` checks the two boots and their keys.
 - **Found on:** Pokémon FireRed Version and LeafGreen Version (0100554023408000, 010034D02340E000, SDK 20.5.19, provisional profiles), pull request #1620: a 3.14 GB heap plus 102 MB of modules over the pool; the second boot sets `mem_used` 0x6a00000.
 
+### The heap region at least the app pool (Android)
+
+- **Symptom:** Android only: a game without a profile aborts at its first heap request: `SetHeapSize OOM: req 0x81200000 > cap 0x8000000`, then `Result 0x1003` (`os::ResultOutOfMemory`), `FATAL` and `CRASH sig=6`.
+- **Cause:** for a game with virtual address memory that sets a heap, the provisional guess (`profile_guess.py`) leaves a 128 MB heap region, and only the [heap check](#the-heap-check-grows-the-block-around-the-profiles-alias-region) resizes it. That check boots the Mac host, so `build_android_from_nsp.py` never runs it, on any build machine. Android's alias region is [a Switch's 64 GB](#the-macs-alias-region-is-the-switchs-64-gb) whatever the profile says, so `mem_alias` only cuts the heap region out of `mem_reserve`.
+- **Fix:** on Android the heap region is at least the app pool, in whole 2 MB, and the block grows by as much (`hle_svc.c` `mem_init_once`, under `DM_ANDROID`). It is address space only: the pool check behind it still bounds the heap, as Horizon's does. It also reaches the registered profiles whose heap region is smaller than the pool, 77 of 158 at this change (Brilliant Diamond 128 MB → 2 GB, FF Resonance 128 MB → 3.2 GB), which then report the larger `HeapRegionSize`. The Mac and the iPhone keep the profile's region, so the heap check still sees the request fail on an iPhone's layout. `make -C dm/host/tests GAME=<id> memory` runs `t_svc_memory_android --android-heap`.
+- **Found on:** Trails in the Sky 1st Chapter 1.0.0 (01002C9022770000, provisional profile) on a Poco F7 (Adreno 825, Android 16), droidplay-core#291.
+
+### The guest block 32 MB-aligned (Android)
+
+- **Symptom:** Android only. Metroid Prime Remastered crashes on its main thread right after `nnMain`'s first `oe` calls, before it opens its RomFS: `CRASH sig=11 addr=0x6aaac0 pc=sdk+0x53c48c lr=main+0x1c0c4`, a 0x800-byte write. The registers hold small values beside it (0x6aa2c0, 0x6aaa40, 0x6ab2c0). The Mac runs the same steps and opens the RomFS next.
+- **Cause:** the host reserves the guest block with `mmap(NULL, …)`. macOS gave the Mac a 32 MB-aligned block (heap at 0x7cf2000000 in that run). Linux aligns it to a page, so on a Pixel 9 Pro XL the heap, 256 MB into the block, started at 0x6658488000: 32 KB-aligned, where Horizon's heap is at least 2 MB-aligned. How the game turns its heap into the address it wrote through was not traced: aligning the block was enough.
+- **Fix:** on Android the block is reserved 32 MB larger, aligned up to 32 MB and its ends given back (`hle_svc.c` `mem_init_once`, under `DM_ANDROID`), so the heap, stacks and alias region start as aligned as on the Mac. It is address space only. The Mac and the iPhone keep their single `mmap`.
+- **Check:** Metroid Prime Remastered 1.0.0, through a DroidPlay with its host alone.
+  - On the Pixel the heap starts at 0x6656000000 and the game opens its RomFS and runs to its title. The one start before the change crashed.
+  - On a Moto Razr Plus 2023 (Adreno 730) it runs into control on the Frigate Orpheon.
+  - Not checked with it: other games on Android.
+- **Found on:** [Metroid Prime Remastered](../../dm/games/010012101468C000/README.md).
+
 ### `nninitStartup`'s heap only without virtual address memory
 
 - Not needed in the end for [Ace Attorney Investigations Collection](../../dm/games/010005501E68C000/README.md) (1.0.0.2, SDK 17.5.3): the process heap of pull request #16. `nninitStartup` calls `SetMemoryHeapSize` / `AllocateMemoryBlock` only without virtual address memory, and nothing else in `main` calls them ([Virtual address memory follows the NPDM's system resource](#virtual-address-memory-follows-the-npdms-system-resource)).
