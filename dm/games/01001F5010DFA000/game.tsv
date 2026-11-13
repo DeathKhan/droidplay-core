@@ -41,3 +41,8 @@ sys_resource	0x1000000
 # materials, terrain, water, lighting, shadows and post effects), 73 in the 678 GFPAK archives under bin/archive (Oodle Kraken entries, decoded with the game's own OodleLZ_Decompress), 40 in main
 shader_groups	/bin/=bin /system_resource/=systemresource
 shader_note	Pokémon Legends: Arceus shaders
+
+# ---- Frame rate ----
+# 0: the game's own interval 2 and period, 30 fps as on the Switch (the Mac and iOS, where 60 has not been run). With a target the frame step stubs (patches.py) ask for present
+# interval 1 and make the game's stored frame period the vsyncs the host holds each frame, so game time is real time at 60 and at 30; Android's default is 60 (android_defaults.txt)
+fps_target	0
