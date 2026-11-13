@@ -1,6 +1,7 @@
 """dm/android/img_evict.h, the Vulkan replay's image eviction rules (gfx_vk_evict.inc), built with the system's C compiler and called through ctypes: which
 images are clean (their content still in guest memory), which another image over their storage overwrote, that the sweep over a pool's images finds every
-overwritten one whatever their order, and the byte budget: its default, when it asks for images to go and how many, and that the least recently looked up go first.
+overwritten one whatever their order, the memory pressure rule (the PSI reading, its levels, the bytes to get down to, the least recently looked up first), and the byte budget (its default, when it
+asks for images to go and how many).
 Skipped without a C compiler."""
 import ctypes
 import os
@@ -16,16 +17,15 @@ CC = (['xcrun', 'clang'] if sys.platform == 'darwin' and shutil.which('xcrun') e
       [c] if (c := shutil.which('clang') or shutil.which('cc') or shutil.which('gcc')) else None)
 
 
-class Ent(ctypes.Structure):   # ie_ent
-    _fields_ = [('pool', ctypes.c_uint64), ('lo', ctypes.c_int64), ('hi', ctypes.c_int64), ('last_present', ctypes.c_uint64), ('last_w', ctypes.c_uint64), ('p', ctypes.c_void_p)]
-
-
 class Cand(ctypes.Structure):   # ie_cand
     _fields_ = [('last_present', ctypes.c_uint64), ('bytes', ctypes.c_uint64), ('p', ctypes.c_void_p)]
 
 
-MB = 1 << 20
-NONE = (1 << 64) - 1   # UINT64_MAX: nothing to go
+MIB = 1 << 20
+
+
+class Ent(ctypes.Structure):   # ie_ent
+    _fields_ = [('pool', ctypes.c_uint64), ('lo', ctypes.c_int64), ('hi', ctypes.c_int64), ('last_present', ctypes.c_uint64), ('last_w', ctypes.c_uint64), ('p', ctypes.c_void_p)]
 
 
 @unittest.skipIf(CC is None or os.name == 'nt', 'no C compiler')
@@ -40,8 +40,12 @@ class ImageEviction(unittest.TestCase):
                        '{ return ie_clean(w, pr, pkg, sh, f, last, now, age); }\n'
                        '__attribute__((visibility("default"))) int over(const ie_ent *a, const ie_ent *b, uint64_t now, uint64_t age) { return ie_overwritten(a, b, now, age); }\n'
                        '__attribute__((visibility("default"))) void sweep(ie_ent *e, uint32_t n, uint64_t now, uint64_t age, uint8_t *mark) { ie_sweep(e, n, now, age, mark); }\n'
-                       '__attribute__((visibility("default"))) uint64_t pick(ie_cand *c, uint32_t n, uint64_t need, uint8_t *mark) { return ie_pick(c, n, need, mark); }\n'
+                       '__attribute__((visibility("default"))) double psi(const char *b) { return ie_psi_some10(b); }\n'
+                       '__attribute__((visibility("default"))) int level(double v) { return ie_psi_level(v); }\n'
                        '__attribute__((visibility("default"))) uint64_t meminfo(const char *b, const char *k) { return ie_meminfo_kb(b, k); }\n'
+                       '__attribute__((visibility("default"))) int swap(uint64_t f, uint64_t t, unsigned p, uint64_t *last) { return ie_swap_level(f, t, p, last); }\n'
+                       '__attribute__((visibility("default"))) uint64_t target(int l, uint64_t live, uint64_t *cap) { return ie_target(l, live, cap); }\n'
+                       '__attribute__((visibility("default"))) uint64_t pick(ie_cand *c, uint32_t n, uint64_t need, uint8_t *mark) { return ie_pick(c, n, need, mark); }\n'
                        '__attribute__((visibility("default"))) uint64_t bdefault(uint64_t kb) { return ie_budget_default(kb); }\n'
                        '__attribute__((visibility("default"))) uint64_t btarget(uint64_t live, uint64_t budget) { return ie_budget_target(live, budget); }\n')
         subprocess.run([*CC, '-shared', '-fPIC', '-O1', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/android'), str(src), '-o', str(cls.tmp / 'e.so')], check=True)
@@ -49,12 +53,14 @@ class ImageEviction(unittest.TestCase):
         cls.lib.clean.argtypes = [ctypes.c_int] * 5 + [ctypes.c_uint64] * 3
         cls.lib.over.argtypes = [ctypes.POINTER(Ent), ctypes.POINTER(Ent), ctypes.c_uint64, ctypes.c_uint64]
         cls.lib.sweep.argtypes = [ctypes.POINTER(Ent), ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8)]
-        cls.lib.pick.argtypes = [ctypes.POINTER(Cand), ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8)]
-        cls.lib.meminfo.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-        cls.lib.bdefault.argtypes = [ctypes.c_uint64]
-        cls.lib.btarget.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
-        for f in ('pick', 'meminfo', 'bdefault', 'btarget'):
-            getattr(cls.lib, f).restype = ctypes.c_uint64
+        cls.lib.psi.argtypes, cls.lib.psi.restype = [ctypes.c_char_p], ctypes.c_double
+        cls.lib.level.argtypes = [ctypes.c_double]
+        cls.lib.meminfo.argtypes, cls.lib.meminfo.restype = [ctypes.c_char_p, ctypes.c_char_p], ctypes.c_uint64
+        cls.lib.swap.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint64)]
+        cls.lib.target.argtypes, cls.lib.target.restype = [ctypes.c_int, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)], ctypes.c_uint64
+        cls.lib.pick.argtypes, cls.lib.pick.restype = [ctypes.POINTER(Cand), ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8)], ctypes.c_uint64
+        cls.lib.bdefault.argtypes, cls.lib.bdefault.restype = [ctypes.c_uint64], ctypes.c_uint64
+        cls.lib.btarget.argtypes, cls.lib.btarget.restype = [ctypes.c_uint64, ctypes.c_uint64], ctypes.c_uint64
 
     def clean(self, gpu_w=0, pool_read=0, pkg=0, shared=0, filled=0, last=0, now=1000, age=600):
         return self.lib.clean(gpu_w, pool_read, pkg, shared, filled, last, now, age)
@@ -103,34 +109,73 @@ class ImageEviction(unittest.TestCase):
         self.assertEqual(self.sweep(ents, age=150), {3, 4})   # a longer age: 0, looked up 100 presents ago, stays
         self.assertEqual(self.sweep([]), set())
 
+    def test_the_pressure_reading_and_its_levels(self):
+        text = b'some avg10=7.31 avg60=2.05 avg300=0.50 total=123456\nfull avg10=1.20 avg60=0.40 avg300=0.10 total=4567\n'
+        self.assertAlmostEqual(self.lib.psi(text), 7.31)   # "some", not "full": lmkd's thrashing rule reads "some" too
+        self.assertEqual(self.lib.psi(b'full avg10=3.00 avg60=0 avg300=0 total=0\n'), -1)
+        self.assertEqual(self.lib.psi(b''), -1)
+        self.assertEqual([self.lib.level(v) for v in (-1, 0, 4.99, 5, 14.99, 15, 80)], [0, 0, 0, 1, 1, 2, 2])
+
+    def test_swap_from_meminfo(self):
+        text = b'MemTotal:       11893412 kB\nMemAvailable:     801196 kB\nSwapTotal:      12582908 kB\nSwapFree:        4446376 kB\n'
+        self.assertEqual(self.lib.meminfo(text, b'SwapTotal:'), 12582908)
+        self.assertEqual(self.lib.meminfo(text, b'SwapFree:'), 4446376)
+        self.assertEqual(self.lib.meminfo(text, b'Shmem:'), 0)
+
+    def swap(self, frees, total=12 * 1024 * 1024, pct=40):   # GiB of SwapFree in turn, with ~12 GiB of swap at lmkd's 40 %: the line 4.8 GiB, holding under 6.0
+        last = ctypes.c_uint64(0)
+        return [self.lib.swap(int(f * 1024 * 1024), total, pct, ctypes.byref(last)) for f in frees]
+
+    def test_swap_holds_near_lmkds_line_and_shrinks_as_it_falls(self):
+        self.assertEqual(self.swap([8, 6.1, 5.9, 5.0]), [0, 0, 1, 1])   # under the line plus a quarter: holding
+        self.assertEqual(self.swap([5.0, 4.7, 4.6, 4.5, 4.3, 4.2, 3.9]), [1, 2, 1, 1, 2, 1, 2])   # under it: an eighth as it crosses, again each further 32nd (0.375 GiB)
+        self.assertEqual(self.swap([4.7, 5.0, 4.7]), [2, 1, 2])   # back over the line and under it again: a new crossing
+        self.assertEqual(self.swap([4.7, 7, 4.7]), [2, 0, 2])
+        self.assertEqual(self.swap([1], total=0), [0])   # no swap
+        self.assertEqual(self.swap([1], pct=0), [0])
+
+    def target(self, steps):
+        cap = ctypes.c_uint64(0)
+        out = []
+        for l, live in steps:
+            t = self.lib.target(l, live * MIB, ctypes.byref(cap)); out.append((-1 if t == 2 ** 64 - 1 else t, cap.value // MIB))
+        return out
+
+    def test_the_target_holds_at_the_least_alive_and_shrinks_by_an_eighth(self):
+        self.assertEqual(self.target([(1, 1600), (1, 1700), (1, 1500), (1, 1550)]),
+                         [(1600 * MIB, 1600), (1600 * MIB, 1600), (1500 * MIB, 1500), (1500 * MIB, 1500)])   # holding: the least alive since the hold began
+        self.assertEqual(self.target([(2, 1600), (1, 1500), (2, 1400)]),
+                         [(1400 * MIB, 1400), (1400 * MIB, 1400), (1225 * MIB, 1225)])   # shrinking: an eighth under what is alive, and the hold continues from there
+        self.assertEqual(self.target([(2, 1600), (0, 1700), (1, 1700)]), [(1400 * MIB, 1400), (-1, 0), (1700 * MIB, 1700)])   # eased: the next hold starts anew
+        self.assertEqual(self.target([(2, 520), (1, 300)]), [(512 * MIB, 512), (512 * MIB, 512)])   # never under the floor
+
+    def pick(self, cands, need):
+        arr = (Cand * len(cands))(*[Cand(lp, b * MIB, i + 1) for i, (lp, b) in enumerate(cands)]); mark = (ctypes.c_uint8 * len(cands))()
+        got = self.lib.pick(arr, len(cands), need * MIB, mark)
+        return got // MIB, sorted(arr[i].p - 1 for i in range(len(cands)) if mark[i])
+
+    def test_the_pick_takes_the_least_recently_looked_up_until_enough(self):
+        cands = [(900, 64), (100, 32), (500, 128), (990, 16), (300, 8)]   # (last lookup, MiB)
+        self.assertEqual(self.pick(cands, 100), (168, [1, 2, 4]))   # 100 (32), 300 (8), 500 (128): enough after the third
+        self.assertEqual(self.pick(list(reversed(cands)), 100), (168, [4 - 4, 4 - 2, 4 - 1]))   # the same images whatever the order
+        self.assertEqual(self.pick(cands, 0), (0, []))
+        self.assertEqual(self.pick(cands, 10000), (248, [0, 1, 2, 3, 4]))   # not enough: all of them
+
     def test_the_budget_defaults_to_a_quarter_of_the_device_memory(self):
         meminfo = b'MemTotal:       11849504 kB\nMemFree:          412352 kB\nSwapTotal:      12582908 kB\n'   # a Galaxy Z Fold 8's 11.3 GB
         kb = self.lib.meminfo(meminfo, b'MemTotal:')
         self.assertEqual(kb, 11849504)
         self.assertEqual(self.lib.bdefault(kb), 11849504 // 4 * 1024)   # 2.83 GB: over the 2.23 GB the ages alone held Saria's scene to there
-        self.assertEqual(self.lib.bdefault(16 << 20), 4096 * MB)   # a 16 GB device: 4 GB
-        self.assertEqual(self.lib.meminfo(b'MemFree: 1 kB\n', b'MemTotal:'), 0)   # not there
-        self.assertEqual(self.lib.bdefault(0), 0)   # and then no budget
+        self.assertEqual(self.lib.bdefault(16 << 20), 4096 * MIB)   # a 16 GB device: 4 GB
+        self.assertEqual(self.lib.bdefault(0), 0)   # MemTotal not there: no budget
 
     def test_the_budget_asks_for_nothing_until_it_is_passed_then_for_a_tenth_under_it(self):
-        b = 3072 * MB
-        self.assertEqual(self.lib.btarget(b, b), NONE)   # at the budget: nothing
-        self.assertEqual(self.lib.btarget(b - 1, b), NONE)
+        b, none = 3072 * MIB, 2 ** 64 - 1
+        self.assertEqual(self.lib.btarget(b, b), none)   # at the budget: nothing
+        self.assertEqual(self.lib.btarget(b - 1, b), none)
         self.assertEqual(self.lib.btarget(b + 1, b), b // 100 * 90)   # past it: down to 90 % of it, not just under it
-        self.assertEqual(self.lib.btarget(8192 * MB, b), b // 100 * 90)
-        self.assertEqual(self.lib.btarget(8192 * MB, 0), NONE)   # no budget
-
-    def pick(self, cands, need):
-        arr = (Cand * len(cands))(*[Cand(last, size, i) for i, (last, size) in enumerate(cands)]); mark = (ctypes.c_uint8 * len(cands))()
-        got = self.lib.pick(arr, len(cands), need, mark)
-        return got, [arr[i].p if arr[i].p is not None else 0 for i in range(len(cands)) if mark[i]]   # the original indices chosen, least recently looked up first
-
-    def test_the_least_recently_looked_up_go_first_until_enough_is_chosen(self):
-        cands = [(900, 64 * MB), (100, 16 * MB), (500, 32 * MB), (300, 8 * MB)]   # (last lookup, bytes)
-        self.assertEqual(self.pick(cands, 20 * MB), (24 * MB, [1, 3]))   # 100 then 300: 16 + 8 MB covers 20
-        self.assertEqual(self.pick(cands, 16 * MB), (16 * MB, [1]))   # exactly one image's worth: no more
-        self.assertEqual(self.pick(cands, 1000 * MB), (120 * MB, [1, 3, 2, 0]))   # more than there is: all of them, short of it
-        self.assertEqual(self.pick(cands, 0), (0, []))
+        self.assertEqual(self.lib.btarget(8192 * MIB, b), b // 100 * 90)
+        self.assertEqual(self.lib.btarget(8192 * MIB, 0), none)   # no budget
 
 
 if __name__ == '__main__':
