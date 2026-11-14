@@ -463,6 +463,23 @@ int main(void) {
         check(tried && m.s.k == 2 && m.s.hold == FSTEP_HOLD0 && m.s.hitch_fails == 1 && m.s.late_cmax <= FSTEP_FIT, b);
         run(&m, 1, 0.2, 2, 3, 0);
         check(m.s.hitch_fails == 0, "  a change of cap forgets the hitch-only failures");
+        sim w = {0}; w.gpu = 0.5; run(&w, 120, 0.2, 1, 3, 0);   // a trial that is late most of the time at a cost that fits (Breath of the Wild at a 60 fps target on a OnePlus Pad 3): the scene's cost showing as lateness
+        for (int i = 0; i < 3; i++) w.next = nvn_fstep_next(&w.s, 3.0, 0.3, 1, 3, 0, 0);
+        for (int i = 0; i < 400 && !w.s.trial; i++) run(&w, 1, 0.2, 1, 3, 0);
+        int wtried = w.s.trial && w.s.k == 1 && !w.s.gtrial; run(&w, 6, 0.2, 1, 3, 0);
+        for (int i = 0; i < 8; i++) w.next = nvn_fstep_next(&w.s, 1.3, 0.6, 1, 3, 0, 0);   // soft late: no step up, but counted in the trial
+        int wk = w.s.k, wl = w.s.tlate;
+        for (int i = 0; i < 3; i++) w.next = nvn_fstep_next(&w.s, 1.7, 0.6, 1, 3, 0, 0);   // three that count, still cheap
+        snprintf(b, sizeof b, "  a trial late most of the time at a cost that fits is not hitch-only: the hold-off doubles (late in the trial %d, hold %.0f)", wl, w.s.hold);
+        check(wtried && wk == 1 && wl == 8 && w.s.k == 2 && w.s.hold == 2 * FSTEP_HOLD0 && w.s.hitch_fails == 0, b);
+        sim x = {0}; x.gpu = 0.5; run(&x, 120, 0.2, 1, 3, 0);   // up to FSTEP_HITCH_LATE other late frames are still a hitch-only failure
+        for (int i = 0; i < 3; i++) x.next = nvn_fstep_next(&x.s, 3.0, 0.3, 1, 3, 0, 0);
+        for (int i = 0; i < 400 && !x.s.trial; i++) run(&x, 1, 0.2, 1, 3, 0);
+        run(&x, 6, 0.2, 1, 3, 0);
+        for (int i = 0; i < FSTEP_HITCH_LATE; i++) { x.next = nvn_fstep_next(&x.s, 1.3, 0.6, 1, 3, 0, 0); run(&x, 2, 0.2, 1, 3, 0); }
+        for (int i = 0; i < 3; i++) x.next = nvn_fstep_next(&x.s, 3.0, 0.3, 1, 3, 0, 0);
+        snprintf(b, sizeof b, "  %d late frames besides the failing run keep it hitch-only (hold %.0f, hitch_fails %d)", FSTEP_HITCH_LATE, x.s.hold, x.s.hitch_fails);
+        check(x.s.k == 2 && x.s.hold == FSTEP_HOLD0 && x.s.hitch_fails == 1, b);
         sim g = {0}; g.gpu = 0.5; run(&g, 120, 0.2, 1, 3, 0); run(&g, 3, 1.6, 1, 3, 0);   // hold 2 at a cost of 1.5 that does not fit 1, a GPU of 0.5 that does
         for (int i = 0; i < 400 && !g.s.trial; i++) run(&g, 1, 1.5, 1, 3, 0);
         int gtried = g.s.trial && g.s.gtrial && g.s.k == 1; run(&g, 35, 0.2, 1, 3, 0);
