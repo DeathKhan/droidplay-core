@@ -2454,6 +2454,23 @@ static void mid_poll(uint64_t presents) {
     int v = 0; if (fscanf(f, "%d", &v) == 1 && v > 0 && v != g_mid_draws) { LOG("[vk] chunks sent in the middle of a pass after %d draws (was %d)", v, g_mid_draws); g_mid_draws = v; }
     fclose(f);
 }
+// The game setting the render targets it draws into again ended the pass and began it on the same framebuffer, its targets stored and loaded (the render pass's
+// external dependencies make a full barrier of it), for nothing: Tears of the Kingdom at #457's save does it about 9 times a frame between draws of one pass. NVN's
+// SetRenderTargets orders nothing by itself (a game that samples what it drew issues a barrier, which still ends the pass), and nvn_mtl.m keeps such a pass going on
+// tile-based GPUs (rt_same, its same-target continuation): the same rule here, targets compared by texture serial and view as that one does, and no early submission
+// for it (EARLY_DRAWS is for new targets). DM_VK_RT_KEEP=0 (env.txt): every SetRenderTargets ends the pass, as before
+static int rt_keep_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RT_KEEP"); v = !(e && *e == '0'); if (!v) LOG("[vk] DM_VK_RT_KEEP=0: setting the same render targets again ends the pass, as before"); } return v; }
+static uint64_t g_rt_kept;   // passes that went on over a SetRenderTargets of the same targets
+static int rt_keep(const p_set_rt *a, const p_set_rt *b) {
+    if (!R.has_rt || !rt_keep_on() || vk_safe()) return 0;
+    if (a->n != b->n || !a->depth != !b->depth || (a->depth && a->depth->serial != b->depth->serial) || a->has_dview != b->has_dview) return 0;
+    if (a->has_dview && memcmp(&a->dview, &b->dview, sizeof a->dview)) return 0;
+    for (int k = 0; k < a->n && k < 8; k++) {
+        if (!a->color[k] != !b->color[k] || (a->color[k] && a->color[k]->serial != b->color[k]->serial) || a->has_cview[k] != b->has_cview[k]) return 0;
+        if (a->has_cview[k] && memcmp(&a->cview[k], &b->cview[k], sizeof a->cview[k])) return 0;
+    }
+    g_rt_kept++; return 1;
+}
 static uint64_t g_op_warned;   // ops this replay does not handle, logged once each
 static uint64_t g_mesh_skipped;   // task / mesh draws skipped (OP_DRAW with DM_PRIM_MESH_TASKS)
 void mtl_exec(const uint8_t *p) {
@@ -2466,7 +2483,8 @@ void mtl_exec(const uint8_t *p) {
         int cpu_op = h.op == OP_UPDATE_UB || h.op == OP_SIGNAL_EVENT || h.op == OP_REPORT_COUNTER || h.op == OP_FENCE_SYNC || h.op == OP_COPY_STRIDE || h.op == OP_CALL
                      || h.op == OP_CLEAR_BUF || h.op == OP_COPY_B2B
                      || h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS || h.op == OP_RESET_COUNTER || h.op == OP_RENDER_COND;   // clears of the bound targets are made in their pass when they can be (clear_color); the others end it themselves (cb())
-        if (P.active && h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_SCISSOR && h.op != OP_JUMP && h.op != OP_END && !cpu_op && !draw_state_is(h.op)) rp_end();
+        int same_rt = h.op == OP_SET_RT && P.active && rt_keep(&R.rt, (const p_set_rt *)a);   // the same targets again: the pass goes on (rt_keep)
+        if (P.active && h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_SCISSOR && h.op != OP_JUMP && h.op != OP_END && !cpu_op && !same_rt && !draw_state_is(h.op)) rp_end();
         switch (h.op) {
             case OP_END: return;
             case OP_JUMP: memcpy(&p, a, 8); continue;
@@ -2500,7 +2518,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_SET_RT:   // new render targets: a chunk with enough work goes to the GPU now, so that it draws while the rest of the submission is recorded
                 // (one command buffer per frame kept the GPU idle until the CPU had recorded everything: Super Mario Bros. Wonder's level took CPU 29 ms + GPU 41 ms
                 // a frame one after the other). A dispatch's storage buffer read by later draws on the GPU is found in the chunks in flight too (fwd_find)
-                if (C && C->ndraw >= EARLY_DRAWS && !vk_safe()) flush();
+                if (!same_rt && C && C->ndraw >= EARLY_DRAWS && !vk_safe()) flush();
                 R.rt = *(const p_set_rt *)a; R.has_rt = 1; g_sh_rt = shadow_rt(&R.rt); break;
             case OP_SCISSOR: R.sc = *(const p_scissor *)a; R.has_sc = 1; break;
             case OP_CLEAR_COLOR: if (!rc_skips()) clear_color((const p_clear_color *)a); break;
@@ -2808,11 +2826,11 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
     if (g_ofw_new) LOG("[vk] storage buffers draws write in an order-free way: %llu bindings on a copy of their chunk, %llu copies made from the identity, %llu landed with words to combine (%llu words); "
                        "%llu shaders write one so (cumulative; gfx_vk_draw.inc ofw_bind, ofw.h, DM_VK_OFW)", (unsigned long long)g_ofw_chain, (unsigned long long)g_ofw_new,
                        (unsigned long long)atomic_load(&g_ofw_landed), (unsigned long long)atomic_load(&g_ofw_words), (unsigned long long)g_ofw_shaders);
-    if (g_wl_n[0] || g_wl_n[1] || g_wl_n[2] || g_wl_n[3] || g_wl_n[4] || g_wl_n[6] || g_wl_n[8]) LOG("[vk] copies holding their range's bytes, written in place: draws' writes on the chunk's copy %llu, order-free writes on such a copy %llu, order-free copies "
+    if (g_wl_n[0] || g_wl_n[1] || g_wl_n[2] || g_wl_n[3] || g_wl_n[4] || g_wl_n[6] || g_wl_n[8] || g_wl_n[9]) LOG("[vk] copies holding their range's bytes, written in place: draws' writes on the chunk's copy %llu, order-free writes on such a copy %llu, order-free copies "
                        "from guest memory %llu / made on the GPU %llu, draws' copies made on the GPU %llu, barriers put in %llu; reads that waited (another kind of draw) %llu, needing a barrier "
-                       "after the pass began %llu; draws skipped (no copy to write) %llu (cumulative; gfx_vk_draw.inc wl_*, wb_live.h, DM_VK_LIVE)", (unsigned long long)g_wl_n[0],
+                       "after the pass began %llu; draws skipped (no copy to write) %llu; dispatches' copies made on the GPU %llu (cumulative; gfx_vk_draw.inc wl_*, wb_live.h, DM_VK_LIVE)", (unsigned long long)g_wl_n[0],
                        (unsigned long long)g_wl_n[1], (unsigned long long)g_wl_n[2], (unsigned long long)g_wl_n[3], (unsigned long long)g_wl_n[4], (unsigned long long)g_wl_n[5],
-                       (unsigned long long)g_wl_n[6], (unsigned long long)g_wl_n[7], (unsigned long long)g_wl_n[8]);
+                       (unsigned long long)g_wl_n[6], (unsigned long long)g_wl_n[7], (unsigned long long)g_wl_n[8], (unsigned long long)g_wl_n[9]);
     LOG("[vk] constant and storage buffer copies: %llu reused, %llu made, %llu MB copied to the arena and %llu MB to the shadows (cumulative; gfx_vk_draw.inc ucopy); constant buffer bindings of the shaders loaded: %llu bounded by res.json, %llu by the SPIR-V scan, %llu read whole, %llu res.json extents below the scan's (gfx_vk_draw.inc cb_ext_pick)%s",
         (unsigned long long)g_ucopy_hit, (unsigned long long)g_ucopy_miss, (unsigned long long)(g_ucopy_bytes >> 20), (unsigned long long)(g_ucopy_shadow >> 20), (unsigned long long)g_cbx[0], (unsigned long long)g_cbx[2], (unsigned long long)g_cbx[3], (unsigned long long)g_cbx[1],
         ext_check() ? "; DM_VK_EXT_CHECK on" : "");
@@ -2853,10 +2871,11 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { LOG("[vk] f
         "%llu walks for room let %llu copies go, %llu requests found no walk due (cumulative; gfx_vk_draw.inc gc_get, sb_keep, gc_evict)",
         (unsigned long long)(g_gc_hit - g_gc_sb), (unsigned long long)g_gc_sb, (unsigned long long)g_gc_made, (unsigned long long)(g_gc_bytes >> 20), (unsigned long long)g_gc_copy,
         (unsigned long long)g_gc_evicts, (unsigned long long)g_gc_evicted, (unsigned long long)g_gc_evict_skips);
-    { static unsigned long long f0; static uint64_t g0, w0; uint64_t g = atomic_load(&g_gpu_ns), w = atomic_load(&g_chunk_wait_ns);
-      if (frame > f0) LOG("[vk] GPU busy %.2f ms per frame over the last %llu frames (%llu command buffers in all); the replay waited %.2f ms per frame for a free one of %d", (double)(g - g0) / 1e6 / (double)(frame - f0), frame - f0,
-                          (unsigned long long)atomic_load(&g_gpu_chunks), (double)(w - w0) / 1e6 / (double)(frame - f0), g_nchunk);
-      f0 = frame; g0 = g; w0 = w; }
+    { static unsigned long long f0; static uint64_t g0, w0, k0; uint64_t g = atomic_load(&g_gpu_ns), w = atomic_load(&g_chunk_wait_ns);
+      if (frame > f0) LOG("[vk] GPU busy %.2f ms per frame over the last %llu frames (%llu command buffers in all); the replay waited %.2f ms per frame for a free one of %d; passes kept over "
+                          "the same render targets set again %.1f a frame (rt_keep, DM_VK_RT_KEEP)", (double)(g - g0) / 1e6 / (double)(frame - f0), frame - f0,
+                          (unsigned long long)atomic_load(&g_gpu_chunks), (double)(w - w0) / 1e6 / (double)(frame - f0), g_nchunk, (double)(g_rt_kept - k0) / (double)(frame - f0));
+      f0 = frame; g0 = g; w0 = w; k0 = g_rt_kept; }
     LOG("[vk] occlusion queries %llu (%s; %llu stretches counted with none), samples-passed reports %llu (%llu to an address a condition had read, %llu to one none had), counter resets %llu, timestamp reports %llu, queries reset on the host %llu / in command buffers %llu, graphics pipelines made %llu (%.0f ms), compute pipelines %llu (%.0f ms), shader modules %llu (%.0f ms); pipelines the driver's cache gave for module identifiers %llu, that needed the modules after all %llu, modules known by identifier %llu; shaders with binding numbers made dense %llu (%llu bindings; spv_bind.h) (cumulative)",
         (unsigned long long)g_q_queries, occl_mode() == 2 ? "precise" : occl_mode() ? "any count" : "none", (unsigned long long)g_q_noq, (unsigned long long)g_q_reports, (unsigned long long)g_q_rep_read, (unsigned long long)g_q_rep_new, (unsigned long long)g_q_resets,
         (unsigned long long)g_ts_reports, (unsigned long long)atomic_load(&g_qr_host), (unsigned long long)g_qr_cmd,
