@@ -166,11 +166,16 @@ class Windows(unittest.TestCase):
     def test_nx_extract_is_built_once_and_reused(self):   # the desktop app reads every game with --info, each read used to run a dotnet build
         tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp); builds = []
         name = 'nx_extract.exe' if os.name == 'nt' else 'nx_extract'
-        def dotnet(cmd, log, env=None, **k): builds.append(cmd); (Path(cmd[cmd.index('-o') + 1]) / name).write_bytes(b'nx')
+        def dotnet(cmd, log, env=None, **k):
+            builds.append(cmd); out = Path(cmd[cmd.index('-o') + 1]); out.mkdir(parents=True, exist_ok=True); (out / name).write_bytes(b'nx')
         with mock.patch.object(ba, 'data_dir', lambda: tmp / 'data'), mock.patch.object(ba.bi, 'run', dotnet):
             first = ba.build_nx_extract(tmp / 'a', tmp / 'logs', {}); again = ba.bi.build_nx_extract(REPO, tmp / 'b', tmp / 'logs', {})
         self.assertEqual(len(builds), 1); self.assertEqual(first, again); self.assertTrue(first.is_file())
         self.assertTrue(first.parent.name.startswith('nx_extract-') and first.parent.parent == tmp / 'data' / 'tools')
+        self.assertEqual(sorted(p.name for p in first.parent.iterdir()), [name])   # the build's output alone, not its obj/
+        # obj/ outside the project: DroidPlay may run from a tree it can't write, such as an AppImage's mount, where the restore stopped with "Permission denied"
+        obj = next(str(c).split('=', 1)[1] for c in builds[0] if str(c).startswith('-p:BaseIntermediateOutputPath='))
+        self.assertFalse(Path(obj).resolve().is_relative_to(REPO)); self.assertTrue(obj.endswith(os.sep))
 
     def test_game_app_stage_without_symbolic_links(self):   # Windows makes them only with Developer Mode on (or as administrator): the stage takes the files instead
         tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp)
@@ -443,9 +448,123 @@ class Setup(unittest.TestCase):   # --setup (dm/android/tools/host_setup.py): wh
         with self.assertRaisesRegex(self.hs.SetupError, 'accept-android-licenses'):
             self.hs.setup({'NDK'}, self.sdk, self.tools, ba.sdk_packages(self.sdk), False, mock.Mock(), lambda m: None)
 
-    def test_off_windows_it_says_where_to_go(self):
-        with mock.patch.object(self.hs, 'WINDOWS', False), self.assertRaisesRegex(self.hs.SetupError, 'DroidPlay'):
+    def test_on_a_mac_it_says_where_to_go(self):   # DroidPlay's Setup for the Mac brings the tools with Homebrew
+        with mock.patch.object(self.hs, 'WINDOWS', False), mock.patch.object(self.hs, 'LINUX', False), self.assertRaisesRegex(self.hs.SetupError, "DroidPlay's Setup"):
             self.hs.setup({'NDK'}, self.sdk, self.tools, ba.sdk_packages(self.sdk), True, mock.Mock(), lambda m: None)
+
+    def linux(self, machine='x86_64'):   # host_setup as it runs on Linux, on that processor
+        cms = [mock.patch.object(self.hs, 'WINDOWS', False), mock.patch.object(self.hs, 'LINUX', True), mock.patch.object(self.hs.platform, 'machine', lambda: machine)]
+        for cm in cms: cm.__enter__(); self.addCleanup(cm.__exit__, None, None, None)
+
+    def test_linux_x86_64_installs_and_arm64_is_told_why_not(self):   # Google publishes the SDK's Linux packages for x86_64 alone
+        self.linux(); self.assertEqual(self.hs.unsupported(), '')
+        self.linux('aarch64')
+        with self.assertRaisesRegex(self.hs.SetupError, 'x86_64 Linux only'):
+            self.hs.setup({'NDK'}, self.sdk, self.tools, ba.sdk_packages(self.sdk), True, mock.Mock(), lambda m: None)
+
+    def test_linux_takes_the_linux_archives(self):   # Microsoft's JDK and .NET as .tar.gz, Google's command-line tools for host-os linux
+        self.linux()
+        self.assertEqual(self.hs.jdk_url(), 'https://aka.ms/download-jdk/microsoft-jdk-21-linux-x64.tar.gz')
+        rel = {'latest-sdk': '10.0.404', 'releases': [{'sdk': {'version': '10.0.404', 'files': [
+            {'rid': 'win-x64', 'name': 'dotnet-sdk-win-x64.zip', 'url': 'w', 'hash': 'h'}, {'rid': 'linux-x64', 'name': 'dotnet-sdk-linux-x64.zip', 'url': 'no', 'hash': 'h'},
+            {'rid': 'linux-x64', 'name': 'dotnet-sdk-linux-x64.tar.gz', 'url': 'l', 'hash': 'h'}, {'rid': 'linux-musl-x64', 'name': 'dotnet-sdk-linux-musl-x64.tar.gz', 'url': 'm', 'hash': 'h'}]}}]}
+        self.assertEqual(self.hs.dotnet_file(rel)[1]['url'], 'l')
+        xml = ('<sdk-repository><remotePackage path="cmdline-tools;latest"><archives>'
+               + ''.join(f'<archive><complete><url>tools-{o}.zip</url><checksum>c{o}</checksum></complete><host-os>{o}</host-os></archive>' for o in ('macosx', 'windows', 'linux'))
+               + '</archives></remotePackage></sdk-repository>')
+        got = []
+        with mock.patch.object(self.hs, 'fetch', lambda url: xml.encode()), mock.patch.object(self.hs, 'download', lambda url, dst, algo, digest, *a: got.append((url, digest))), \
+             mock.patch.object(self.hs, 'unpack', lambda *a, **k: None), mock.patch.object(Path, 'unlink', lambda self, *a, **k: None):
+            self.hs.install_cmdline_tools(self.sdk, self.tmp, mock.Mock())
+        self.assertEqual(got, [(self.hs.REPOSITORY + 'tools-linux.zip', 'clinux')])
+
+    def test_linux_packages_go_through_android_with_no_extension(self):   # bin/android, not android.exe
+        self.linux()
+        b = self.sdk / 'cmdline-tools/latest/bin'; b.mkdir(parents=True); (b / 'android').touch()
+        seen = []
+        def run(cmd, input=None, **k): seen.append(cmd); (self.sdk / 'ndk' / ba.NDK).mkdir(parents=True); return mock.Mock(returncode=0, stdout='', stderr='')
+        with mock.patch.object(self.hs.subprocess, 'run', run): self.hs.install_packages(self.sdk, [ba.sdk_packages(self.sdk)['NDK']], mock.Mock())
+        self.assertEqual(seen[0][0], str(b / 'android'))
+
+    @unittest.skipIf(os.name == 'nt', 'Unix file modes')
+    def test_zips_keep_their_unix_modes(self):   # zipfile's extractall made the Linux command-line tools' bin/android non-executable
+        import zipfile
+        z = self.tmp / 'tools.zip'
+        with zipfile.ZipFile(z, 'w') as zf:
+            for name, mode in (('cmdline-tools/bin/android', 0o100755), ('cmdline-tools/lib/a.jar', 0o100644)):
+                i = zipfile.ZipInfo(name); i.create_system = 3; i.external_attr = mode << 16; zf.writestr(i, b'x')
+            i = zipfile.ZipInfo('cmdline-tools/bin/sdkmanager'); i.create_system = 3; i.external_attr = 0o120777 << 16; zf.writestr(i, 'android')   # a link beside it
+        self.hs.unpack(z, self.sdk / 'latest', mock.Mock(), 'tools', top=True)
+        self.assertEqual(os.stat(self.sdk / 'latest/bin/android').st_mode & 0o777, 0o755)
+        self.assertEqual(os.stat(self.sdk / 'latest/lib/a.jar').st_mode & 0o111, 0)
+        self.assertEqual(os.readlink(self.sdk / 'latest/bin/sdkmanager'), 'android')
+        with zipfile.ZipFile(z, 'w') as zf:   # a link out of the folder is refused
+            i = zipfile.ZipInfo('x/evil'); i.create_system = 3; i.external_attr = 0o120777 << 16; zf.writestr(i, '../../../etc/passwd')
+        with self.assertRaisesRegex(self.hs.SetupError, 'points outside it'): self.hs.unpack(z, self.tmp / 'evil', mock.Mock(), 'tools')
+
+    @unittest.skipIf(os.name == 'nt', 'Unix file modes')
+    def test_tarballs_unpack_with_their_modes(self):   # the JDK and the .NET SDK on Linux
+        import tarfile
+        src = self.tmp / 'src/jdk-21.0.9+10/bin'; src.mkdir(parents=True); (src / 'java').write_bytes(b'\x7fELF'); os.chmod(src / 'java', 0o755)
+        with tarfile.open(self.tmp / 'jdk.tar.gz', 'w:gz') as t: t.add(self.tmp / 'src/jdk-21.0.9+10', 'jdk-21.0.9+10')
+        self.hs.unpack(self.tmp / 'jdk.tar.gz', self.tools / 'jdk', mock.Mock(), 'the JDK', top=True)
+        self.assertTrue(os.access(self.tools / 'jdk/bin/java', os.X_OK))
+
+    @unittest.skipIf(os.name == 'nt', "Linux's place: pathlib can't make POSIX paths on Windows")
+    def test_a_new_sdk_on_linux_goes_into_the_data_folder_and_is_found_there(self):   # beside the JDK and .NET, not a new ~/Android
+        with mock.patch.object(ba, 'data_dir', lambda: self.tmp / 'data'), mock.patch.object(ba.os, 'name', 'posix'), \
+             mock.patch.dict(os.environ, {'HOME': str(self.tmp / 'home')}):
+            for k in ('ANDROID_HOME', 'ANDROID_SDK_ROOT', 'LOCALAPPDATA'): os.environ.pop(k, None)
+            self.assertEqual(ba.default_sdk(), self.tmp / 'data/tools/android-sdk')
+            (self.tmp / 'data/tools/android-sdk/platform-tools').mkdir(parents=True)
+            self.assertEqual(ba.sdk_dir(None), self.tmp / 'data/tools/android-sdk')
+            (self.tmp / 'home/Android/Sdk/platform-tools').mkdir(parents=True)   # Android Studio's, which --setup then completes
+            self.assertEqual(ba.sdk_dir(None), self.tmp / 'home/Android/Sdk')
+
+    def distro(self):   # Linux with no ANDROID_HOME reaching DroidPlay (a desktop launch, #508) and a distribution's SDK at a stand-in for /opt/android-sdk
+        self.linux(); distro = self.tmp / 'opt/android-sdk'
+        cms = [mock.patch.object(ba, 'data_dir', lambda: self.tmp / 'data'), mock.patch.object(ba, 'DISTRO_SDKS', (str(distro),)), mock.patch.object(ba.os, 'name', 'posix'),
+               mock.patch.dict(os.environ, {'HOME': str(self.tmp / 'home')})]
+        for cm in cms: cm.__enter__(); self.addCleanup(cm.__exit__, None, None, None)
+        for k in ('ANDROID_HOME', 'ANDROID_SDK_ROOT', 'LOCALAPPDATA'): os.environ.pop(k, None)
+        return distro
+
+    @unittest.skipIf(os.name == 'nt', "Linux's places: pathlib can't make POSIX paths on Windows")
+    def test_a_distributions_sdk_is_found_after_the_players_own(self):   # Arch's /opt/android-sdk, Debian's /usr/lib/android-sdk
+        distro = self.distro()
+        with self.assertRaises(ba.BuildError): ba.sdk_dir(None)
+        (distro / 'platform-tools').mkdir(parents=True); self.assertEqual(ba.sdk_dir(None), distro)
+        (self.tmp / 'data/tools/android-sdk/platform-tools').mkdir(parents=True)   # one Install what's missing made goes first
+        self.assertEqual(ba.sdk_dir(None), self.tmp / 'data/tools/android-sdk')
+        with mock.patch.object(ba.host_setup, 'LINUX', False):   # on a Mac or Windows the Linux places aren't looked in
+            shutil.rmtree(self.tmp / 'data'); self.assertRaises(ba.BuildError, ba.sdk_dir, None)
+
+    @unittest.skipIf(os.name == 'nt' or os.geteuid() == 0, 'Unix file modes, which root ignores')
+    def test_setup_puts_what_a_read_only_sdk_lacks_into_a_whole_sdk_of_the_players_own(self):   # not sdkmanager failing on a folder only root can write
+        distro = self.distro(); (distro / 'platform-tools').mkdir(parents=True); own = self.tmp / 'data/tools/android-sdk'
+        self.assertEqual(ba.setup_target(None, {'NDK'}), (distro, {'NDK'}))   # one the player can write to is completed in place
+        os.chmod(distro, 0o555); self.addCleanup(os.chmod, distro, 0o755)
+        self.assertEqual(ba.setup_target(None, {'NDK', '.NET SDK 10'}), (own, {'NDK', '.NET SDK 10', 'Android SDK'}))
+        self.assertEqual(ba.setup_target(None, {'.NET SDK 10'}), (distro, {'.NET SDK 10'}))   # nothing of the SDK's missing: the distribution's stays the one used
+        self.assertEqual(ba.setup_target(str(distro), {'NDK'}), (distro, {'NDK'}))   # named with --sdk: completed as asked
+
+    def test_the_sdk_row_says_whether_the_variables_reached_droidplay(self):   # "not set" (a desktop launch) told apart from "set, but no SDK there"
+        self.linux()
+        with mock.patch.dict(os.environ, {}):
+            for k in ('ANDROID_HOME', 'ANDROID_SDK_ROOT'): os.environ.pop(k, None)
+            detail, fix = ba.sdk_not_found(); self.assertIn('not set', detail); self.assertIn('environment.d', fix)
+            with mock.patch.object(ba.host_setup, 'LINUX', False): self.assertNotIn('environment.d', ba.sdk_not_found()[1])
+            os.environ['ANDROID_HOME'] = '/nowhere'
+            detail, fix = ba.sdk_not_found(); self.assertIn('ANDROID_HOME=/nowhere has no platform-tools', detail); self.assertNotIn('environment.d', fix)
+
+    def test_dotnet_runs_without_icu_where_linux_has_none(self):   # .NET stops at its first start without ICU unless told to go without
+        self.linux()
+        with mock.patch.dict(os.environ, {'PATH': '/usr/bin'}), mock.patch.object(self.hs, 'has_icu', lambda: False):
+            os.environ.pop('DOTNET_SYSTEM_GLOBALIZATION_INVARIANT', None); self.hs.add_tool_paths(self.tools)
+            self.assertEqual(os.environ.get('DOTNET_SYSTEM_GLOBALIZATION_INVARIANT'), '1')
+        with mock.patch.dict(os.environ, {'PATH': '/usr/bin'}), mock.patch.object(self.hs, 'has_icu', lambda: True):
+            os.environ.pop('DOTNET_SYSTEM_GLOBALIZATION_INVARIANT', None); self.hs.add_tool_paths(self.tools)
+            self.assertNotIn('DOTNET_SYSTEM_GLOBALIZATION_INVARIANT', os.environ)
 
     def run_install(self, cli):   # install_packages with subprocess stubbed: the command for the NDK, and what it was fed
         b = self.sdk / 'cmdline-tools/latest/bin'; b.mkdir(parents=True); (b / ('android.exe' if cli else 'sdkmanager.bat')).touch()
@@ -710,6 +829,11 @@ class PickDevice(Base):   # the console's default phone: the only one ready, a p
         props = {'R5CY51ZLGKH': 'R5CY51ZLGKH\n9774d56d682e549c\n', '192.168.1.30:5555': 'e7879cce\nf00dfeed12345678\n'}
         with self.assertRaisesRegex(ba.BuildError, r'2 adb devices ready'): self.pick([(s, 'device') for s in props], props)
         self.assertEqual(self.pick([('R5CY51ZLGKH', 'device'), ('192.168.1.30:5555', 'offline')], props), 'R5CY51ZLGKH')
+
+    def test_a_phone_linux_wont_open_is_named_with_why(self):   # adb's "no permissions (...); see [...]": it was listed as "(no)"
+        state = 'no permissions (user andrew is not in the plugdev group); see [http://developer.android.com/tools/device.html]'
+        with self.assertRaisesRegex(ba.BuildError, r'0 adb devices ready \(R5CY51ZLGKH \(no permissions: user andrew is not in the plugdev group\)\).*udev rule'):
+            self.pick([('R5CY51ZLGKH', state)], {})
 
 
 class PhoneSetup(Base):   # adb as a recording stand-in, and a game to copy
@@ -1087,10 +1211,12 @@ class Update(unittest.TestCase):   # dm/android/desktop/update.py, the desktop a
         threading.Thread(target=server.serve_forever, daemon=True).start(); self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
         self.base = f'http://127.0.0.1:{server.server_address[1]}'
 
-    def release(self, digest=None, name='DroidPlay-Setup-0.5.1.exe'):
+    def release(self, digest=None, name='DroidPlay-Setup-0.5.1.exe', appimage='sha256:' + '1' * 64):
         digest = f'sha256:{hashlib.sha256(self.setup).hexdigest()}' if digest is None else digest
         self.files['/api'] = json.dumps({'tag_name': 'v0.5.1', 'html_url': 'https://example.invalid/v0.5.1', 'assets': [
             {'name': 'droidplay-core-0.5.1.zip', 'size': 1, 'browser_download_url': self.base + '/x', 'digest': 'sha256:' + '0' * 64},
+            {'name': 'DroidPlay-0.5.1-x86_64.AppImage', 'size': 3, 'browser_download_url': self.base + '/a', 'digest': appimage},
+            {'name': 'DroidPlay-0.5.1-x86_64.AppImage.sha256', 'size': 99, 'browser_download_url': self.base + '/s', 'digest': 'sha256:' + '2' * 64},
             {'name': name, 'size': len(self.setup), 'browser_download_url': self.base + '/setup.exe', 'digest': digest}]}).encode()
         return upd.latest_release(self.base + '/api')
 
@@ -1103,6 +1229,10 @@ class Update(unittest.TestCase):   # dm/android/desktop/update.py, the desktop a
         r = self.release(); self.assertEqual((r['tag'], r['setup']['name'], r['setup']['sha256']), ('v0.5.1', 'DroidPlay-Setup-0.5.1.exe', hashlib.sha256(self.setup).hexdigest()))
         self.assertIsNone(self.release(digest='')['setup'])   # nothing to check the download against: the release's page instead
         self.assertIsNone(self.release(name='Install.DroidPlay.cmd')['setup'])
+
+    def test_the_appimage_beside_it(self):   # DroidPlay for Linux's file in the same release, by the same rule; its .sha256 file isn't taken for it
+        r = self.release(); self.assertEqual((r['appimage']['name'], r['appimage']['url'], r['appimage']['sha256']), ('DroidPlay-0.5.1-x86_64.AppImage', self.base + '/a', '1' * 64))
+        self.assertIsNone(self.release(appimage='')['appimage']); self.assertIsNotNone(self.release(appimage='')['setup'])
 
     def test_setup_downloaded_and_checked(self):
         folder = self.tmp / 'updates'; folder.mkdir(); (folder / 'DroidPlay-Setup-0.5.0.exe').write_bytes(b'old')
@@ -1125,6 +1255,8 @@ class Update(unittest.TestCase):   # dm/android/desktop/update.py, the desktop a
         self.assertFalse(upd.setup_install(app / 'core'))
         (app / 'unins000.exe').write_bytes(b''); (app / 'runtime' / 'pythonw.exe').write_bytes(b'')
         self.assertTrue(upd.setup_install(app / 'core'))
+        r = self.release(); self.assertEqual(upd.how(r, app / 'core', {}), ('setup', None)); self.assertEqual(upd.how(r, self.tmp / 'checkout', {}), (None, None))
+        self.assertEqual(upd.how(dict(r, setup=None), app / 'core', {}), (None, None))   # a release without its Setup: the release's page
 
 
 if __name__ == '__main__':

@@ -8,14 +8,14 @@
 #   python scripts/build_android_from_nsp.py --import-save <folder | archive> --title <title ID> [--serial ...]   a save for that game, swapped in by the app after it asks
 #   python scripts/build_android_from_nsp.py --restore-backup <backup folder> [--title <title ID>] [--serial ...]   a game's save (or every game's) from Back up saves' copy
 #   python scripts/build_android_from_nsp.py --check | --info <NSP folder>                              requirements / the game's details, as JSON (the desktop app)
-#   python scripts/build_android_from_nsp.py --setup [--accept-android-licenses]                         install what --check finds missing (Windows: dm/android/tools/host_setup.py)
+#   python scripts/build_android_from_nsp.py --setup [--accept-android-licenses]                         install what --check finds missing (Windows, Linux: dm/android/tools/host_setup.py)
 #   python scripts/build_android_from_nsp.py <NSP folder> -k <prod.keys> --game-apk [--xapk] [--out <folder>]   the game in an app of its own, to install anywhere (make_game_app)
 #   --progress json: newline-delimited JSON events on stdout (build_ipa_from_nsp.py Progress), for the desktop app (scripts/nxnative_android.py)
 #   Every build also writes those events to a journal, <data>/builds/<time>-<pid>.jsonl (start and exit events around them), whatever its --progress: the desktop app
 #   shows a build started from a console too
 # One app carries every game: its launcher (dm/android/java Launcher.java) lists the games on the phone, Android/data/org.nxnative.android/files/games/<title ID>/,
 # and the app holds a host per game, lib/arm64-v8a/libdmhost_<title ID>.so, started by its loader (dm/android/loader.c). The hosts built on this computer are kept in a
-# library (<data>/hosts/<title ID>/: %LOCALAPPDATA%\nxnative\android on Windows, ~/.local/share/nxnative/android elsewhere), and every APK is packed from all of them,
+# library (<data>/hosts/<title ID>/: %LOCALAPPDATA%\nxnative\android on Windows, ~/.local/share/nxnative/android elsewhere, or under XDG_DATA_HOME on Linux), and every APK is packed from all of them,
 # so building a second game keeps the first in the app.
 # Steps (the extraction and the rewrite are build_ipa_from_nsp.py's own, reused):
 #   1. find the game profile from the title ID (dm/games/<id>); a game without one is surveyed and packed from a provisional profile (<NSP folder>/<id>_build/profile),
@@ -45,15 +45,22 @@ from build_ipa_from_nsp import BuildError, say   # noqa: E402
 PKG = 'org.nxnative.android'
 # One signing key for every build on this computer: an update must be signed like the installed app, and uninstalling it would delete the saves and the game files on the phone
 KEYSTORE = Path.home() / '.android' / 'nxnative-debug.jks'
+# DejaVu Sans, which DroidPlay for Linux carries (dm/android/linux/stage.sh puts it here; a checkout has none): the last of both lists below, so a Linux without
+# DejaVu or Liberation at the paths listed, such as Fedora's Atomic desktops, still builds. Its hinting makes it a standard font too
+BUNDLED_FONTS = REPO / 'dm/android/fonts'
 # The letters of the button-icon font (make_ext_font.py): macOS's Arial Rounded Bold is its default; elsewhere a bold sans-serif of the system
 LETTER_FONTS = ['/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf', r'C:\Windows\Fonts\arialbd.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-                '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf', '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf']
+                '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf', '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf', '/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf',
+                '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf', '/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf',
+                '/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf', str(BUNDLED_FONTS / 'DejaVuSans-Bold.ttf')]
 # The standard shared font (hle_sdk16.c: every font type but the Nintendo extension), copied into <id>_build/font/standard.ttf: STD_FONT names one, else the first of these.
 # It must be a hinted TrueType font. Android's own Roboto has no TrueType hinting, and Super Smash Bros. Ultimate crashed at boot on it (main+0x7caa0); Roboto with empty
 # cvt / fpgm / prep tables crashed too, while Arial stripped of everything but its hinting booted. The iPhone build copies Arial Unicode the same way (build_ipa.sh)
 STANDARD_FONTS = ['/System/Library/Fonts/Supplemental/Arial Unicode.ttf', '/System/Library/Fonts/Supplemental/Arial.ttf', r'C:\Windows\Fonts\arialuni.ttf',
                   r'C:\Windows\Fonts\arial.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/usr/share/fonts/TTF/DejaVuSans.ttf',
-                  '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf']
+                  '/usr/share/fonts/dejavu/DejaVuSans.ttf', '/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf',
+                  '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf',
+                  '/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf', str(BUNDLED_FONTS / 'DejaVuSans.ttf')]
 REMOTE = f'/sdcard/Android/data/{PKG}/files'
 BUILD_TOOLS, PLATFORM = '36.0.0', 'android-35'   # build_apk.py's defaults
 # libadrenotools and its hooks (dm/android/CMakeLists.txt), in every APK: DM_VK_DRIVER opens a Vulkan driver of the player's through them (dm/android/vk_driver.c), so trying
@@ -93,9 +100,7 @@ ANDROID_TESTED = {
 }
 
 
-def data_dir():   # the library of game hosts, the loader, the self test and the APK
-    base = Path(os.environ['LOCALAPPDATA']) if os.name == 'nt' and os.environ.get('LOCALAPPDATA') else Path.home() / '.local/share'
-    return base / 'nxnative' / 'android'
+def data_dir(): return data_home.data_dir()   # the library of game hosts, the loader, the self test and the APK (dm/android/tools: XDG_DATA_HOME on Linux)
 
 
 class Journaled(bi.Progress):   # the console's progress, and the same build's events as JSON lines in a journal file (a second Progress in json mode, written there)
@@ -134,14 +139,37 @@ class Journaled(bi.Progress):   # the console's progress, and the same build's e
     def exit(self, code): self.close(ok=code == 0); self.write({'ev': 'exit', 'code': code}); self.f.close()
 
 
-def sdk_dir(arg):   # --sdk, the environment, then where Android Studio puts it: Windows, Linux, macOS
-    for c in (arg, os.environ.get('ANDROID_HOME'), os.environ.get('ANDROID_SDK_ROOT'), os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk'), os.path.expanduser('~/Android/Sdk'),
-              os.path.expanduser('~/Library/Android/sdk')):
+# Where Linux distributions' packages put the SDK: Arch's (AUR android-sdk) and Debian's / Ubuntu's (android-sdk). A shell's ANDROID_HOME doesn't reach an app started from
+# the desktop (fish's universal variables, a .bashrc), so without these an SDK installed this way was "not found" (#508)
+DISTRO_SDKS = ('/opt/android-sdk', '/usr/lib/android-sdk')
+
+
+def sdk_dir(arg):   # --sdk, the environment, where Android Studio puts it (Windows, Linux, macOS), where --setup makes one on Linux (default_sdk), then a distribution's
+    la = os.environ.get('LOCALAPPDATA')
+    for c in (arg, os.environ.get('ANDROID_HOME'), os.environ.get('ANDROID_SDK_ROOT'), la and os.path.join(la, 'Android', 'Sdk'), os.path.expanduser('~/Android/Sdk'),
+              os.path.expanduser('~/Library/Android/sdk'), data_dir() / 'tools' / 'android-sdk', *(DISTRO_SDKS if host_setup.LINUX else ())):
         if c and (Path(c) / 'platform-tools').is_dir(): return Path(c)
     raise BuildError('Android SDK not found: give --sdk or set ANDROID_HOME')
 
 
-sys.path.append(str(REPO / 'dm/android/tools')); import host_setup, phone_id   # noqa: E401, E402  # pyright: ignore[reportMissingImports]  (--setup, a phone's name in folder names; dm/android/tools, put on the path here)
+def sdk_not_found():   # check()'s "Android SDK" row when sdk_dir finds none: (detail, fix), saying whether the variables reached this process at all
+    env = [(k, os.environ[k]) for k in ('ANDROID_HOME', 'ANDROID_SDK_ROOT') if os.environ.get(k)]
+    fix = 'install Android Studio or the command-line tools, then set ANDROID_HOME (or give --sdk)'
+    if env: return 'not found: ' + ', '.join(f'{k}={v} has no platform-tools' for k, v in env), fix
+    if host_setup.LINUX: fix += ('. ANDROID_HOME and ANDROID_SDK_ROOT are not set for DroidPlay: an app started from the desktop does not see variables set in a shell '
+                                 '(.bashrc, fish\'s set -Ux). Set them in ~/.config/environment.d/ and log in again, or use Install what\'s missing')
+    return 'not found (ANDROID_HOME and ANDROID_SDK_ROOT are not set)', fix
+
+
+def default_sdk():
+    """Where --setup makes an SDK when sdk_dir finds none. Windows: Android Studio's place, %LOCALAPPDATA%\\Android\\Sdk, which is hidden like the rest of
+    AppData. Linux: <data>/tools/android-sdk, beside the JDK and .NET it installs, so everything DroidPlay installs is in the user's data folder and goes with it,
+    rather than a new folder in the home folder (Android Studio's ~/Android/Sdk, which sdk_dir still finds first, and then --setup completes)"""
+    if os.name == 'nt': return Path(os.environ.get('LOCALAPPDATA') or Path.home(), 'Android', 'Sdk')
+    return data_dir() / 'tools' / 'android-sdk'
+
+
+sys.path.append(str(REPO / 'dm/android/tools')); import data_home, host_setup, phone_id   # noqa: E401, E402  # pyright: ignore[reportMissingImports]  (data_dir, --setup, a phone's name in folder names; dm/android/tools, put on the path here)
 NDK, CMAKE = '28.2.13676358', '3.22.1'   # what --setup installs, and the CI builds with; a build takes the newest NDK and CMake the SDK has
 
 
@@ -178,9 +206,13 @@ def build_nx_extract(work, logs, env):
         if p.is_file() and not {'bin', 'obj'} & set(rel.parts): h.update(rel.as_posix().encode() + b'\0' + p.read_bytes() + b'\0')
     out = data_dir() / 'tools' / f'nx_extract-{h.hexdigest()[:16]}'
     if (out / name).is_file(): return out / name
-    with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:   # built outside and copied in, as that script does: MSBuild breaks on an apostrophe in the path
-        bi.run(['dotnet', 'build', src, '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
-        if not (Path(t) / name).exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
+    with tempfile.TemporaryDirectory(prefix='nx_extract_') as tmp:   # built outside and copied in, as that script does: MSBuild breaks on an apostrophe in the path
+        # obj/ (the restore's and the compiler's files) goes there too, not into the project: DroidPlay may run from a tree it can't write, such as an AppImage's
+        # mount, where the restore stopped with "Permission denied". The trailing separator is MSBuild's rule for this property
+        t, obj = Path(tmp) / 'out', Path(tmp) / 'obj'
+        bi.run(['dotnet', 'build', src, '-c', 'Release', '-o', t, f'-p:BaseIntermediateOutputPath={obj}{os.sep}', '-v', 'quiet', '-nologo'],
+               logs / 'nx_extract_build.log', env=env)
+        if not (t / name).exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
         part = out.with_name(f'{out.name}.{os.getpid()}'); bi.rmtree(part); shutil.copytree(t, part)
         try: os.replace(part, out)
         except OSError: bi.rmtree(part)   # another run put the same build there meanwhile
@@ -336,7 +368,7 @@ def build_shaders(sv, dirs, work, logs, env, g, dlc_roms=(), derive=None, derive
                                      f'them it would play its sound over a black screen. Packing a version and build that {g.id} registers (its game.tsv) uses the registered profile '
                                      f'instead (--package picks the version); otherwise report this build with {logs / "shader_split.log"} and this message') from e
         bi.PROG.end(str(e), ok=False); say('[RED] the game is packed without shaders (its draws are skipped). If it compiles its shaders while it runs, play it for a while (black is expected), '
-            'then run this build again with --update-shaders (DroidPlay for Windows: Manage › Update shaders from the phone) to bring them in: '
+            'then run this build again with --update-shaders (DroidPlay for Windows and Linux: Manage › Update shaders from the phone) to bring them in: '
             'docs/android.md, "Games that compile their shaders while they run"'); return None, g   # a provisional profile: shaders compiled at run time, captured later
     g = got.get('g', g)
     bi.PROG.stage('shaders for Vulkan', step='translating')
@@ -392,7 +424,8 @@ def ue_decode(dirs, pkg_ver, nsp_dir, patched, work, logs, env, g, serial, sdk, 
 
 def oodle_phone(serial, sdk, g, game, pkg_ver, nsp_dir, patched, work, logs, env):
     """The game's host into the app and its rewritten code to the phone, for the jobs of scripts/android_oodle.py Phone (ue_decode, oodle_decode): the host does not depend on the
-    shaders, which do not exist yet. Only the code goes: a job reads no RomFS"""
+    shaders, which do not exist yet. Only the code goes: a job reads no RomFS, and its env.txt points DM_ROMFS at an empty folder of its own (android_oodle.py), since the host's
+    rom mount refuses a game whose files are all missing and this game folder has neither RomFS nor RomFS.img yet"""
     import android_oodle   # pyright: ignore[reportMissingImports]
     so, loader, ndk = build_host(sdk, g.id, work, logs, env); st = build_selftest(ndk, work, logs, env)
     library_add(g.id, so, loader, st, {'title_id': g.id, 'name': bi.nacp.name(game / 'control.nacp') or g.get('name', ''), 'version': pkg_ver,
@@ -730,13 +763,14 @@ def phone(serial, what):   # the device to this build while it installs or runs 
 def pick_device():
     """The one device adb lists as ready ('device'): an offline Wi-Fi entry left from an earlier connection does not count, and a phone on a cable and on Wi-Fi
     at once is one device, used over the cable"""
-    out = subprocess.run(['adb', 'devices'], capture_output=True, text=True, errors='replace').stdout.splitlines()[1:]
-    rows = [l.split() for l in out if l.strip()]
-    ready = [r[0] for r in rows if len(r) > 1 and r[1] == 'device']
+    rows = phone_id.devices(subprocess.run(['adb', 'devices'], capture_output=True, text=True, errors='replace').stdout)
+    ready = [d['serial'] for d in rows if d['state'] == 'device']
     if len(ready) > 1: ready = [d['serial'] for d in phone_id.one_per_phone([{'serial': r, 'id': phone_key(r)} for r in ready])]
     if len(ready) == 1: return ready[0]
-    listed = ', '.join(f'{r[0]} ({r[1]})' for r in rows) or 'none'
-    raise BuildError(f'{len(ready)} adb devices ready ({listed}): connect one, or pick it with --serial')
+    listed = ', '.join(f'{d["serial"]} ({d["state"]}{": " + d["why"] if d["why"] else ""})' for d in rows) or 'none'
+    blocked = any(d['state'] == phone_id.NO_PERMISSIONS for d in rows)   # Linux: adb sees the phone but may not open it
+    raise BuildError(f'{len(ready)} adb devices ready ({listed}): connect one, or pick it with --serial' +
+                     ('. A phone with "no permissions" needs a udev rule that lets you use it: docs/android.md, "Phones on Linux"' if blocked else ''))
 
 
 class PhoneLost(BuildError):   # adb lost the phone, or the phone stopped answering, as opposed to a command that failed: survives_drops waits for it and goes on
@@ -1153,10 +1187,10 @@ def run_time_note(on, name, gid, prov, want, derived, captured, game_app=False):
     if prov:   # the phone captures each one the first time the game compiles it (front_android.c DM_GLSLC_CAPTURE), and pull_captures brings them in
         if not on: return None
         if game_app: return (f'[RED] {name} compiles some of its shaders while it runs, so a game app built now may draw some things black, and it can\'t take them in later. '
-                             'To pack them, install the game with DroidPlay first, play it to its first scene, run --update-shaders (DroidPlay for Windows: Manage › Update '
+                             'To pack them, install the game with DroidPlay first, play it to its first scene, run --update-shaders (DroidPlay for Windows and Linux: Manage › Update '
                              'shaders from the phone), then build the game app again: docs/android.md, "Games that compile their shaders while they run"')
         return (f'[RED] {name} compiles some of its shaders while it runs, so its first install may draw some things black. Play it to its first scene, then bring them in '
-                'with --update-shaders (DroidPlay for Windows: Manage › Update shaders from the phone): docs/android.md, "Games that compile their shaders while they run"')
+                'with --update-shaders (DroidPlay for Windows and Linux: Manage › Update shaders from the phone): docs/android.md, "Games that compile their shaders while they run"')
     if want:   # a profile derived from it splits its own tables, without whatever no capture in this extraction holds; --update-shaders pulls nothing for it
         return (f'[RED] {name} compiles {len(want)} of its shaders while it runs, and this build, from a profile derived from game profile {gid}, packs without them: '
                 f'whatever they draw may be black. Only a build on a Mac captures them so far: {GLSLC_ISSUE}') if derived and not captured else None
@@ -1263,7 +1297,7 @@ def save_title_ids(root, own_name=True):   # the title IDs a save's files give, 
     return ids
 
 
-def unpack_save(src, dst):   # an archive's files → dst: Python's zipfile (Stored, Deflate, bzip2, LZMA), else tar (bsdtar, on Windows 10 and later and on a Mac: RAR, 7z)
+def unpack_save(src, dst):   # an archive's files → dst: Python's zipfile (Stored, Deflate, bzip2, LZMA), else bsdtar (Windows 10 and later's tar, a Mac's: RAR, 7z)
     import zipfile
     shutil.rmtree(dst, ignore_errors=True); dst.mkdir(parents=True); method = None
     try:
@@ -1272,7 +1306,8 @@ def unpack_save(src, dst):   # an archive's files → dst: Python's zipfile (Sto
     except NotImplementedError as e: method = e   # Deflate64, which Windows' own zip uses for big files: bsdtar (libarchive 3.7) doesn't read it either
     except zipfile.BadZipFile: pass   # not a zip
     shutil.rmtree(dst); dst.mkdir()
-    try: r = subprocess.run(['tar', '-xf', str(src), '-C', str(dst)], capture_output=True, text=True, errors='replace')
+    tar = shutil.which('bsdtar') or 'tar'   # Linux's tar is GNU tar, which reads neither RAR nor 7z: libarchive's bsdtar where the system has it
+    try: r = subprocess.run([tar, '-xf', str(src), '-C', str(dst)], capture_output=True, text=True, errors='replace')
     except OSError as e: raise BuildError(f"{src.name} isn't a zip, and there's no tar here to unpack it ({e}): unpack it with another tool and send the folder") from None
     if r.returncode and method: raise BuildError(f"{src.name} is packed with a compression Python and tar don't read ({method}): unpack it with Windows' Explorer "
                                                  "(Extract all), which wrote it, or another tool, then send the folder")
@@ -1396,7 +1431,7 @@ def tool_version(cmd):
 def check(sdk_arg):
     rows = []
     def row(name, ok, detail, fix=''):
-        if os.name == 'nt' and fix and not name.startswith('Python'): fix = "Install what's missing (the desktop app's Settings), or build_android_from_nsp.py --setup"
+        if not host_setup.unsupported() and fix and not name.startswith('Python'): fix = "Install what's missing (the desktop app's Settings), or build_android_from_nsp.py --setup"
         rows.append({'name': name, 'ok': bool(ok), 'detail': detail, 'fix': '' if ok else fix})
     for m, pip in (('lz4.block', 'lz4'), ('capstone', 'capstone'), ('fontTools', 'fonttools'), ('zbic', 'zbic'), ('PySide6', 'PySide6')):
         row(f'Python module {pip}', bi._importable(m), sys.executable, f'{sys.executable} -m pip install {pip}')
@@ -1407,7 +1442,7 @@ def check(sdk_arg):
     except BuildError as e: dn = None; row('.NET SDK 10', False, str(e), 'install the .NET 10 SDK: https://dotnet.microsoft.com/download')
     else: row('.NET SDK 10', dn and dn.split('.')[0] == '10', dn or 'not found', 'install the .NET 10 SDK: https://dotnet.microsoft.com/download')
     try: sdk = sdk_dir(sdk_arg)
-    except BuildError: sdk = None; row('Android SDK', False, 'not found', 'install Android Studio or the command-line tools, then set ANDROID_HOME (or give --sdk)')
+    except BuildError: sdk = None; row('Android SDK', False, *sdk_not_found())
     else: row('Android SDK', True, str(sdk))
     if sdk:
         for what, d in (('NDK', sdk / 'ndk'), ('CMake', sdk / 'cmake')):
@@ -1426,10 +1461,18 @@ def check(sdk_arg):
     return rows
 
 
-def setup(sdk_arg, accept):   # --setup: what check() finds missing, installed (host_setup.py), then checked again; the Python modules stay pip's (or uv run's)
-    missing = {r['name'] for r in check(sdk_arg) if not r['ok']}
+def setup_target(sdk_arg, missing):
+    """(the SDK --setup installs into, what it installs) for check()'s missing rows: the SDK sdk_dir finds and completes, unless the player can't write to it and didn't
+    name it with --sdk (a distribution's, root's: DISTRO_SDKS). Then the parts it lacks come as a whole SDK of the player's own (default_sdk), which sdk_dir finds
+    ahead of the distribution's from then on, rather than sdkmanager failing on a folder only root can write"""
     try: sdk = sdk_dir(sdk_arg)
-    except BuildError: sdk = Path(sdk_arg or os.path.join(os.environ.get('LOCALAPPDATA') or Path.home(), 'Android', 'Sdk')).expanduser()   # Android Studio's place
+    except BuildError: return (Path(sdk_arg).expanduser() if sdk_arg else default_sdk()), missing
+    if sdk_arg or os.access(sdk, os.W_OK) or not missing & set(sdk_packages(sdk)): return sdk, missing
+    return default_sdk(), missing | {'Android SDK'}
+
+
+def setup(sdk_arg, accept):   # --setup: what check() finds missing, installed (host_setup.py), then checked again; the Python modules stay pip's (or uv run's)
+    sdk, missing = setup_target(sdk_arg, {r['name'] for r in check(sdk_arg) if not r['ok']})
     try: done = host_setup.setup(missing, sdk, data_dir() / 'tools', sdk_packages(sdk), accept, bi.PROG, say)
     except host_setup.SetupError as e: raise BuildError(str(e)) from e
     host_setup.add_tool_paths(data_dir() / 'tools', sdk)
@@ -1594,7 +1637,7 @@ def main(argv):
     ap.add_argument('--romfs-beside', action='store_true', help="with --game-apk: the RomFS beside the APK as <name>.romfs whatever the game's size, "
                                                                  'so the APK stays small; the player puts it anywhere on the device and picks it once')
     ap.add_argument('--out', help='with --game-apk: the folder for the app (default: the NSP folder)')
-    ap.add_argument('--setup', action='store_true', help='install what --check finds missing (Windows: the JDK, the .NET SDK and the Android SDK)')
+    ap.add_argument('--setup', action='store_true', help='install what --check finds missing (Windows and x86_64 Linux: the JDK, the .NET SDK and the Android SDK, into your user folders)')
     ap.add_argument('--accept-android-licenses', action='store_true', help="with --setup: you accept the Android SDK License (https://developer.android.com/studio/terms)")
     a = ap.parse_args(argv)
     # adb is run by name: --sdk's platform-tools go on PATH too. The import-time tool_paths() only knew the SDK found without the options, so on a Mac with no
@@ -1773,7 +1816,7 @@ def main(argv):
         if sv and bi.pg.build_sources(game / 'ExeFS', bi.rfs.source(game), g.words('modules') or ['main'])['ue_decode'][0]:   # Unreal's Oodle-compressed shaders (ue_decode)
             with phone(serial, f'build_android_from_nsp.py: decoding {g.id}\'s Unreal shaders') if serial else contextlib.nullcontext():
                 ue_decode(sdirs, pkg_ver, nsp_dir, patched, work, logs, env, g, serial, sdk, game)
-        if sv and src['oodle_packs'][0] and not mac_oodle:   # the archives' Oodle streams, decoded on the phone before the split
+        if sv and (src['oodle_packs'][0] or src['ue_legacy_oodle'][0]) and not mac_oodle:   # the archives' Oodle streams, decoded on the phone before the split (a legacy pak whose shaders are Zlib or LZ5 reads without it)
             env['DM_OODLE_CACHE'] = str(oodle_decode([bi.rfs.source(sdirs[v]) for v in sv], [sdirs[v] / 'ExeFS/main' for v in sv], dlc_roms, game, pkg_ver, nsp_dir, patched,
                                                      work, logs, env, g, serial, sdk))
         def derive_shader_tables(reason):   # build_ipa_from_nsp.py main's: the registered profile with the split's shader tables, everything else as registered
@@ -1823,7 +1866,7 @@ def main(argv):
     bi.PROG.end(f'{REMOTE}/games/{g.id}')
     if romfs_at: say(f'the RomFS: {romfs_at}' + (f' (copy {bi.rfs.source(game)} there before playing)' if a.no_romfs else ''))
     say(f'done: open DroidPlay on the phone and pick "{label}". Log: {REMOTE}/log.txt (adb logcat -s DroidPlay)')
-    if runtime: say('once it reaches its first scene, bring in the shaders it compiled while it ran with --update-shaders (DroidPlay for Windows: Manage › Update shaders from the phone)')
+    if runtime: say('once it reaches its first scene, bring in the shaders it compiled while it ran with --update-shaders (DroidPlay for Windows and Linux: Manage › Update shaders from the phone)')
 
 
 if __name__ == '__main__':
