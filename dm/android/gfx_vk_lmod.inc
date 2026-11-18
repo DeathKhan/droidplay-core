@@ -64,12 +64,14 @@ static uint32_t *lm_code(const char *path, uint32_t miss, int alpha, int tff, ui
         }
     }
     uint32_t *nph = NULL; size_t nphn = spv_fit_nophys(code, n, path, &nph); if (nphn) { free(code); code = nph; n = nphn; }   // raw memory off: no physical pointer read (spv_nophys.h)
+    uint32_t *gp = NULL; size_t gpn = spv_fit_gmpage(code, n, path, &gp); if (gpn) { free(code); code = gp; n = gpn; }   // raw memory helpers read the page map before they search (spv_gmpage.h)
     uint32_t *gc = NULL; size_t gcn = spv_fit_gmcache(code, n, path, &gc); if (gcn) { free(code); code = gc; n = gcn; }   // raw memory helpers' last entry kept in private words (spv_gmcache.h)
     uint32_t *np = NULL; size_t npn = gm_np_code(code, n, path, first, &np); if (npn) { free(code); code = np; n = npn; }   // raw memory without physical pointers (spv_noptr.h)
     uint32_t *vi = NULL; size_t vn = spv_fit_vsinit(code, n, path, &vi); if (vn) { free(code); code = vi; n = vn; }   // vertex outputs start as (0,0,0,1)
     uint32_t *pf = NULL; size_t pn = spv_pool_fit(code, n, path, &pf); if (pn) { free(code); code = pf; n = pn; }   // the texture pool by ID moved into the pool set
     uint32_t *ha = NULL; size_t hn = spv_fit_harr(code, n, path, &ha); if (hn) { free(code); code = ha; n = hn; }   // arrays past what stage_set writes shortened to it
     uint32_t *fit = NULL; size_t fn = spv_fit(code, n, path, &fit); if (fn) { free(code); code = fit; n = fn; }
+    uint32_t *fs = NULL; size_t fsn = spv_fit_fsum(code, n, path, &fs); if (fsn) { free(code); code = fs; n = fsn; }   // after the subgroup rewrites: float atomic adds summed across the subgroup (spv_fsum.h)
     uint32_t *ly = NULL; size_t ln = spv_fit_layer(code, n, path, &ly); if (ln) { free(code); code = ly; n = ln; }
     uint32_t *lb = NULL; size_t lbn = tff == 1 || tff == 2 || tff == 4 || alpha ? 0 : spv_fit_lbase(code, n, path, &lb); if (lbn) { free(code); code = lb; n = lbn; }   // the layer less or plus a base (not in the capture's wrapper, nor beside the alpha test's push constant)
     uint32_t *ts = NULL; size_t tn = spv_fit_tgs(code, n, path, &ts); if (tn) { free(code); code = ts; n = tn; }   // shared memory past the GPU's limit (spv_tgspill)
