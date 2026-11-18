@@ -61,7 +61,7 @@ class Tools(unittest.TestCase):
         s = fr.tools_step(rows('NDK'), True)
         self.assertIn('Still to install: the Android SDK.', s.text); self.assertNotIn('Java', s.text.split('Still')[1])
 
-    def test_elsewhere_settings_says_how(self):   # --setup installs on Windows alone
+    def test_elsewhere_settings_says_how(self):   # --setup installs on Windows and x86_64 Linux: a Mac, or Linux on arm64, gets Settings' how-to
         s = fr.tools_step(rows('.NET SDK 10'), False)
         self.assertEqual(s.button, 'Open Settings'); self.assertIn('Settings says how', s.text)
 
@@ -89,7 +89,7 @@ class Phone(unittest.TestCase):
         s = fr.phone_step([self.S25], True)
         self.assertTrue(s.done); self.assertIn('Galaxy S25 Edge', s.text); self.assertIn('Android 16', s.text)
 
-    def test_one_waiting_for_allow_says_what_to_tap(self):   # adb lists it with no model until it allows this PC
+    def test_one_waiting_for_allow_says_what_to_tap(self):   # adb lists it with no model until it allows this computer
         s = fr.phone_step([{'serial': 'R5C0', 'state': 'unauthorized', 'model': ''}], True)
         self.assertEqual(s.state, fr.WAITING); self.assertIn('Your phone', s.text); self.assertIn('Allow', s.text)
 
@@ -116,6 +116,10 @@ class Phone(unittest.TestCase):
     def test_the_picked_phone_first(self):
         pad = dict(self.S25, serial='PAD', name='OnePlus Pad 3')
         self.assertIn('OnePlus Pad 3', fr.phone_step([self.S25, pad], True, picked='PAD').text)
+
+    def test_one_linux_wont_open_points_at_the_guide(self):   # no udev rule for this user: it said "connected but not ready (adb says "no")"
+        s = fr.phone_step([{'serial': 'R5C0', 'state': phone_id.NO_PERMISSIONS, 'model': '', 'why': 'user andrew is not in the plugdev group'}], True)
+        self.assertEqual((s.state, s.button), (fr.PROBLEM, 'Set up my phone…')); self.assertIn('no permissions', s.text); self.assertIn('Linux', s.text)
 
 
 class PhoneId(unittest.TestCase):   # one phone, one name: over USB, over Wi-Fi by address or by mDNS name, before and after its port changes (phone_id.py)
@@ -174,6 +178,22 @@ class PhoneId(unittest.TestCase):   # one phone, one name: over USB, over Wi-Fi 
         self.assertEqual(phone_id.find(picker, [None, '', '192.168.1.20:37123', '10.0.0.7:5555'], ids), 0)   # the first key that names a listed phone
         self.assertEqual(phone_id.find(picker, ['192.168.1.20:37123'], ids), -1)
         self.assertEqual(phone_id.find(['R5CY51ZLGKH'], ['192.168.1.20:41011', ids['192.168.1.20:41011']], ids), 0)   # the Phones page's Wi-Fi row picks the cable entry
+
+
+class AdbDevices(unittest.TestCase):   # adb devices -l as adb 37 prints it, read into one dict a phone (phone_id.devices)
+    OUT = ('* daemon not running; starting now at tcp:5037\n* daemon started successfully\nList of devices attached\n'
+           'R5CY51ZLGKH            no permissions (user andrew is not in the plugdev group); see [http://developer.android.com/tools/device.html] usb:3-3 transport_id:2\n'
+           '0123ABC\tunauthorized usb:1-1 transport_id:1\n'
+           '192.168.1.20:37123     device product:pa3q model:SM_S937U1 device:pa3q transport_id:4\n'
+           'ZY22\tno permissions (missing udev rules? user is in the plugdev group); see [http://developer.android.com/tools/device.html]\n\n')
+
+    def test_each_state_whole(self):
+        got = [(d['serial'], d['state'], d['model'], d['why']) for d in phone_id.devices(self.OUT)]
+        self.assertEqual(got, [('R5CY51ZLGKH', 'no permissions', '', 'user andrew is not in the plugdev group'), ('0123ABC', 'unauthorized', '', ''),
+                               ('192.168.1.20:37123', 'device', 'SM S937U1', ''), ('ZY22', 'no permissions', '', 'missing udev rules? user is in the plugdev group')])
+
+    def test_nothing_listed(self):
+        self.assertEqual(phone_id.devices('List of devices attached\n\n'), []); self.assertEqual(phone_id.devices(''), [])
 
 
 class WiFi(unittest.TestCase):   # PairDialog and Connect…: adb's mDNS list, pair and connect replies as adb 35 prints them, in plain words (wifi.py)
@@ -332,21 +352,27 @@ class Explain(unittest.TestCase):   # the messages as the script, nx_extract and
         self.assertEqual((h.title, h.action), ('Not enough space on Galaxy S25 Edge', 'retry'))
         self.assertIn('needs 4.7 GB and Galaxy S25 Edge has 2.1 GB free. Free up 2.9 GB', h.body)
 
+    def test_a_phone_linux_wont_open_says_what_to_install(self):   # the picker's tooltip, and the console build's pick_device
+        for t in ('device no permissions (user andrew is not in the plugdev group)',
+                  '0 adb devices ready (R5C (no permissions: missing udev rules? user is in the plugdev group)): connect one, or pick it with --serial. '
+                  'A phone with "no permissions" needs a udev rule that lets you use it: docs/android.md, "Phones on Linux"'):
+            h = ex.explain(t); self.assertEqual(h.action, 'phone'); self.assertIn('Linux', h.title); self.assertIn('android-udev', h.body)
+
     def test_a_step_that_failed_on_a_nearly_full_phone(self):   # says_when_phone_full's line under a step that printed nothing
         h = ex.explain('adb -s X shell sh /data/local/tmp/nxnative_mkdirs.sh failed (exit status 1): no output\nThe phone has only 310 MB free, which is likely why: free up space')
         self.assertTrue(h.title.startswith('Not enough space on')); self.assertIn('310 MB', h.body)
 
     def test_adb_no_space_is_the_phones_and_oserror_the_pcs(self):
         self.assertIn('your phone', ex.explain('adb -s X push a b failed (exit status 1): adb: error: failed to copy: No space left on device').title)
-        self.assertEqual(ex.explain("[Errno 28] No space left on device: 'D:\\BD\\x'", folder='D:\\Games\\BD').title, 'Not enough space on this PC')
+        self.assertEqual(ex.explain("[Errno 28] No space left on device: 'D:\\BD\\x'", folder='D:\\Games\\BD').title, 'Not enough space on this computer')
 
     def test_pc_full_names_the_drive(self):
         h = ex.explain('less than 12 GB free on the volume of D:\\Games\\BD\\0100000011D90000_build', game='Pokémon Brilliant Diamond')
-        self.assertEqual((h.title, h.action), ('Not enough space on this PC', 'folder')); self.assertIn('about 12 GB free on drive D:', h.body)
+        self.assertEqual((h.title, h.action), ('Not enough space on this computer', 'folder')); self.assertIn('about 12 GB free on drive D:', h.body)
 
     def test_unauthorized_asks_for_allow(self):
         for t in ('0 adb devices ready (R5C0 (unauthorized)): connect one, or pick it with --serial', 'adb: device unauthorized.'):
-            h = ex.explain(t, phone='Galaxy S25 Edge'); self.assertEqual((h.title, h.action), ("Galaxy S25 Edge hasn't allowed this PC yet", 'phone'))
+            h = ex.explain(t, phone='Galaxy S25 Edge'); self.assertEqual((h.title, h.action), ("Galaxy S25 Edge hasn't allowed this computer yet", 'phone'))
 
     def test_a_web_servers_401_isnt_the_phone(self):
         self.assertEqual(ex.explain('<urlopen error HTTP Error 401: Unauthorized>', setup=True).title, 'The download stopped')
@@ -407,6 +433,53 @@ class Explain(unittest.TestCase):   # the messages as the script, nx_extract and
         self.assertEqual(ex.explain('boom', stage='extract v393216').title, 'The build stopped at "Reading the game files"')
         self.assertEqual(ex.explain('boom', setup=True, stage='Android SDK packages').title, 'Installing the tools stopped at "Installing the Android SDK"')
 
+    # what --info prints when it can't read a game folder: its notes on stderr, the error on stdout (scan_nsps); the Library showed the generic "The build stopped"
+    # with "Can't read it" and no reason for a Skyward Sword HD folder on Windows (2026-11-13)
+    D = 'D:\\Games\\SSHD'
+
+    def test_script_error_puts_the_error_last(self):
+        err = '[12:00:01] skipping game.zip: neither an NSP (PFS0) nor an XCI (HEAD at 0x100)\n[RED] skipping update.nsp: its content meta could not be read: bad header'
+        t = ex.script_error('[RED] no game package with a readable content meta in D:\\Games\\SSHD\n', err)
+        self.assertTrue(t.splitlines()[-1].startswith('[RED] no game package'))   # the Library shows the last line: the reason, not a note
+        self.assertIn('skipping game.zip', t); self.assertIn('skipping update.nsp', t)
+        self.assertEqual(ex.script_error('', 'Traceback (most recent call last):\n  File "x"\nValueError: boom'), 'Traceback (most recent call last):\n  File "x"\nValueError: boom')
+        self.assertEqual(ex.script_error('', ''), 'no output')
+
+    def test_folder_reads_say_what_to_change(self):
+        h = ex.explain('[RED] more than one game in the folder: 01002DA013484000, 0100000000010000; keep one game per folder, or name the one to pack with '
+                       '--title-id / TITLE_ID', folder=self.D, read=True)
+        self.assertEqual((h.title, h.action, h.bug), ('More than one game in this folder', 'folder', False)); self.assertIn('0100000000010000', h.body)
+        h = ex.explain('[RED] no base game NSP found in D:\\Games\\SSHD (title ID 01002DA013484000)', folder=self.D, read=True)
+        self.assertEqual((h.title, h.action), ('The game itself is missing from this folder', 'folder'))
+        h = ex.explain('no NSP for update 1.0.1 (the game profile needs these versions: 1.0.0, 1.0.1)', game='The Legend of Zelda: Skyward Sword HD', folder=self.D)
+        self.assertEqual(h.title, 'An update the build needs is missing'); self.assertIn('update 1.0.1', h.body)
+
+    def test_a_folder_with_nothing_readable_names_the_files_it_passed_over(self):
+        t = ex.script_error('[RED] no game package with a readable content meta in D:\\Games\\SSHD', '[12:00:01] skipping SSHD.zip: neither an NSP (PFS0) nor an '
+                            'XCI (HEAD at 0x100)\n[RED] skipping SSHD.nsp: its content meta could not be read: NCA header')
+        h = ex.explain(t, folder=self.D, read=True)
+        self.assertEqual((h.title, h.action, h.bug), ('No game DroidPlay can open in this folder', 'folder', False))
+        self.assertIn('<b>SSHD.zip</b>', h.body); self.assertIn('<b>SSHD.nsp</b>', h.body); self.assertIn('prod.keys', h.body)
+        self.assertNotIn('passed over', ex.explain('[RED] no game package with a readable content meta in D:\\x', read=True).body)
+
+    def test_the_game_reader_without_nuget_org(self):   # dotnet's restore for nx_extract, as a Windows PC printed it, then the script's own line
+        t = ex.script_error('[RED] dotnet exit code 1 (full output: C:\\Temp\\title_probe_x\\logs\\nx_extract_build.log)',
+                            "C:\\DroidPlay\\core\\dm\\tools\\nx_extract\\nx_extract.csproj : error NU1100: Unable to resolve 'LibHac (>= 0.19.0)' for 'net10.0'.\n"
+                            '    0 Warning(s)\n    1 Error(s)\n\nTime Elapsed 00:00:00.76')
+        h = ex.explain(t, read=True)
+        self.assertEqual(h.title, "DroidPlay couldn't download its game reader"); self.assertIn('dotnet nuget enable source nuget.org', h.body); self.assertFalse(h.bug)
+
+    def test_a_game_that_draws_with_opengl_or_vulkan_is_not_a_bug(self):   # build_android_from_nsp.py unsupported_graphics' words, as droidplay-core#476's log had them
+        h = ex.explain('[RED] FM24 Touch draws with OpenGL, not NVN (main imports EGL and names glShaderSource: it renders with OpenGL). DroidPlay Core on Android runs NVN '
+                       'games only so far, so this game cannot be built for Android yet', stage='extract v458752')
+        self.assertEqual((h.title, h.bug, h.action), ("This game isn't supported on Android yet", False, '')); self.assertIn('FM24 Touch draws with OpenGL', h.body)
+        h = ex.explain('[RED] Hades draws with Vulkan, not NVN (main imports 99 Vulkan functions and not nvnBootstrapLoader). …', game='Hades')
+        self.assertIn('Hades draws with Vulkan', h.body)
+
+    def test_an_unknown_read_failure_says_read_not_build(self):
+        h = ex.explain('[RED] something new', folder=self.D, read=True)
+        self.assertTrue(h.bug); self.assertEqual(h.title, "DroidPlay couldn't read this game"); self.assertNotIn('stopped', h.title)
+
     # build_android_from_nsp.py run_time_stop's words, on Windows and on a Mac: a registered profile's tables name shaders the game compiles while it runs (droidplay-core#441)
     STOP = ("[RED] Fire Emblem: Three Houses compiles 9 of its shaders while it runs, with its own shader compiler (GLSLC), and game profile 010055D009F78000's shader tables "
             "need them. ")
@@ -433,6 +506,12 @@ class Explain(unittest.TestCase):   # the messages as the script, nx_extract and
 
 
 class Report(unittest.TestCase):   # Copy report: one Discord message, home folder as ~, never key material
+    def test_linux_names_its_distribution(self):   # "Linux 7.2.9" said nothing of the fonts, udev rules or libraries a distribution has
+        name = ex.system_name({'NAME': 'Bazzite', 'VERSION_ID': '44', 'PRETTY_NAME': 'Bazzite'})   # Bazzite's PRETTY_NAME carries no version
+        self.assertTrue(name.startswith('Bazzite 44 (Linux '), name)
+        self.assertTrue(ex.system_name({'NAME': 'Ubuntu', 'VERSION_ID': '24.04', 'PRETTY_NAME': 'Ubuntu 24.04.1 LTS'}).startswith('Ubuntu 24.04.1 LTS (Linux '))
+        self.assertTrue(ex.system_name({'NAME': 'Arch Linux', 'PRETTY_NAME': 'Arch Linux'}).startswith('Arch Linux (Linux '))
+
     INFO = {'version': '0.5.0', 'title': 'Build Pokémon Brilliant Diamond', 'stage': 'rewrite', 'k': 3, 'n': 8, 'game': 'Pokémon Brilliant Diamond',
             'game_id': '0100000011D90000', 'game_version': '393216', 'phone': 'Galaxy S25 Edge', 'android': '16', 'gpu': 'Adreno (TM) 830'}
 
@@ -473,6 +552,15 @@ class Guide(unittest.TestCase):   # PhoneGuide: the brand picked from what adb s
     def test_every_brand_ends_with_plugging_in(self):
         self.assertEqual({k for k, *_ in pg.BRANDS}, {'samsung', 'pixel', 'xiaomi', 'oneplus', 'handheld', 'other'})
         self.assertTrue(all(steps[-1] == pg.PLUG for _, _, steps, _ in pg.BRANDS))
+
+    def test_driver_advice_on_windows_and_udev_on_linux(self):   # Device Manager and Google's driver mean nothing on Linux; udev rules mean nothing on Windows
+        win, lin, mac = (dict(pg.trouble(s)) for s in ('win32', 'linux', 'darwin'))
+        self.assertTrue(any('Device Manager' in t for t in win)); self.assertFalse(any('udev' in x for x in win.values()))
+        self.assertFalse(any('Device Manager' in t for t in lin)); self.assertTrue(any(pg.UDEV_RULE.replace('"', '&quot;') in x for x in lin.values()))
+        self.assertFalse(any('Device Manager' in t for t in mac) or any('udev' in x for x in mac.values()))
+        self.assertIn('Google', pg.brand_note('pixel', 'win32')); self.assertNotIn('Google', pg.brand_note('pixel', 'linux'))
+        self.assertIn('If it doesn', pg.brand_note('pixel', 'linux')); self.assertEqual(pg.brand_note('pixel', 'darwin'), '')
+        self.assertIn('tap <b>Install</b>', pg.brand_note('xiaomi', 'linux'))   # a maker's own catch stays everywhere
 
     def test_battery_and_space_from_one_shell_call(self):   # a OnePlus Pad 3 on a Mac's USB port, as it printed them
         text = ('  AC powered: false\n  USB powered: true\n  Wireless powered: false\n  Dock powered: false\n  status: 4\n  level: 80\n'

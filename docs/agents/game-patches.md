@@ -76,7 +76,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](#nierautomata-the-end-of-yorha-edition-010056b015fe8000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](#nierautomata-the-end-of-yorha-edition-0100b8e016f76000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [Paper Mario: The Thousand-Year Door](#paper-mario-the-thousand-year-door) | 1 | 0 | 1 | 0 | 0 | `build` → `game` |
-| [Pokémon Legends: Arceus](#pokémon-legends-arceus) | 0 | 0 | 3 | 1 | 0 | `game`, `build` → `game` |
+| [Pokémon Legends: Arceus](#pokémon-legends-arceus) | 0 | 0 | 3 | 2 | 0 | `game` ×2, `build` → `game` |
 | [Pokémon: Let's Go, Pikachu!](#pokémon-lets-go-pikachu) | 0 | 0 | 2 | 0 | 0 | `build` → `game` |
 | [Super Mario 3D All-Stars: Super Mario Sunshine](#super-mario-3d-all-stars-super-mario-sunshine) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Super Mario Bros. Wonder](#super-mario-bros-wonder) | 0 | 0 | 1 | 0 | 0 | `build` → `game` |
@@ -311,8 +311,8 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **`game`**, rendering, at goal, checked: v0 and 1.0.141667 mains: one function with each fingerprint, the constant unique in main, the site and its free registers read by disassembly (2026-11-10): render size: 1280x720 times the host's render scale. The game's own size constant in its init, found by the function's fingerprint on any build that keeps the function; the game asks no service for a size, and no other game in the repository runs Supergiant's NVN engine (Hades is Vulkan)
 
-- **function-matched frame step** (`main` of builds without FRAME_STEP): render size from the host's render scale: a function of 0x350 bytes, `+0x190` in it
-- **function-matched frame step** (`main` of builds without FRAME_STEP): render size from the host's render scale: a function of 0x350 bytes, `+0x190` in it
+- **function-matched frame step** (`main` of builds without FRAME_STEP): render size from the host's render scale: a function of 0x350 bytes, `+0x190` in it; render scale stub (the launcher offers DM_RENDER_SCALE)
+- **function-matched frame step** (`main` of builds without FRAME_STEP): render size from the host's render scale: a function of 0x350 bytes, `+0x190` in it; render scale stub (the launcher offers DM_RENDER_SCALE)
 
 ### Hyrule Warriors: Age of Calamity
 
@@ -432,6 +432,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 [Pokémon Legends: Arceus](../../dm/games/01001F5010DFA000/README.md), `01001F5010DFA000`, [patches.py](../../dm/games/01001F5010DFA000/patches.py).
 
 - **`game`**, runtime, at goal, checked: function-matched on 1.1.1, the only build on hand: exactly one match, a boot to the field setup, and the patched function run on the module's own bytes in a small interpreter for both null paths. Issue #712's reporters ran the earlier cuts for about 7 hours with no crash; the path itself has not been reached with these cuts: capture demo: the empty result when the weak reference at +0x88 is unset or dead. The game's own function dereferences its own weak reference; no host service is on the path, so no host or engine rule can hold it. Whether another Game Freak game shares the function is unchecked
+- **`game`**, runtime, at goal, checked: function-matched on 1.1.1, the only build on hand: each of the three functions matches once and the rewriter writes the seven cuts. On a OnePlus Pad 3 at the 60 fps default, idle at the title (the note's "Title screen freeze"): 0 of 20 starts froze, against 1 of 20 without the cuts; with a ~1 ms spin inside the leader's second count, 0 of 6 against 4 of 4: fork/join count: each update one atomic add. A data race in the game's own render job system (a count updated outside its mutex on one side); no host service is on the path, and no host rule can make a plain load and store atomic. Whether Game Freak's other games share the functions is unchecked
 - **`build` → `game`**, frame rate, gap, judgement: present interval 2 → 1 with a target fps, and the frame period from the host's frame step. The game's own display settings word and frame-time object; MATCH_FRAME_STEP could carry the three stubs (the start-up function, the period getter and the scene update), not tried: 1.1.1 is the only build on hand
 
 - **1.1.1 `main`** `aee8f150…` ([patches.py:56](../../dm/games/01001F5010DFA000/patches.py#L56))
@@ -439,6 +440,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - frame step `+0x278303c`: frame step: the frame period read is the host's vsyncs × 16,666,667 ns (state page target fps; 0 = the stored period)
   - frame step `+0x279a6f4`: frame step: counts the vsyncs the scene update steps
 - **function-matched** (`main` of builds without CUTS): capture demo: the empty result when the weak reference at +0x88 is unset or dead: 1 function, 5 cuts
+- **function-matched** (`main` of builds without CUTS): fork/join count: each update one atomic add: 3 functions, 7 cuts
 
 ### Pokémon: Let's Go, Pikachu!
 
@@ -598,9 +600,9 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), `0400486024DEC000`, [patches.py](../../dm/games/0400486024DEC000/patches.py).
 
 - **`game`**, frame rate, at goal, checked: v131072 main: one function with this fingerprint, the site and its free registers read by disassembly (2026-11-08): frame ratio from the host's step. The game's own frame-ratio division, found by its function's fingerprint on any build that keeps the function
-- **`game`**, rendering, at goal, checked: v131072 main: one function with each fingerprint (the level function a leaf, x2..x11 / x16 / x17 / s0..s2 free), its callers, the update and the controller fields read by disassembly, the fields read in play (2026-11-08); the climb run natively against a model of the update and in play to full size (2026-11-09): dynamic resolution: full size, or a climb on the load measured at each level. The game's own dynamic-resolution level function and update, found by their functions' fingerprints on any build that keeps both; switchable (DM_DYNAMIC_RESOLUTION)
+- **`game`**, rendering, at goal, checked: v131072 main: one function with each fingerprint (the level function a leaf, x2..x11 / x16 / x17 / s0..s2 free), its callers, the update and the controller fields read by disassembly, the fields read in play (2026-11-08); the climb run natively against a model of the update and in play to full size (2026-11-09); the level list's layout read from the original's loop and the render-scale pick run natively over the slider's values (2026-11-12): dynamic resolution: full size, the level nearest a render scale, or a climb on the load measured at each level. The game's own dynamic-resolution level function and update, found by their functions' fingerprints on any build that keeps both; switchable (DM_DYNAMIC_RESOLUTION, DM_RENDER_SCALE)
 
-- **function-matched frame step** (`main` of builds without FRAME_STEP): frame ratio from the host's step: a function of 0x9b4 bytes, `+0xe4` in it; dynamic resolution, a function of 0x294 bytes, `+0x0` in it; dynamic resolution update, a function of 0xb24 bytes,  in it; launcher capabilities: DYNAMIC_RESOLUTION
+- **function-matched frame step** (`main` of builds without FRAME_STEP): frame ratio from the host's step: a function of 0x9b4 bytes, `+0xe4` in it; dynamic resolution, a function of 0x294 bytes, `+0x0` in it; dynamic resolution update, a function of 0xb24 bytes,  in it; render scale stub (the launcher offers DM_RENDER_SCALE); launcher capabilities: DYNAMIC_RESOLUTION
 
 ### The Legend of Zelda: Tears of the Kingdom
 
@@ -608,7 +610,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **`game`**, frame rate, at goal, checked: 1.4.3 main: one function of each fingerprint; the rule rewrites it byte-identical to its former build entry (2026-11-09): 60 fps frame step and render scale. The game's own timing object, found by its six functions' fingerprints on any build that keeps them; no engine sibling shares the code (BotW, SMO, MK8D, ACNH, Splatoon 2 / 3, Kirby, Mario Party, Ocarina, Smash, Metroid Dread, Origami King: no exact match, 2026-11-09)
 
-- **function-matched frame step** (`main` of builds without FRAME_STEP): 60 fps frame step and render scale: a function of 0x298 bytes, `+0x18` in it; game step reader 1, a function of 0x358 bytes, `+0x34`, `+0x4c` in it; game step reader 2, a function of 0x81c bytes, `+0x4c`, `+0x58` in it; menu fade, a function of 0x3bc bytes, `+0x130` in it; swapchain argument, a function of 0x8bc bytes, `+0x1a4` in it; view render size, a function of 0x1f8 bytes, `+0x9c`, `+0x15c` in it
+- **function-matched frame step** (`main` of builds without FRAME_STEP): 60 fps frame step and render scale: a function of 0x298 bytes, `+0x18` in it; game step reader 1, a function of 0x358 bytes, `+0x34`, `+0x4c` in it; game step reader 2, a function of 0x81c bytes, `+0x4c`, `+0x58` in it; menu fade, a function of 0x3bc bytes, `+0x130` in it; swapchain argument, a function of 0x8bc bytes, `+0x1a4` in it; view render size, a function of 0x1f8 bytes, `+0x9c`, `+0x15c` in it; render scale stub (the launcher offers DM_RENDER_SCALE)
 
 ### Xenoblade Chronicles 3
 

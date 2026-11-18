@@ -438,7 +438,7 @@ class RunTimeShaders(unittest.TestCase):
     def test_what_each_kind_of_profile_is_told(self):
         prov = ba.run_time_note(True, 'Crash', self.PROV, True, None, '', 0)
         self.assertIn('[RED] Crash compiles some of its shaders while it runs, so its first install may draw some things black. Play it to its first scene', prov)
-        self.assertIn('--update-shaders (DroidPlay for Windows: Manage › Update shaders from the phone)', prov)
+        self.assertIn('--update-shaders (DroidPlay for Windows and Linux: Manage › Update shaders from the phone)', prov)
         app = ba.run_time_note(True, 'Crash', self.PROV, True, None, '', 0, game_app=True)
         self.assertIn('a game app built now may draw some things black', app); self.assertIn('then build the game app again', app)
         why = f'v393216 is not a version game profile {self.TID} registers'
@@ -485,6 +485,57 @@ class RunTimeShaders(unittest.TestCase):
         (f,) = (self.tmp / 'data/builds').glob('*.jsonl')
         evs = [json.loads(line) for line in f.read_text(encoding='utf-8').splitlines()]
         self.assertIn({'ev': 'run_time_shaders', 'title_id': self.PROV, 'name': 'Crash', 'game_app': False}, [{k: v for k, v in e.items() if k != 't'} for e in evs])
+
+
+
+class SplitProfile(Profile):   # the parts of game.py's profile that split_shaders reads
+    def modules_in(self, d): return []
+    def get(self, name, default=''): return default
+
+
+class SplitOodleCache(unittest.TestCase):
+    """split_shaders (build_ipa_from_nsp.py) fingerprints DM_OODLE_CACHE with its inputs: a split made before the cache was complete (a --no-push build, then one with the phone) runs
+    again by itself, and a split the unchanged cache belongs to is reused as it is. The split here is a mocked run: it writes the tables and package the stage expects, and the log
+    the stage reads its shader count from"""
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.work = self.tmp / 'work'; self.logs = self.work / 'logs'; self.logs.mkdir(parents=True)
+        self.cache = self.tmp / 'oodle_cache'; self.cache.mkdir()
+        self.roms = self.tmp / 'v0'; (self.roms / 'shaders').mkdir(parents=True)
+        self.main = self.tmp / 'v0main'; self.main.write_bytes(b'main')
+        self.provisional = SplitProfile(self.tmp / 'profile' / GID)
+        self.provisional.dir.mkdir(parents=True)   # the split copies its tables beside a provisional profile's
+        self.split_ran = 0
+        def run(cmd, log, env=None, on_line=None):   # shader_split.py: its tables and package, and the count of shaders the stage reads from its log
+            self.split_ran += 1
+            for c in map(Path, cmd):
+                if c.name.endswith('.tsv'): c.parent.mkdir(parents=True, exist_ok=True); c.write_text('name\tvalue\n')
+                elif c.name == 'pkg': c.mkdir(parents=True, exist_ok=True); (c / 'a.shader').write_bytes(b'x')
+            Path(log).write_text('shaders: 2 (3 files)\n')
+        for p in (mock.patch.object(ba.bi, 'run', side_effect=run), mock.patch.object(ba.bi, 'PROG', mock.MagicMock()),
+                  mock.patch.object(ba.bi, 'say'), mock.patch.object(ba, 'say')):
+            p.start(); self.addCleanup(p.stop)
+
+    def split(self):
+        return ba.bi.split_shaders(sys.executable, REPO, [self.roms], [self.main], self.work / 'shader' / 'pkg',
+                                   {'DM_OODLE_CACHE': str(self.cache)}, self.logs, self.provisional, provisional=True)
+
+    def test_a_split_the_unchanged_cache_belongs_to_is_reused(self):
+        self.split(); self.assertEqual(self.split_ran, 1)
+        self.split()
+        self.assertEqual(self.split_ran, 1)   # inputs unchanged: the split ran once
+
+    def test_a_cache_that_filled_in_after_the_split_runs_it_again(self):
+        self.split(); self.assertEqual(self.split_ran, 1)
+        (self.cache / '1.pack').write_bytes(b'decoded streams'); (self.cache / '1.idx').write_text('abc\t10\t0\n')
+        self.split()
+        self.assertEqual(self.split_ran, 2)   # the cache's contents are split inputs: the split ran again
+
+    def test_a_split_runs_without_a_cache_and_reuses_without_one(self):
+        def nocache():
+            return ba.bi.split_shaders(sys.executable, REPO, [self.roms], [self.main], self.work / 'shader' / 'pkg', {}, self.logs, self.provisional, provisional=True)
+        nocache(); self.assertEqual(self.split_ran, 1)
+        nocache(); self.assertEqual(self.split_ran, 1)   # the same, with no DM_OODLE_CACHE in the environment
 
 
 if __name__ == '__main__':

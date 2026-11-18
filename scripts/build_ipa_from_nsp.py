@@ -719,6 +719,21 @@ def same_build(nsp_dir, app, fam, keys, repo, env):
     PROG.end('no profile registers its main build'); return None
 
 
+def code_probe(nsp_dir, app, fam, keys, repo, env):
+    """The newest version's control data and code modules alone, nothing of the RomFS: nx_extract --code-only, or a NUP's or a dump's ExeFS as it is. For a check before the
+    survey, whose RomFS manifest reads every RomFS file (Football Manager 2024 Touch: 7 minutes on a Windows PC before the Android build stopped for its OpenGL).
+    → the folder holding ExeFS/ (and control.nacp from an NSP), in <title ID>_survey/code.partial"""
+    work = nsp_dir / f'{app:016X}_survey'; logs = work / 'logs'; tmp = work / 'code.partial'; rmtree(tmp)
+    files = fam.get('nup') or fam.get('dump')
+    ups = sorted(fam['updates'], key=lambda u: u[0] or 0); upd = ups[-1][1] if ups else None
+    PROG.plan(1); PROG.stage('survey: graphics check', step='reading the code modules' if files else 'build nx_extract')
+    if files: code_modules(fam, upd or fam['base'], tmp / 'ExeFS')
+    else:
+        nx = build_nx_extract(repo, work, logs, env); PROG.set(step='reading the code modules')
+        run([nx, keys, fam['base'], upd or '-', tmp, '--code-only'] + extract_flags(app), logs / 'code_only.log', ok=(4,))   # 4: a sparse base game alone
+    PROG.end(); return tmp
+
+
 def code_modules(fam, k, dst):   # the ExeFS of a NUP package or a dump's version folder into dst; nothing for a version folder with no code of its own
     if fam.get('dump'):
         if pack_dump.has_code(k): pack_dump.exefs(k / 'exefs', dst)
@@ -2171,6 +2186,8 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
             capture = Path(env.get(setting) or r.parent / folder)
             inputs += [('stat', capture) if provisional else ('files', sorted(capture.glob(pattern)))]   # its files, not where it is: the same build reached through a moved folder or a link keeps its split
     if env.get('DM_NRO_DIR'): inputs += [('files', sorted(Path(env['DM_NRO_DIR']).glob('*.nro')))]   # NROs captured from a boot (capture_nro)
+    if env.get('DM_OODLE_CACHE'):   # the decoded Oodle streams a reader reads in place of the Mac host's: a cache that filled in after the split (a --no-push build, then one with the phone) must split again, or every package the first split could not read stays unread (Stray: 32 shaders, 44,409 files)
+        inputs += [('tree', Path(env['DM_OODLE_CACHE']))]
     inputs += [item for r in dlc_roms for item in (('dlc', Path(r).name), ('stat', r))]   # DLC has no registered module build to pin its contents: include its index and re-extraction times, even when file sizes stay the same
     if oodle:   # a host or rewriter fix can change what the game's decoder produces
         PROG.set(step='building the Mac host for the game\'s Oodle decoder'); env = dict(env, **oodle())

@@ -8,7 +8,8 @@
 #                shows here too, from the journal the script writes (<data>/builds/*.jsonl)
 #   Phones       adb devices over USB and Wi-Fi (pair, connect, discover), the app and the games on each, saves backed up to the computer
 #   Performance  the game's log (adb logcat) with the frame time, GPU and CPU figures it prints, a frame's GPU passes
-#   Settings     your keys, and what the build needs on this computer with how to get what is missing; on Windows, Install what's missing (--setup)
+#   Settings     your keys, and what the build needs on this computer with how to get what is missing; on Windows and Linux, Install what's missing (--setup);
+#                on Linux, from the AppImage, Add to the applications menu (dm/android/desktop/menu_entry.py)
 # /// script
 # # Below 3.15: lz4 has no wheels for it yet, and a player's computer has no compiler to build one. The packing script runs in this same Python.
 # # PySide6-Essentials has every Qt module the app uses (Core, Gui, Widgets, Svg) without PySide6's add-ons and web engine, a few hundred MB less to download.
@@ -20,7 +21,7 @@ import json, os, re, shutil, subprocess, sys, time, uuid
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QByteArray, QObject, QProcess, QProcessEnvironment, QRectF, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, Signal  # pyright: ignore[reportMissingImports]   (PySide6 is the desktop app's alone; the lint job does not install it)
+    from PySide6.QtCore import QByteArray, QObject, QProcess, QProcessEnvironment, QRectF, QRunnable, QSettings, QSize, QStandardPaths, Qt, QThreadPool, QTimer, QUrl, Signal  # pyright: ignore[reportMissingImports]   (PySide6 is the desktop app's alone; the lint job does not install it)
     from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap  # pyright: ignore[reportMissingImports]
     from PySide6.QtSvg import QSvgRenderer  # pyright: ignore[reportMissingImports]
     from PySide6.QtWidgets import (  # pyright: ignore[reportMissingImports]
@@ -28,8 +29,8 @@ try:
                                    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                    QProgressBar, QPushButton, QRadioButton, QScrollArea, QSplitter, QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
                                    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
-except ImportError:
-    sys.exit(f'DroidPlay (nxnative_android.py) needs PySide6: uv run {__file__}, or {sys.executable} -m pip install PySide6')
+except ImportError as e:   # on Linux also a system library Qt needs and the system lacks (libEGL.so.1...): the error names it
+    sys.exit(f'DroidPlay (nxnative_android.py) needs PySide6 ({e}): uv run {__file__}, or {sys.executable} -m pip install PySide6')
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / 'scripts' / 'build_android_from_nsp.py'
@@ -44,12 +45,18 @@ import game_data as gd   # noqa: E402  # pyright: ignore[reportMissingImports]  
 import wifi   # noqa: E402  # pyright: ignore[reportMissingImports]  (what adb pair, connect and mdns say over Wi-Fi, in plain words)
 import explain as ex   # noqa: E402  # pyright: ignore[reportMissingImports]  (plain words for what went wrong, and the report for #help)
 import phone_guide as pg   # noqa: E402  # pyright: ignore[reportMissingImports]  (how to connect a phone, by brand; its battery and free space)
-import update as upd   # noqa: E402  # pyright: ignore[reportMissingImports]  (the newest release, and its Setup downloaded and checked)
+import update as upd   # noqa: E402  # pyright: ignore[reportMissingImports]  (the newest release, and its Setup or AppImage downloaded and checked)
+import procs   # noqa: E402  # pyright: ignore[reportMissingImports]  (Stop: a build and every tool it started)
+import menu_entry   # noqa: E402  # pyright: ignore[reportMissingImports]  (Linux: the AppImage's entry in the applications menu)
 
 LANGUAGES = [('en-US', 'American English'), ('en-GB', 'British English'), ('ja', 'Japanese'), ('fr', 'French'), ('de', 'German'), ('es-419', 'Latin American Spanish'),
              ('es', 'Spanish'), ('it', 'Italian'), ('nl', 'Dutch'), ('fr-CA', 'Canadian French'), ('pt', 'Portuguese'), ('ru', 'Russian'), ('ko', 'Korean'),
              ('zh-Hant', 'Traditional Chinese'), ('zh-Hans', 'Simplified Chinese'), ('pt-BR', 'Brazilian Portuguese')]
 NOWINDOW = 0x08000000 if os.name == 'nt' else 0   # CREATE_NO_WINDOW: no console flashing up for each adb call
+CAN_INSTALL = not ba.host_setup.unsupported()   # Install what's missing (--setup): Windows and x86_64 Linux; a Mac's DroidPlay Setup brings the tools itself
+# Off Windows, a build starts in a session of its own (setsid), so it leads a process group with the tools it starts and Stop ends them all (procs.py). Qt 6.7
+# and later; an older PySide6 from pip leaves it out, and Stop then ends the script alone, as before
+NEW_SESSION = getattr(getattr(QProcess, 'UnixProcessFlag', None), 'CreateNewSession', None) if os.name != 'nt' else None
 # The Python that builds and the script's --check and --info run on. On Windows the Start menu shortcut opens this app on pythonw.exe, which has no console, so
 # each console tool a build runs on it (java, dotnet, cmake, ninja, adb…) would open a window of its own, dozens in a build. The python.exe beside it, started from
 # this windowless app (QProcess, NOWINDOW), gets one hidden console that every tool shares, and their output still reaches the Builds page.
@@ -263,12 +270,14 @@ class Game:
         ex = info.get('extracted') or {}; self.newest = info.get('newest')
         e = ex.get(self.newest) or (next(iter(ex.values())) if ex else {})
         self.id = info.get('title_id'); self.name = e.get('name') or info.get('name') or self.id or Path(folder).name; self.error = info.get('error')
+        self.detail = info.get('detail') or self.error   # what the read said in full: the files it passed over, and why, before the error
         self.captures = e.get('captures') or 0
         self.icon = e.get('icon'); self.display = e.get('display'); self.languages = e.get('languages') or [c for c, _ in LANGUAGES]
         self.profile = info.get('profile'); self.provisional = info.get('provisional'); self.host = info.get('host'); self.tested = info.get('android_tested')
         self.run_time = info.get('run_time_shaders') or {}   # {count, ready}: shaders it compiles while it runs that its tables name, which only a Mac build captures (droidplay-core#441)
         self.pm = QPixmap(self.icon) if self.icon else QPixmap()
 
+    def help(self): return ex.explain(self.detail or '', folder=self.folder, read=True)   # the folder's read failed: what to do about it (explain.py)
     def new_shaders(self, on_phone):   # run-time shaders the phone saved beyond the ones on this computer (a provisional profile's only: build_android_from_nsp.py pull_captures)
         return max(0, (on_phone.get(self.id) or {}).get('captures', 0) - self.captures) if self.provisional else 0
     def status(self, on_phone, phone):   # (text, colour, state): state picks what Play does
@@ -276,7 +285,7 @@ class Game:
         # not the game's fault: the tools that read it aren't installed yet. It showed as unreadable, with a disabled "Not supported", to every new player
         if self.info.get('needs_tools'): return "Install DroidPlay's tools to read it: Get started, step 2", BUILD, 'tools'
         if self.error:   # in plain words (explain.py): keys older than the game get Pick your prod.keys, not a disabled "Can't read it"
-            h = ex.explain(self.error); return h.title, ERR, {'keys': 'keys', 'tools': 'tools'}.get(h.action, 'none')
+            h = self.help(); return h.title, ERR, {'keys': 'keys', 'tools': 'tools', 'folder': 'folder'}.get(h.action, 'none')
         if not self.profile: return 'Not supported yet: experimental build only', ERR, 'survey'
         if self.run_time and not self.run_time.get('ready') and not self.host: return ex.mac_only(self.run_time.get('count', 0), sys.platform == 'darwin'), ERR, 'mac'   # its build would stop at once
         x = 'Experimental (provisional profile, may not boot) · ' if self.provisional else ''   # an experimental build's profile, guessed from the survey
@@ -307,7 +316,8 @@ class Hero(QWidget):   # the picked game, large: its art's wash behind, the art 
         self.pm = g.pm if g else QPixmap(); self.cache = None
         self.status.setText(f'<span style="color:{color}">●&nbsp;&nbsp;{esc(status.upper())}</span>' if g else '')
         self.title.setText(esc(g.name) if g else 'Add your first game')
-        if g and g.error and not g.info.get('needs_keys') and not g.info.get('needs_tools'): self.meta.setText(ex.explain(g.error).body)   # what to do about it
+        if g and g.error and not g.info.get('needs_keys') and not g.info.get('needs_tools'):   # what to do about it, and what the read said, to search or quote
+            self.meta.setText(f'{g.help().body}<br><span style="color:{TEXT3}">What it said: {esc(g.error)}</span>')
         elif g:
             bits = [g.id, f'v{g.display}' if g.display else None, (g.info.get('table') or {}).get('engine'), 'played on Android' if g.tested else 'not played on Android yet', hint]
             self.meta.setText('   ·   '.join(b for b in bits if b))
@@ -425,7 +435,7 @@ class LibraryPage(QWidget):
                     msg = str(e).strip().splitlines()[-1].removeprefix('[RED] ') if str(e).strip() else 'could not be read'
                     # no keys yet, or no tools yet: before Install what's missing has brought the .NET SDK, nothing can read the packages (build_ipa_from_nsp.py's
                     # "needs dotnet"), and every game read as a folder that could not be read
-                    out[f] = {'error': msg, 'needs_keys': not keys and 'prod.keys' in msg, 'needs_tools': 'dotnet' in msg,
+                    out[f] = {'error': msg, 'detail': str(e).strip(), 'needs_keys': not keys and 'prod.keys' in msg, 'needs_tools': 'dotnet' in msg,
                               'name': names.get(str(Path(f).resolve())) or Path(f).name}
             return out
         def got(r):
@@ -470,7 +480,7 @@ class LibraryPage(QWidget):
         text, color, state = g.status(self.win.phone_games, self.win.phone_name())
         self.hero.show_game(g, text, color, ex.RUN_TIME_META if self.run_time_later(g) else ''); self.hero.opts.setEnabled(bool(g.profile))
         self.hero.play.setText({'play': '  Play', 'install': '  Install on phone', 'build': '  Build and install', 'survey': '  Experimental build', 'keys': '  Pick your prod.keys',
-                                'tools': '  Install the tools', 'none': "  Can't read it", 'mac': '  Build it for the Mac first' if sys.platform == 'darwin' else '  Builds on a Mac only'}[state])
+                                'tools': '  Install the tools', 'folder': '  Open the folder', 'none': "  Can't read it", 'mac': '  Build it for the Mac first' if sys.platform == 'darwin' else '  Builds on a Mac only'}[state])
         self.hero.play.setEnabled(state not in ('none', 'mac'))
     def run_time_later(self, g):   # a build said the game compiles shaders while it runs (run_time_shaders), which Update shaders brings in: a provisional profile's only
         return bool(g.provisional and self.win.st.value(f'runtime/{g.id}', False, type=bool))
@@ -492,6 +502,7 @@ class LibraryPage(QWidget):
         s = self.win.serial()
         if state == 'keys': self.win.settings.pick_keys(); return   # none yet, or keys older than the game
         if state == 'tools': self.win.go('setup'); return   # the checklist's Install tools
+        if state == 'folder': reveal(g.folder); return   # what's in the folder is what to change (explain.py's rules for the scan)
         if state in ('play', 'install') and not s: self.win.toast(self.win.no_phone()); return
         if state == 'play':
             if not self.first_start_ok(g, s): return
@@ -733,6 +744,7 @@ class BuildsPage(QWidget):
         self.proc = QProcess(self); self.proc.setProgram(PYTHON); self.proc.setArguments([str(SCRIPT), *args, '--progress', 'json'])
         env = QProcessEnvironment.systemEnvironment(); env.insert('PYTHONUTF8', '1'); env.insert('PYTHONUNBUFFERED', '1'); env.insert('NXNATIVE_BUILD_ID', bid); self.proc.setProcessEnvironment(env)
         self.proc.setProcessChannelMode(QProcess.MergedChannels); self.proc.readyRead.connect(self.read); self.proc.finished.connect(self.finished)
+        if NEW_SESSION is not None: self.proc.setUnixProcessParameters(NEW_SESSION)   # a process group its tools join, which Stop ends (procs.py)
         self.proc.start(); self.t0 = time.time(); self.say(f'$ python {SCRIPT.name} ' + ' '.join(args), TEXT3)
         self.progress.emit(title, 'starting…', -1, True)
     def fresh(self, args, bid):   # a build starts: what the last one said and where it stopped are forgotten
@@ -838,7 +850,9 @@ class BuildsPage(QWidget):
         bg(gpu, got)
     def save_report(self):   # the whole log and where its journal is, redacted the same way
         info, serial = self.report_info(); info['gpu'] = self.gpus.get(serial, '')   # as Copy report asked the phone, if it did
-        f, _ = QFileDialog.getSaveFileName(self, 'Save the full report', str(Path.home() / 'Documents' / f'DroidPlay report {time.strftime("%Y-%m-%d %H%M")}.txt'), 'Text (*.txt)')
+        docs = Path(QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or Path.home())   # Linux's may be named otherwise (xdg-user-dirs), or not exist
+        name = f'DroidPlay report {time.strftime("%Y-%m-%d %H%M")}.txt'
+        f, _ = QFileDialog.getSaveFileName(self, 'Save the full report', str((docs if docs.is_dir() else Path.home()) / name), 'Text (*.txt)')
         if not f: return
         try: Path(f).write_text(ex.full_report(info, self.log.toPlainText(), self.journal_path() or '', str(Path.home())), encoding='utf-8')
         except OSError as e: QMessageBox.warning(self, 'Save full report', str(e)); return
@@ -860,13 +874,11 @@ class BuildsPage(QWidget):
     def stop(self):
         if self.ext:   # a console build: its process tree
             if QMessageBox.question(self, 'Stop', f'Stop {self.title}, started from the console?') != QMessageBox.Yes: return
-            if os.name == 'nt': subprocess.run(['taskkill', '/T', '/F', '/PID', str(self.ext['pid'])], capture_output=True, creationflags=NOWINDOW)
-            else: os.kill(self.ext['pid'], 15)
+            procs.stop_tree(self.ext['pid'], force=False)
             return
         if not self.busy() or not self.proc: return
         self.stopping = True
-        if os.name == 'nt': subprocess.run(['taskkill', '/T', '/F', '/PID', str(self.proc.processId())], capture_output=True, creationflags=NOWINDOW)   # its tools too
-        else: self.proc.kill()
+        procs.stop_tree(self.proc.processId())   # its tools too
 
 
 class BuildBar(QWidget):   # the running build at the bottom of every page
@@ -899,7 +911,8 @@ class KeepColour(QStyledItemDelegate):   # a selected row keeps its coloured tex
         if fg is not None: opt.palette.setBrush(QPalette.HighlightedText, fg)
 
 
-STATES = {'device': 'connected', 'unauthorized': 'allow USB debugging on the phone', 'authorizing': 'allow USB debugging on the phone', 'offline': 'offline'}   # adb's words
+STATES = {'device': 'connected', 'unauthorized': 'allow USB debugging on the phone', 'authorizing': 'allow USB debugging on the phone', 'offline': 'offline',
+          phone_id.NO_PERMISSIONS: 'USB access needed: How to connect a phone'}   # adb's words
 NO_ADB = "adb isn't installed, so DroidPlay can't see your phones. It comes with the tools: Get started, step 2."
 NO_PHONE = (f'No phone connected. Plug one in with USB debugging on and allow this computer when the phone asks, or pair one over Wi-Fi. '
             f'<a style="color:{READY}" href="guide">How to connect a phone</a>')
@@ -921,7 +934,8 @@ class PhoneGuide(QDialog):   # how to connect a phone, by brand (dm/android/desk
         self.more = QToolButton(); self.more.setObjectName('manage'); self.more.setText(" If it doesn't work"); self.more.setCheckable(True); self.more.setCursor(Qt.PointingHandCursor)
         self.more.setIcon(icon('right', TEXT, 16)); self.more.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); lay.addWidget(self.more)
         link = lambda h: h.replace('<a ', f'<a style="color:{READY}" ')   # noqa: E731  (the app's green, not the palette's blue on the dark panel)
-        self.trouble = label(link(''.join(f'<p><b>{t}{"" if t[-1] in "?!." else "."}</b> {x}</p>' for t, x in pg.TROUBLE)), 'meta', wrap=True); self.trouble.setTextFormat(Qt.RichText)
+        self.trouble = label(link(''.join(f'<p><b>{t}{"" if t[-1] in "?!." else "."}</b> {x}</p>' for t, x in pg.trouble())), 'meta', wrap=True); self.trouble.setTextFormat(Qt.RichText)
+        self.trouble.setTextInteractionFlags(Qt.TextBrowserInteraction)   # the udev rule and commands, to select and copy
         self.trouble.setOpenExternalLinks(True); self.trouble.hide(); lay.addWidget(self.trouble); lay.addStretch()
         self.more.toggled.connect(lambda on: (self.trouble.setVisible(on), self.more.setIcon(icon('down' if on else 'right', TEXT, 16))))
         foot = QWidget(); fl = QHBoxLayout(foot); fl.setContentsMargins(28, 12, 28, 22); fl.setSpacing(16)
@@ -933,7 +947,7 @@ class PhoneGuide(QDialog):   # how to connect a phone, by brand (dm/android/desk
         self.ensurePolished(); need = lay.totalHeightForWidth(640) + foot.sizeHint().height() + 40   # as tall as its steps, within the screen (the game-app dialog's rule)
         self.resize(640, min(max(need, 680), int(win.screen().availableGeometry().height() * 0.85)))   # rich text's height for width comes out short: room for If it doesn't work
     def show_brand(self):
-        k = self.brand.currentData(); _, _, steps, note = next(b for b in pg.BRANDS if b[0] == k)
+        k = self.brand.currentData(); steps = next(b[2] for b in pg.BRANDS if b[0] == k); note = pg.brand_note(k)
         self.steps.setText('<ol style="margin: 0">' + ''.join(f'<li style="margin-bottom: 10px">{x}</li>' for x in steps) + '</ol>')
         self.note.setText(note.replace('<a ', f'<a style="color:{READY}" ')); self.note.setVisible(bool(note)); self.win.st.setValue('phone_brand', k)
     def watch(self):   # the checklist's phone step, as DroidPlay sees it now (it looks every few seconds)
@@ -1130,7 +1144,7 @@ class PhonesPage(QWidget):
         if box.clickedButton() is not go: return
         def run():   # its Wi-Fi address first: adb on the phone is out of reach over USB for a moment once it restarts
             ip = wifi.wifi_ip(adb_run(s, 'shell', wifi.IP_CMD, timeout=10)[1])
-            if not ip: return False, f'{name} is not on Wi-Fi: connect it to the same network as this PC, then try again'
+            if not ip: return False, f'{name} is not on Wi-Fi: connect it to the same network as this computer, then try again'
             ok, text = wifi.tcpip_result(*adb_run(s, 'tcpip', str(wifi.TCPIP_PORT), timeout=20))
             if not ok: return False, text
             addr = f'{ip}:{wifi.TCPIP_PORT}'
@@ -1323,6 +1337,11 @@ class SettingsPage(QWidget):
         lay.addLayout(upd)
         start = QHBoxLayout(); start.addWidget(label('Get started', 'meta')); self.start_line = label('', 'muted'); start.addWidget(self.start_line, 1)
         b = QPushButton('Show the setup checklist'); b.setObjectName('ghost'); b.clicked.connect(lambda: win.go('setup')); start.addWidget(b); lay.addLayout(start)
+        if sys.platform.startswith('linux') and menu_entry.appimage():   # the AppImage, which has no menu entry until one is written (menu_entry.py)
+            menu = QHBoxLayout(); menu.addWidget(label('Applications menu', 'meta')); self.menu_line = label('', 'muted', wrap=True); menu.addWidget(self.menu_line, 1)
+            self.menu_add = QPushButton(); self.menu_add.setObjectName('ghost'); self.menu_add.clicked.connect(self.menu_write); menu.addWidget(self.menu_add)
+            self.menu_del = QPushButton('Remove'); self.menu_del.setObjectName('ghost'); self.menu_del.clicked.connect(self.menu_remove); menu.addWidget(self.menu_del)
+            lay.addLayout(menu); self.show_menu()
         lay.addSpacing(8)
         head = QHBoxLayout(); head.addWidget(label('Requirements', 'h2')); head.addStretch(); b = QPushButton('Check again'); b.setObjectName('ghost'); b.clicked.connect(lambda *_: self.run()); head.addWidget(b)
         self.setup = QPushButton("Install what's missing"); self.setup.clicked.connect(self.install); self.setup.hide(); head.addWidget(self.setup); self.rows = []
@@ -1338,11 +1357,28 @@ class SettingsPage(QWidget):
     def show_update(self, newer):   # the version, when DroidPlay last looked, and a newer release if there is one
         st, v = self.win.st, self.win.version; checked = st.value('update/checked', '')
         when = f' Last checked {checked}.' if checked else ''
-        rel = self.win.release; can = bool(newer and rel and rel.get('setup') and upd.setup_install(REPO))
-        if newer: self.update_line.setText(f'DroidPlay {v} · {newer.lstrip("v")} is out.{when}'); self.update_btn.setText(f'{"Update to" if can else "Download"} {newer.lstrip("v")}')
+        rel = self.win.release; can, why = upd.how(rel, REPO) if newer and rel else (None, None)
+        if newer:   # with why Update can't, where there's a reason to give (the AppImage's folder can't be written, a test build)
+            self.update_line.setText(f'DroidPlay {v} · {newer.lstrip("v")} is out.{when}' + (f' {why[0].upper() + why[1:]}: Download opens the release page.' if why else ''))
+            self.update_btn.setText(f'{"Update to" if can else "Download"} {newer.lstrip("v")}')
         elif upd.release_number(v): self.update_line.setText(f'DroidPlay {v}.{when}'); self.update_btn.setText('Check for updates')
-        else: self.update_line.setText(f'DroidPlay {v or "(its version unknown)"}: a copy from source, so it doesn\'t look for releases by itself.'); self.update_btn.setText('Check for updates')
+        else:   # a checkout's git describe, or an AppImage built by CI from one (linux-package.yml), which a release doesn't replace
+            what = 'a test build' if menu_entry.appimage() else 'a copy from source'
+            self.update_line.setText(f'DroidPlay {v or "(its version unknown)"}: {what}, so it doesn\'t look for releases by itself.'); self.update_btn.setText('Check for updates')
         self.newer = newer
+    def show_menu(self):
+        st, cur = menu_entry.state(), menu_entry.current()
+        self.menu_line.setText({'none': 'DroidPlay is not in your applications menu.', 'this': 'DroidPlay is in your applications menu.',
+                                'other': f'The menu entry starts another copy, {cur[1] if cur and cur[1] else "a file that is gone"}.'}[st])
+        self.menu_add.setText({'none': 'Add to the applications menu', 'this': 'Write it again', 'other': 'Start this copy'}[st]); self.menu_del.setVisible(st != 'none')
+    def menu_write(self):
+        try: menu_entry.add(menu_entry.appimage(), lambda p: app_icon().pixmap(256, 256).save(str(p), 'PNG'))
+        except (OSError, ValueError, TypeError) as e: QMessageBox.warning(self, 'Applications menu', f'DroidPlay could not add itself to the menu: {e}'); return
+        self.show_menu(); self.win.toast('DroidPlay is in your applications menu (a few seconds on some desktops)')
+    def menu_remove(self):
+        try: menu_entry.remove()
+        except OSError as e: QMessageBox.warning(self, 'Applications menu', f'DroidPlay could not remove its menu entry: {e}'); return
+        self.show_menu(); self.win.toast('DroidPlay is out of your applications menu')
     def update_clicked(self):
         if getattr(self, 'newer', None) and self.win.release: self.win.update_now()   # Update, or the release's page where it can't
         elif getattr(self, 'newer', None): QDesktopServices.openUrl(QUrl(self.win.st.value('update/url', '') or 'https://github.com/enjoyerofslop/droidplay-core/releases/latest'))
@@ -1380,20 +1416,23 @@ class SettingsPage(QWidget):
             if then: then(rows)
             self.win.setup_changed()
         bg(lambda: self.win.script_json('--check'), got)
-    def installable(self):   # the failing rows --setup installs: Windows only so far, and not the Python modules (uv run brings those, or pip)
-        return [r['name'] for r in self.rows if not r['ok'] and r['name'] != 'check' and not r['name'].startswith('Python')] if os.name == 'nt' else []
+    def installable(self):   # the failing rows --setup installs: on Windows and x86_64 Linux (host_setup.unsupported), and not the Python modules (uv run brings those, or pip)
+        return [r['name'] for r in self.rows if not r['ok'] and r['name'] != 'check' and not r['name'].startswith('Python')] if CAN_INSTALL else []
     def install(self, show_builds=True):   # build_android_from_nsp.py --setup, once the player has seen what it downloads and, for the Android SDK's parts, accepted Google's licence
         missing = self.installable()
         if not missing: return
         sdk_rows = set(ba.sdk_packages(Path('.'))) | {'Android SDK'}
+        to, whole = ba.setup_target(None, set(missing))   # as --setup will: a distribution's SDK the player can't write to gets a whole one of their own instead (#508)
         parts = (['JDK 21, Microsoft\'s build (about 190 MB)'] if any(n.startswith('JDK') for n in missing) else []) + \
                 (['.NET SDK 10 (about 290 MB)'] if '.NET SDK 10' in missing else []) + \
                 (['the Android SDK: its command-line tools, platform-tools, platform, build-tools, NDK and CMake (about 1.1 GB to download, 4 GB installed)']
-                 if 'Android SDK' in missing else   # with no SDK found, --check lists none of its parts but adb
+                 if 'Android SDK' in whole else   # with no SDK found, --check lists none of its parts but adb
                  [f'the Android SDK\'s {", ".join(n for n in missing if n in sdk_rows)}'] if any(n in sdk_rows for n in missing) else [])
         sdk = any(n in sdk_rows for n in missing)
-        b = QMessageBox(QMessageBox.Question, "Install what's missing", 'Setup downloads and installs:\n\n• ' + '\n• '.join(parts) +
-                        f'\n\nThe JDK and the .NET SDK go into {ba.data_dir() / "tools"}, for this app alone; the Android SDK goes where Android Studio keeps it.', QMessageBox.Cancel, self)
+        where = f'the Android SDK into {to}' + (', where Android Studio keeps it' if os.name == 'nt' else '') if 'Android SDK' in whole else f'the Android SDK into the one it found, {to}'
+        b = QMessageBox(QMessageBox.Question, "Install what's missing", 'DroidPlay downloads and installs:\n\n• ' + '\n• '.join(parts) +
+                        f'\n\nThe JDK and the .NET SDK go into {ba.data_dir() / "tools"}, for this app alone' + (f'; {where}' if sdk else '') + '. All of it goes into your own folders: '
+                        'nothing asks for administrator rights.', QMessageBox.Cancel, self)
         if sdk: b.setInformativeText(f'The Android SDK comes from Google: installing its parts means accepting the <a style="color:{READY}" '
                                      'href="https://developer.android.com/studio/terms">Android SDK License</a>. Nothing is sent to Google about you: '
                                      'the SDK\'s usage metrics stay off.')
@@ -1464,7 +1503,7 @@ class SetupPage(QWidget):   # Get started: keys, tools, phone, first game. Not i
         w = self.win; lib = w.library
         games = [{'folder': g.folder, 'name': g.name, 'state': g.status(w.phone_games, w.phone_name())[2], 'tested': g.tested, 'error': g.error} for g in lib.games.values()]
         run = ('running', self.run.fraction(), self.run.text(time.time())) if self.run else ('failed', self.failed) if self.failed else None
-        return [fr.keys_step(w.st.value('keys', '') or ''), fr.tools_step(w.settings.rows if w.settings.checked else None, os.name == 'nt', run),
+        return [fr.keys_step(w.st.value('keys', '') or ''), fr.tools_step(w.settings.rows if w.settings.checked else None, CAN_INSTALL, run),
                 fr.phone_step(w.devs, w.adb, w.serial(), bool(w.st.value('serial', ''))), fr.game_step(lib.folders(), games, getattr(lib, 'reading', False))]
     def refresh(self):   # → how many steps are done
         if not hasattr(self.win, 'library'): return 0
@@ -1491,7 +1530,8 @@ class SetupPage(QWidget):   # Get started: keys, tools, phone, first game. Not i
 
 
 # ---------------- Updates ----------------
-# The app says a newer release is out, as DroidPlay for Mac does; a copy DroidPlay-Setup installed also offers Update (dm/android/desktop/update.py has why and how).
+# The app says a newer release is out, as DroidPlay for Mac does; a copy DroidPlay-Setup installed and DroidPlay for Linux's AppImage also offer Update
+# (dm/android/desktop/update.py has why and how).
 class Progress(QObject): moved = Signal(object, object)   # a download's bytes so far and in all, from the thread pool to the window
 
 
@@ -1515,16 +1555,16 @@ class UpdateBar(QWidget):   # under the top bar, on every page, while a newer re
     def go(self):
         if self.can_update: self.win.update_now()
         elif self.url: QDesktopServices.openUrl(QUrl(self.url))
-    def show_release(self, rel):   # Update where DroidPlay-Setup installed this copy and the release has its Setup; the release's page otherwise
+    def show_release(self, rel):   # Update where Setup installed this copy or it's the AppImage, and the release has that file; the release's page otherwise
         self.tag, self.url = rel['tag'], rel['url']; v = self.tag.lstrip('v')
-        self.can_update = bool(rel.get('setup')) and upd.setup_install(REPO)
+        kind, why = upd.how(rel, REPO); self.can_update = bool(kind)
         self.get.setEnabled(True); self.later_btn.setText('Not now'); self.notes.setVisible(self.can_update)
         if self.can_update:
             self.get.setText('Update')
             self.text.setText(f'DroidPlay {v} is out. Update downloads it, then DroidPlay closes and opens again, updated; your games, builds and settings stay.')
         else:
-            self.get.setText('Download')
-            self.text.setText(f'DroidPlay {v} is out. Download its installer from the release page; your games, builds and settings stay.')
+            self.get.setText('Download'); what = 'its installer' if os.name == 'nt' else 'its AppImage' if menu_entry.appimage() else 'it'
+            self.text.setText(f'DroidPlay {v} is out. Download {what} from the release page' + (f' ({why})' if why else '') + '; your games, builds and settings stay.')
         self.show()
     def show_progress(self, done, total):
         self.get.setEnabled(False); self.notes.hide(); self.later_btn.setText('Cancel')
@@ -1611,11 +1651,14 @@ class Window(QMainWindow):
             if asked and not newer: self.toast(f'DroidPlay {self.version} is the newest' if mine else f'The newest release is {tag}; this copy is {self.version or "of no release"}')
         bg(upd.latest_release, got)
 
-    def update_now(self):   # Update: the release's Setup downloaded and checked, then run silently; DroidPlay closes, and Setup's /RELAUNCH opens the new one
+    def update_now(self):   # Update: the release's Setup downloaded and checked, then run silently; DroidPlay closes, and Setup's /RELAUNCH opens the new one.
+        # From DroidPlay for Linux's AppImage, its AppImage instead (update_appimage)
         rel = self.release
         if self.updating or not rel: return
-        if not (rel.get('setup') and upd.setup_install(REPO)): QDesktopServices.openUrl(QUrl(rel['url'])); return
+        kind, _ = upd.how(rel, REPO)
+        if not kind: QDesktopServices.openUrl(QUrl(rel['url'])); return
         if self.builds.busy() or self.builds.ext: self.toast('A build is running: wait for it to finish, or stop it, then update'); return
+        if kind == 'appimage': self.update_appimage(rel); return
         v, mb = rel['tag'].lstrip('v'), rel['setup']['size'] / 2**20
         if QMessageBox.question(self, 'Update DroidPlay', f'Update to DroidPlay {v}?\n\nDroidPlay downloads its installer ({mb:.0f} MB) and checks it against the release, '
                                 'then closes, updates, and opens again. Your games, builds and settings stay.') != QMessageBox.Yes: return
@@ -1631,6 +1674,31 @@ class Window(QMainWindow):
             if not (started[0] if isinstance(started, tuple) else started):
                 self.updatebar.show_release(rel); QMessageBox.warning(self, 'Update DroidPlay', f'Windows did not start {r}. Run it yourself, or download it from the release page.'); return
             QApplication.quit()   # Setup would close it anyway (the Restart Manager); it opens the new DroidPlay when it is done
+        bg(fetch, got)
+
+    def update_appimage(self, rel):   # Linux: the release's AppImage downloaded beside this one and checked, put in its place and started; this DroidPlay closes
+        img, a, v = upd.appimage_install(REPO)[0], rel['appimage'], rel['tag'].lstrip('v')
+        name = a['name'] if upd.APPIMAGE_NAME.fullmatch(img.name) else img.name   # replace_appimage: a release's name follows the version, the player's stays
+        if QMessageBox.question(self, 'Update DroidPlay', f'Update to DroidPlay {v}?\n\nDroidPlay downloads its AppImage ({a["size"] / 2**20:.0f} MB) into {img.parent}, '
+                                f'checks it against the release and puts it in place of this one as {name}, then closes and opens again; the first start of {v} '
+                                'prepares it, once. Your games, builds and settings stay.') != QMessageBox.Yes: return
+        self.updating = flag = {'cancel': False}; sig = Progress(); sig.moved.connect(self.updatebar.show_progress); self.updatebar.show_progress(0, a['size'])
+        def fetch(): return upd.download_appimage(a, img, REPO, sig.moved.emit, lambda: flag['cancel'])
+        def got(r):
+            self.updating = None; sig.deleteLater()
+            if isinstance(r, upd.Cancelled): self.updatebar.show_release(rel); return
+            if isinstance(r, Exception):
+                self.updatebar.show_release(rel)
+                QMessageBox.warning(self, 'Update DroidPlay', f'The update could not be downloaded: {getattr(r, "strerror", None) or r}\n\n{img.name} is as it was.'); return
+            if self.builds.busy() or self.builds.ext:   # one started while it downloaded: nothing replaced, and closing would end it
+                Path(r).unlink(missing_ok=True); self.updatebar.show_release(rel); self.toast('A build started: Update again once it has finished'); return
+            try: new = upd.replace_appimage(r, img, menu_entry.retarget)
+            except OSError as e:
+                Path(r).unlink(missing_ok=True); self.updatebar.show_release(rel)
+                QMessageBox.warning(self, 'Update DroidPlay', f'The new AppImage could not be put in place of {img}: {e.strerror or e}. {img.name} is as it was.'); return
+            if upd.relaunch(new) is None:
+                self.updatebar.hide(); QMessageBox.warning(self, 'Update DroidPlay', f'DroidPlay {v} is in place, {new}, but did not start: close DroidPlay and open it.'); return
+            QApplication.quit()   # the new AppImage, started on its own, prepares its version (the window it shows) and opens
         bg(fetch, got)
 
     def dark_title(self):   # Windows' own title bar in its dark mode, to match the room
@@ -1656,7 +1724,7 @@ class Window(QMainWindow):
         elif action == 'backup': self.phones.backup()
         elif action == 'issue': QDesktopServices.openUrl(QUrl(ex.ISSUE_441))
     def phone_guide(self): PhoneGuide(self).exec()
-    def phone_brand(self):   # the guide's brand: of the phone adb sees (its maker once it has allowed this PC, its model code before), else the one picked last time
+    def phone_brand(self):   # the guide's brand: of the phone adb sees (its maker once it has allowed this computer, its model code before), else the one picked last time
         d = next((d for d in self.devs or [] if d['state'] == 'device'), None) or next(iter(self.devs or []), None)
         b = pg.brand_for(d.get('manufacturer', ''), d.get('model', '')) if d else 'other'
         return b if b != 'other' else self.st.value('phone_brand', 'other') or 'other'
@@ -1694,7 +1762,7 @@ class Window(QMainWindow):
     def keys(self): k = self.st.value('keys', '') or ''; return k if k and Path(k).is_file() else None
     def script_json(self, *args):
         r = subprocess.run([PYTHON, str(SCRIPT), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=NOWINDOW, env=dict(os.environ, PYTHONUTF8='1'))
-        if r.returncode: raise RuntimeError((r.stderr or r.stdout).strip()[-500:])
+        if r.returncode: raise RuntimeError(ex.script_error(r.stdout, r.stderr))   # its error is on stdout after --info's notes on stderr: the error last
         return json.loads(r.stdout)
     def serial(self): return self.phone.currentData() or None
     def phone_name(self): return self.models.get(self.serial()) or self.serial()
@@ -1766,13 +1834,10 @@ class Window(QMainWindow):
             if not shutil.which('adb'): return None   # Install what's missing brings it, with the Android SDK
             ok, out = adb_run(None, 'devices', '-l', timeout=10)
             devs = []
-            for line in out.splitlines()[1:] if ok else []:
-                c = line.split()
-                if len(c) < 2: continue
-                d = {'serial': c[0], 'state': c[1], 'model': next((x[6:] for x in c if x.startswith('model:')), '').replace('_', ' ')}
+            for d in phone_id.devices(out) if ok else []:   # Linux's "no permissions (...)" is one state with spaces in it: a split line read it as "no"
                 if d['state'] == 'device':   # in one call: Android's version, the model's market name where the maker sets one (devices -l has its code: OPD2415 for a OnePlus Pad 3), the phone's own name
                     # and the model as the phone spells it: devices -l turns what isn't a letter or a digit into _, so a Galaxy's SM-S937U1 came out as SM S937U1
-                    # its maker (the phone guide's brand), and its battery and free space (a PC's USB port charges slowly; an install needs room)
+                    # its maker (the phone guide's brand), and its battery and free space (a computer's USB port charges slowly; an install needs room)
                     got_p, p = adb_run(d['serial'], 'shell', 'getprop ro.build.version.release; getprop ro.product.marketname; getprop ro.vendor.oplus.market.name; '
                                        'getprop ro.product.model; settings get global device_name; getprop ro.product.manufacturer; '
                                        'dumpsys battery | grep -E "powered:|level:|status:"; df -k /sdcard | tail -n 1', timeout=8)
@@ -1807,14 +1872,17 @@ class Window(QMainWindow):
             self.phone.blockSignals(True); self.phone.clear()
             for d in phone_id.one_per_phone([d for d in r if d['state'] == 'device']):   # one entry a phone, over the cable when it is on a cable and on Wi-Fi (the Phones page lists both)
                 self.phone.addItem(icon('phone', TEXT2, 16), f'{self.models[d["serial"]]}' + (f' · Android {d.get("android")}' if d.get('android') else ''), d['serial'])
-            # a phone plugged in but not ready: listed, greyed, with what to do; it said "No phone connected" while the phone waited for Allow
+            # a phone plugged in but not ready: listed, greyed, with what to do; it said "No phone connected" while the phone waited for Allow, and left out a phone
+            # Linux doesn't let this user open (no udev rule), which Get started then called "connected but not ready"
             for d in r:
-                if d['state'] in ('unauthorized', 'authorizing', 'offline'):
-                    off = d['state'] == 'offline'
-                    self.phone.addItem(icon('phone', ERR if off else BUILD, 16), ((f'Reconnecting to {self.lost["name"]} over Wi-Fi…' if self.lost else 'Wake your phone (Wi-Fi)')
-                                                                       if phone_id.wifi(d['serial']) else 'Plug your phone in again') if off else 'Tap Allow on your phone', None)
+                if d['state'] in ('unauthorized', 'authorizing', 'offline', phone_id.NO_PERMISSIONS):
+                    off, perm = d['state'] == 'offline', d['state'] == phone_id.NO_PERMISSIONS
+                    self.phone.addItem(icon('phone', ERR if off or perm else BUILD, 16), 'Phone found: USB access needed (How to connect a phone)' if perm else
+                                       ((f'Reconnecting to {self.lost["name"]} over Wi-Fi…' if self.lost else 'Wake your phone (Wi-Fi)')
+                                        if phone_id.wifi(d['serial']) else 'Plug your phone in again') if off else 'Tap Allow on your phone', None)
                     it = self.phone.model().item(self.phone.count() - 1); it.setEnabled(False)
-                    it.setToolTip(re.sub(r'<[^>]+>', '', ex.explain(f'device {d["state"]}', phone=d.get('model', ''), wifi=phone_id.wifi(d['serial'])).body))
+                    it.setToolTip(re.sub(r'<[^>]+>', '', ex.explain(f'device {d["state"]} ({d.get("why", "")})' if perm else f'device {d["state"]}',
+                                                                    phone=d.get('model', ''), wifi=phone_id.wifi(d['serial'])).body))
             if not self.phone.count(): self.phone.addItem(icon('phone', BUILD if self.lost else TEXT3, 16), f'Reconnecting to {self.lost["name"]} over Wi-Fi…' if self.lost and adb else
                                                           'No phone connected' if adb else 'Install the tools to find phones', None)
             self.phone.setToolTip('The phone builds install to' if adb else 'DroidPlay finds phones with adb, which comes with the tools: Get started, step 2')
@@ -1823,16 +1891,23 @@ class Window(QMainWindow):
         bg(look, got)
 
 
-def main():
-    if '--write-icon' in sys.argv[:-1]:   # the Windows installer's shortcuts take DroidPlay's icon as an .ico file (dm/android/windows/install_droidplay.cmd)
-        app = QApplication(sys.argv[:1]); path = sys.argv[sys.argv.index('--write-icon') + 1]
-        if not app_icon().pixmap(256, 256).save(path, 'ICO'): sys.exit(f'could not write {path}')
-        return
+def open_window(argv):   # the app and its window, shown: main's, and the AppImage's window check (dm/android/linux/window_check.py)
     if os.name == 'nt':   # a taskbar button of its own, with DroidPlay's name and icon, not grouped with every other Python window
         try: import ctypes; ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('io.github.enjoyerofslop.droidplay.desktop')
         except Exception: pass
-    app = QApplication(sys.argv); app.setApplicationName('DroidPlay'); app.setWindowIcon(app_icon()); app.setStyle('Fusion'); app.setStyleSheet(STYLE)
-    w = Window(); w.show(); sys.exit(app.exec())
+    app = QApplication(argv); app.setApplicationName('DroidPlay'); app.setWindowIcon(app_icon()); app.setStyle('Fusion'); app.setStyleSheet(STYLE)
+    # Wayland takes a window's icon and its dock entry from the .desktop file named by the app ID (the AppImage's, dm/android/linux), not from setWindowIcon
+    app.setDesktopFileName('io.github.enjoyerofslop.droidplay')
+    w = Window(); w.show()
+    return app, w
+
+
+def main():
+    if '--write-icon' in sys.argv[:-1]:   # DroidPlay's icon as a file: an .ico for the Windows installer's shortcuts, a .png for the AppImage (dm/android/linux/stage.sh)
+        app = QApplication(sys.argv[:1]); path = sys.argv[sys.argv.index('--write-icon') + 1]
+        if not app_icon().pixmap(256, 256).save(path, 'PNG' if path.lower().endswith('.png') else 'ICO'): sys.exit(f'could not write {path}')
+        return
+    app, _ = open_window(sys.argv); sys.exit(app.exec())
 
 
 if __name__ == '__main__':
