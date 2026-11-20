@@ -72,6 +72,7 @@ static uint32_t *lm_code(const char *path, uint32_t miss, int alpha, int tff, ui
     uint32_t *ha = NULL; size_t hn = spv_fit_harr(code, n, path, &ha); if (hn) { free(code); code = ha; n = hn; }   // arrays past what stage_set writes shortened to it
     uint32_t *wg = NULL; size_t wgn = spv_fit_wg32(code, n, path, &wg); if (wgn) { free(code); code = wg; n = wgn; }   // a task / mesh kernel's warp as its workgroup (spv_wg32.h)
     uint32_t *fit = NULL; size_t fn = spv_fit(code, n, path, &fit); if (fn) { free(code); code = fit; n = fn; }
+    uint32_t *sx = NULL; size_t sxn = spv_fit_shx(code, n, path, &sx); if (sxn) { free(code); code = sx; n = sxn; }   // after the subgroup rewrites: shuffles as ShuffleXor where the compiler crashes on them
     uint32_t *fs = NULL; size_t fsn = spv_fit_fsum(code, n, path, &fs); if (fsn) { free(code); code = fs; n = fsn; }   // after the subgroup rewrites: float atomic adds summed across the subgroup (spv_fsum.h)
     t_wg32 = 0;
     uint32_t *ly = NULL; size_t ln = spv_fit_layer(code, n, path, &ly); if (ln) { free(code); code = ly; n = ln; }
