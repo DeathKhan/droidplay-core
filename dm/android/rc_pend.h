@@ -1,32 +1,33 @@
-// Conditional rendering's list of pending timestamp reports (gfx_vk.c rc_note / rc_value, profile render_cond): an address whose latest report the replay has met counts
-// as 0 if that report was a timestamp one (a timestamp report puts 0 in the counter field), and as unknown if a report of another counter kind came after it. A
-// samples-passed report, or one of a counter kind the host does not implement, is not added: the counter report address set (g_rc_occ) holds those, with the fence that
-// says when one has landed. They were added here too, and Ocarina of Time's 530 or so occlusion reports a frame filled the 256 entries: a full list drops its older half,
-// so a timestamp report noted before them in the same submission was forgotten, and a condition on it read the 1 the CPU had written there. The game clears its 768x432
-// refraction target under such a condition at every bind and reports once: the later clears ran and wiped the scene copy, and the water turned opaque brown.
-// DM_VK_OCCLUSION=0 did not avoid it, as the reports are still replayed and noted. nvn_mtl.m's table has kept only timestamps per submission since Splatoon Raiders
-// (docs/reference/rendering.md, Report tables that dropped entries). Plain C, for dm/tools/tests/test_rc_pend.py.
+// The counter reports the replay made last, each address once with the kind of its newest report (gfx_vk.c rc_note, rc_value: render_cond), found through an
+// open-addressing index instead of a walk of the list. Self-contained: dm/tools/tests/test_rc_pend.py drives it on the PC.
+// The list keeps the RC_PEND newest addresses; when it is full the older half goes (those reports have landed by then), as before. Each report and each condition walked the
+// whole list: Ocarina of Time makes about 2,200 reports and 530 conditions a frame with the list full, and the walks were 4.5% of its replay thread on a Galaxy Z Fold 8 in
+// Kokiri Forest (rc_note, rc_value). The index holds each address's position in the list, at most RC_PEND of its RC_PIDX slots (no deletions: it is rebuilt when the list drops
+// its older half), so a probe ends at the address or at an empty slot within a few steps.
 #pragma once
 #include <stdint.h>
 #include <string.h>
 
-enum { RC_PEND = 256 };
-enum { RCP_TIMESTAMP = 1, RCP_UNKNOWN = 2 };   // an entry's kind: a timestamp report (counter 0), or a report of another counter after one to the same address
-typedef struct { uint64_t addr; int kind; } rcp_entry;
-typedef struct { rcp_entry e[RC_PEND]; int n; uint64_t dropped; } rcp_list;   // dropped: entries let go when the list was full
+enum { RC_PEND = 256, RC_PIDX = 1024 };
+typedef struct { uint64_t addr; int kind; } rc_pent;
+typedef struct { rc_pent e[RC_PEND]; int n; uint16_t idx[RC_PIDX]; } rc_pend;   // idx: position + 1 in e, 0 empty
 
-// a report to address a: timestamp 1 for a timestamp report, 0 for any other counter kind. An entry the address has takes the new kind; a timestamp report takes a new
-// entry, and a full list first lets its older half go (timestamps noted that long ago have landed, and their memory reads 0 as well); another kind takes none
-static void rcp_note(rcp_list *l, uint64_t a, int timestamp) {
-    int kind = timestamp ? RCP_TIMESTAMP : RCP_UNKNOWN;
-    for (int i = 0; i < l->n; i++) if (l->e[i].addr == a) { l->e[i].kind = kind; return; }
-    if (!timestamp) return;   // (the counter report address set holds it)
-    if (l->n == RC_PEND) { memmove(l->e, l->e + RC_PEND / 2, sizeof *l->e * (RC_PEND / 2)); l->n = RC_PEND / 2; l->dropped += RC_PEND / 2; }
-    l->e[l->n].addr = a; l->e[l->n++].kind = kind;
+static inline uint32_t rcp_slot(const rc_pend *p, uint64_t a) {
+    uint32_t i = (uint32_t)((a >> 4) * 0x9E3779B1u) & (RC_PIDX - 1);
+    while (p->idx[i] && p->e[p->idx[i] - 1].addr != a) i = (i + 1) & (RC_PIDX - 1);
+    return i;
 }
-
-// the kind of address a's entry: RCP_TIMESTAMP, RCP_UNKNOWN, or 0 when it has none (its value is the address set's or memory's)
-static int rcp_find(const rcp_list *l, uint64_t a) {
-    for (int i = l->n - 1; i >= 0; i--) if (l->e[i].addr == a) return l->e[i].kind;
-    return 0;
+// the newest kind noted for address a, or 0 when it is not in the list
+static inline int rcp_kind(const rc_pend *p, uint64_t a) { uint32_t i = rcp_slot(p, a); return p->idx[i] ? p->e[p->idx[i] - 1].kind : 0; }
+// a report of kind (not 0) to address a: its entry updated, or added as the newest (the older half dropped first when the list is full)
+static inline void rcp_note(rc_pend *p, uint64_t a, int kind) {
+    uint32_t i = rcp_slot(p, a);
+    if (p->idx[i]) { p->e[p->idx[i] - 1].kind = kind; return; }
+    if (p->n == RC_PEND) {
+        memmove(p->e, p->e + RC_PEND / 2, sizeof *p->e * (RC_PEND / 2)); p->n = RC_PEND / 2;
+        memset(p->idx, 0, sizeof p->idx);
+        for (int k = 0; k < p->n; k++) p->idx[rcp_slot(p, p->e[k].addr)] = (uint16_t)(k + 1);
+        i = rcp_slot(p, a);
+    }
+    p->e[p->n].addr = a; p->e[p->n].kind = kind; p->idx[i] = (uint16_t)++p->n;
 }
