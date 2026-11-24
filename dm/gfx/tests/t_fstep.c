@@ -525,6 +525,41 @@ int main(void) {
         snprintf(b, sizeof b, "  a GPU-fit trial back to 1 failing on hitches doubles the hold-off and counts in gfail (hold %.0f, gfail %d)", g.s.hold, g.s.gfail);
         check(gtried && g.s.k == 2 && g.s.hold == 2 * FSTEP_HOLD0 && g.s.gfail == 1 && g.s.hitch_fails == 0, b);
     }
+    {   // At kmin, frames late more often than not did not hold it, soft-late ones too (Breath of the Wild at a 60 fps target on a OnePlus Pad 3: three of four frames late at hold 1)
+        sim m = {0}; m.gpu = 0.5; run(&m, 120, 0.2, 1, 3, 0); run(&m, 3, 1.6, 1, 3, 0);
+        for (int i = 0; i < 400 && !m.s.trial; i++) run(&m, 1, 0.2, 1, 3, 0);
+        int tried = m.s.trial && m.s.k == 1 && !m.s.probe; uint64_t ups = m.s.ups;
+        for (int i = 0; i < 2 * FSTEP_RUN && m.s.k == 1 && m.s.trial; i++) m.next = nvn_fstep_next(&m.s, i % 3 ? 1.3 : 1.0, 0.6, 1, 3, 0, 0);   // two of three soft-late: no late run
+        snprintf(b, sizeof b, "a trial back to 1 late on two of three frames, all soft: it fails at its end (k %d, hold %.0f, ups +%llu)", m.s.k, m.s.hold, (unsigned long long)(m.s.ups - ups));
+        check(tried && m.s.k == 2 && m.s.ups == ups + 1 && m.s.hold == 2 * FSTEP_HOLD0 && m.s.hitch_fails == 0, b);
+        sim h = {0}; h.gpu = 0.5; run(&h, 120, 0.2, 1, 3, 0); run(&h, 3, 1.6, 1, 3, 0);
+        for (int i = 0; i < 400 && !h.s.trial; i++) run(&h, 1, 0.2, 1, 3, 0);
+        for (int i = 0; i < 2 * FSTEP_RUN && h.s.trial; i++) h.next = nvn_fstep_next(&h.s, i % 3 ? 1.0 : 1.3, 0.6, 1, 3, 0, 0);   // one of three
+        check(h.s.k == 1 && h.s.hold == FSTEP_HOLD0, "  late on one of three: it holds, as before");
+        // a probe that held, then a run at hold 1 late on two of three frames (soft) for 10 s: at the next step up a failed probe, and its cost is not the one that held
+        sim p = {0}; p.gpu = 0.5; run(&p, 120, 0.2, 1, 3, 0); run(&p, 3, 1.6, 1, 3, 0);
+        p.slow = 1; p.gpu = 0.9; for (int i = 0; i < 400 && !p.s.probe; i++) run(&p, 1, 1.2, 1, 3, 0);
+        p.slow = 0; p.gpu = 0.5; run(&p, 2 * FSTEP_RUN, 0.2, 1, 3, 0);
+        int held = p.s.k == 1 && p.s.probe == 2; double hold = p.s.hold;
+        for (int i = 0; i < 600; i++) p.next = nvn_fstep_next(&p.s, i % 3 ? 1.3 : 1.0, 0.6, 1, 3, 0, 0);
+        run(&p, 3, 1.6, 1, 3, 0);
+        snprintf(b, sizeof b, "  a probe's run at 1 late on two of three frames: a failed probe, no cost that held (hold %.0f, cref %.2f)", p.s.hold, p.s.cref);
+        check(held && p.s.k == 2 && p.s.hold == 2 * hold && p.s.cref == 0, b);
+        // The scene: at hold 1 three of four frames soft-late (1.25 shown, cost 1.2, GPU 0.75), a run of three counted late frames every 10 s; at hold 2 the same cost (1.0, GPU 0.88).
+        // Before, its first 10 s at hold 1 kept that cost as the one that held kmin, and hold 2's same cost started a probe every hold-off: 95 % of the time at hold 1
+        nvn_fstep s; memset(&s, 0, sizeof s); nvn_fgpu g; memset(&g, 0, sizeof g); uint32_t r = 12345; int c1 = 0, n1 = 0;
+        for (int i = 0; i < 7200; i++) {
+            int k = s.k ? s.k : 1; double shown, cost, gpu;
+            if (k == 1) { c1++; r = r * 1103515245u + 12345u; double u = (r >> 8) / 16777216.0; gpu = 0.75;
+                          if (c1 % 600 >= 597) shown = cost = 1.6; else if (u < 0.74) { shown = 1.25; cost = 1.2; } else { shown = 1.0; cost = 0.95; } }
+            else { shown = k; cost = 1.0; gpu = 0.88; }
+            s.gpu = gpu; int slow = nvn_fstep_gpu_slowed(&g, gpu, k, 1, nvn_fstep_probe_phase(&s));
+            n1 += i >= 3600 && k == 1;
+            nvn_fstep_next(&s, shown, cost, 1, 3, 0, slow);
+        }
+        snprintf(b, sizeof b, "  that scene settles at hold 2 (at hold 1 %d of the last 3,600 frames, probes %llu, cref %.2f)", n1, (unsigned long long)s.probes, s.cref);
+        check(s.k == 2 && n1 == 0 && s.probes == 0 && s.cref == 0, b);
+    }
     {   // The pipeline's lateness at a hold the GPU fits (FSTEP_LATE_SOFT): Ocarina of Time on a OnePlus Pad 3, GPU 1.3 vsyncs, frames of 2.2 at hold 2 (late by 0.2)
         sim m = {0}; m.gpu = 1.3; run(&m, 120, 0.5, 1, 3, 0); run(&m, 60, 2.4, 1, 3, 0);
         check(m.s.k == 2 && m.s.ups == 1, "soft late: frames of 2.4 with 1.3 of GPU step from 1 to 2 and stay at 2 (not 3)");
