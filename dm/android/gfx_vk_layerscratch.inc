@@ -8,10 +8,11 @@
 // different layer of one level of one array or cube image, no BC shadow) draws each target into a 2D image of its own: the level's layers are copied into them as the
 // pass begins (rp_start: the pass loads them) and back as it ends (rp_end), every time it is begun again. The images are kept by format, size and slot (LSC_MAX at most).
 // Another bug than one image in two slots (dup_slots, the same layer twice) and than small layered passes on the Adreno 6xx (gfx_vk_layerpad.inc): this pass is not layered.
-// DM_VK_LAYER_SCRATCH (env.txt): 1 on any GPU, 0 off; by default on Qualcomm's own driver (g_qcom_driver), not on Turnip
+// DM_VK_LAYER_SCRATCH (env.txt): opt-in, 1 on any GPU; off when unset or 0. Not on by default for Qualcomm's driver: the bug was seen on the Odin 3 in another
+// replay, not yet in this one
 static int layer_scratch_on(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("DM_VK_LAYER_SCRATCH"); v = e ? *e == '1' : g_qcom_driver;
+    if (v < 0) { const char *e = getenv("DM_VK_LAYER_SCRATCH"); v = e && *e == '1';
                  if (v) LOG("[vk] a render pass whose colour targets are layers of one image draws into one-layer scratch images (DM_VK_LAYER_SCRATCH)"); }
     return v;
 }
