@@ -12,8 +12,8 @@
 // - Overwritten: a shared image that another shared image over its storage was written as since its last lookup, with no lookup for DM_VK_IMAGE_EVICT_ALIAS_AGE
 //   presents (default EV_ALIAS_AGE). On the console that write landed in the same memory, so this image's content is gone there too; its next lookup makes it
 //   again as a first one does (filled from its storage where tex_init_fill can, else zero).
-// Over the byte budget (ev_budget: DM_VK_IMAGE_BUDGET_MB, else a quarter of the device's memory; checked at every present, scans every EV_EVERY_PRESSED presents while
-// over it), images either rule would take with no lookup for EV_BUDGET_AGE presents go too, the least recently looked up first, until the image memory is 90 % of the
+// Over the byte budget (ev_budget: DM_VK_IMAGE_BUDGET_MB, none unless it is set; checked at every present, scans every EV_EVERY_PRESSED presents while over it),
+// clean images go after EV_BUDGET_AGE presents without a lookup instead of EV_AGE (overwritten ones already go at EV_ALIAS_AGE, the shorter), the least recently looked up first, until the image memory is 90 % of the
 // budget (img_evict.h ie_budget_target, ie_pick). The ages work by time and the budget by bytes: a game that makes images faster than they age is held under it, where no
 // memory pressure can be read. Nothing the GPU wrote and no image the texture pool reads by ID goes for it, as for the ages, so a scene whose images are all of those
 // stays over it (a line says so).
@@ -27,7 +27,7 @@
 #define EV_ALIAS_AGE 30
 #define EV_EVERY 30
 #define EV_EVERY_PRESSED 10
-#define EV_BUDGET_AGE 60   // (nx2android's budget: an image looked up in the last 60 presents may be in the submissions in flight, and is likely to be looked up again)
+#define EV_BUDGET_AGE 60   // an image looked up in the last 60 presents is likely to be looked up again (in-flight chunks are dead_add's: it keeps an evicted image until they complete)
 static int ev_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_IMAGE_EVICT"); v = !(e && *e == '0'); } return v; }
 static uint64_t ev_env(const char *name, long def) { const char *e = getenv(name); return (uint64_t)(e && atol(e) > 0 ? atol(e) : def); }
 static uint64_t ev_age(void) { static uint64_t a; if (!a) a = ev_env("DM_VK_IMAGE_EVICT_AGE", EV_AGE); return a; }
@@ -38,17 +38,16 @@ static uint64_t g_ev_bscans, g_ev_bshort;   // the budget's scans that chose ima
 static nvn_hmap g_ev_store = {.klen = 8};   // the storage of evicted images not made again yet: the lookup that makes one again counts it (ev_made)
 static void ev_made(vtex *v) { uint64_t k = (uint64_t)(uintptr_t)v->store; if (k && g_ev_store.n && nvn_hm_del(&g_ev_store, &k)) g_ev_back++; }
 static int ev_clean(const vtex *v, uint64_t now, uint64_t age) { return v->img && ie_clean(v->gpu_w, v->pool_read, v->pkg, v->shared, v->filled, v->last_present, now, age); }
-// The byte budget, chosen once: DM_VK_IMAGE_BUDGET_MB (0: none), else a quarter of MemTotal (img_evict.h ie_budget_default); the start's line gives it and where it came from
+// The byte budget, chosen once: DM_VK_IMAGE_BUDGET_MB in MB; none (0) unless it is set, or with DM_VK_IMAGE_EVICT=0. The start's line says which
 static uint64_t ev_budget(void) {
     static uint64_t b = UINT64_MAX;
     if (b != UINT64_MAX) return b;
     const char *e = getenv("DM_VK_IMAGE_BUDGET_MB");
-    if (e && *e) { long long m = atoll(e); b = m > 0 ? (uint64_t)m << 20 : 0; }
-    else { char t[512]; int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC); ssize_t n = fd >= 0 ? read(fd, t, sizeof t - 1) : -1; if (fd >= 0) close(fd);
-           t[n > 0 ? n : 0] = 0; b = ie_budget_default(ie_meminfo_kb(t, "MemTotal:")); }
-    if (b) LOG("[vk] image eviction: a byte budget of %llu MB (%s): over it, images a lookup makes again go after %d presents without one, the least recently looked up first",
-               (unsigned long long)(b >> 20), e && *e ? "DM_VK_IMAGE_BUDGET_MB" : "a quarter of MemTotal", EV_BUDGET_AGE);
-    else LOG("[vk] image eviction: no byte budget (%s)", e && *e ? "DM_VK_IMAGE_BUDGET_MB=0" : "MemTotal unread in /proc/meminfo");
+    long long m = e && *e ? atoll(e) : 0;
+    b = ev_on() && m > 0 ? (uint64_t)m << 20 : 0;
+    if (b) LOG("[vk] image eviction: a byte budget of %llu MB (DM_VK_IMAGE_BUDGET_MB): over it, clean images go after %d presents without a lookup instead of %llu, the least recently looked up first",
+               (unsigned long long)(b >> 20), EV_BUDGET_AGE, (unsigned long long)ev_age());
+    else LOG("[vk] image eviction: no byte budget (%s)", !ev_on() ? "off: DM_VK_IMAGE_EVICT=0" : "DM_VK_IMAGE_BUDGET_MB unset or 0");
     return b;
 }
 static void ev_overwritten(uint64_t now, uint64_t age, uint8_t as) {   // the shared images another one over their storage overwrote (ie_sweep), marked as
@@ -71,7 +70,7 @@ static void ev_over_budget(uint64_t now, uint64_t target) {   // after the age r
     uint64_t gone = 0;
     EV_EACH(v, if (v->evict) gone += v->mem_bytes);
     if (g_im_live <= gone + target) return;
-    ev_overwritten(now, EV_BUDGET_AGE, 5);
+    if (ev_alias_age() > EV_BUDGET_AGE) ev_overwritten(now, EV_BUDGET_AGE, 5);   // (else the age sweep before this one has marked them all already)
     uint32_t n = 0;
     EV_EACH(v, if (!v->evict && ev_clean(v, now, EV_BUDGET_AGE)) v->evict = 5; if (v->evict == 5) n++);
     ie_cand *c = n ? malloc(n * sizeof *c) : NULL; uint8_t *mark = n ? malloc(n) : NULL; uint32_t k = 0;

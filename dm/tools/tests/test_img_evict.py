@@ -1,6 +1,6 @@
 """dm/android/img_evict.h, the Vulkan replay's image eviction rules (gfx_vk_evict.inc), built with the system's C compiler and called through ctypes: which
 images are clean (their content still in guest memory), which another image over their storage overwrote, that the sweep over a pool's images finds every
-overwritten one whatever their order, and the byte budget: its default, when it asks for images to go and how many, and that the least recently looked up go first.
+overwritten one whatever their order, and the byte budget: when it asks for images to go and how many, and that the least recently looked up go first.
 Skipped without a C compiler."""
 import ctypes
 import os
@@ -41,8 +41,6 @@ class ImageEviction(unittest.TestCase):
                        '__attribute__((visibility("default"))) int over(const ie_ent *a, const ie_ent *b, uint64_t now, uint64_t age) { return ie_overwritten(a, b, now, age); }\n'
                        '__attribute__((visibility("default"))) void sweep(ie_ent *e, uint32_t n, uint64_t now, uint64_t age, uint8_t *mark) { ie_sweep(e, n, now, age, mark); }\n'
                        '__attribute__((visibility("default"))) uint64_t pick(ie_cand *c, uint32_t n, uint64_t need, uint8_t *mark) { return ie_pick(c, n, need, mark); }\n'
-                       '__attribute__((visibility("default"))) uint64_t meminfo(const char *b, const char *k) { return ie_meminfo_kb(b, k); }\n'
-                       '__attribute__((visibility("default"))) uint64_t bdefault(uint64_t kb) { return ie_budget_default(kb); }\n'
                        '__attribute__((visibility("default"))) uint64_t btarget(uint64_t live, uint64_t budget) { return ie_budget_target(live, budget); }\n')
         subprocess.run([*CC, '-shared', '-fPIC', '-O1', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/android'), str(src), '-o', str(cls.tmp / 'e.so')], check=True)
         cls.lib = ctypes.CDLL(str(cls.tmp / 'e.so'))
@@ -50,10 +48,8 @@ class ImageEviction(unittest.TestCase):
         cls.lib.over.argtypes = [ctypes.POINTER(Ent), ctypes.POINTER(Ent), ctypes.c_uint64, ctypes.c_uint64]
         cls.lib.sweep.argtypes = [ctypes.POINTER(Ent), ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8)]
         cls.lib.pick.argtypes = [ctypes.POINTER(Cand), ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8)]
-        cls.lib.meminfo.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-        cls.lib.bdefault.argtypes = [ctypes.c_uint64]
         cls.lib.btarget.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
-        for f in ('pick', 'meminfo', 'bdefault', 'btarget'):
+        for f in ('pick', 'btarget'):
             getattr(cls.lib, f).restype = ctypes.c_uint64
 
     def clean(self, gpu_w=0, pool_read=0, pkg=0, shared=0, filled=0, last=0, now=1000, age=600):
@@ -102,15 +98,6 @@ class ImageEviction(unittest.TestCase):
         self.assertEqual(self.sweep(list(reversed(ents))), {6 - 0, 6 - 3, 6 - 4})   # the same images, given in the other order
         self.assertEqual(self.sweep(ents, age=150), {3, 4})   # a longer age: 0, looked up 100 presents ago, stays
         self.assertEqual(self.sweep([]), set())
-
-    def test_the_budget_defaults_to_a_quarter_of_the_device_memory(self):
-        meminfo = b'MemTotal:       11849504 kB\nMemFree:          412352 kB\nSwapTotal:      12582908 kB\n'   # a Galaxy Z Fold 8's 11.3 GB
-        kb = self.lib.meminfo(meminfo, b'MemTotal:')
-        self.assertEqual(kb, 11849504)
-        self.assertEqual(self.lib.bdefault(kb), 11849504 // 4 * 1024)   # 2.83 GB: over the 2.23 GB the ages alone held Saria's scene to there
-        self.assertEqual(self.lib.bdefault(16 << 20), 4096 * MB)   # a 16 GB device: 4 GB
-        self.assertEqual(self.lib.meminfo(b'MemFree: 1 kB\n', b'MemTotal:'), 0)   # not there
-        self.assertEqual(self.lib.bdefault(0), 0)   # and then no budget
 
     def test_the_budget_asks_for_nothing_until_it_is_passed_then_for_a_tenth_under_it(self):
         b = 3072 * MB
