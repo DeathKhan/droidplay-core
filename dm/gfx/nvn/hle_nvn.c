@@ -2145,6 +2145,25 @@ static int fstep_hold(void) {
 // then finds its texture free (two swapchain textures, avail = the previous slot + period), so counted as work it made the cost the hold whatever the work. Breath of the Wild on an
 // Ayn Odin 2 held 3 vsyncs for good after the load into the world ("held 1 / 2 / 3 vsyncs 0 / 0 / 1800", 0 down) with about 43 ms of work (p50) and 7 ms asleep in each present.
 // With the sleep taken out the GPU term matters there too: the Android replay's mtl_gpu_ms gives it (gfx_vk.c g_fgpu; it returned -1, which left the cost the CPU's alone)
+#if DM_ANDROID
+#include <fcntl.h>
+// The GPU's clock over its top clock for the frame step's top-clock fit (nvn_fstep.h tnew), from Qualcomm's kgsl sysfs (clock_mhz, max_clock_mhz: the top the kernel allows now,
+// under any thermal limit), read every 8th call; 0 where it is not readable (other GPUs, a sandbox that hides it), and the frame step then goes by the cost
+static double fstep_clock_scale(void) {
+    static int fc = -2, fm = -1; static unsigned n; static double scale;
+    if (fc == -2) {
+        fc = open("/sys/class/kgsl/kgsl-3d0/clock_mhz", O_RDONLY | O_CLOEXEC); fm = open("/sys/class/kgsl/kgsl-3d0/max_clock_mhz", O_RDONLY | O_CLOEXEC);
+        if (fc < 0 || fm < 0) { if (fc >= 0) close(fc); if (fm >= 0) close(fm); fc = fm = -1; }
+        LOG("[nvn] frame step: the GPU clock is %s (the top-clock fit, DM_FSTEP_TRIAL_GRACE_NEW)", fc >= 0 ? "readable" : "not readable: the top-clock fit goes by the cost");
+    }
+    if (fc < 0) return 0;
+    if (n++ % 8) return scale;
+    char a[32], b[32]; ssize_t ra = pread(fc, a, sizeof a - 1, 0), rb = pread(fm, b, sizeof b - 1, 0);
+    if (ra <= 0 || rb <= 0) return scale = 0;
+    a[ra] = b[rb] = 0; double cur = atof(a), top = atof(b);
+    return scale = cur > 0 && top > 0 && cur <= top ? cur / top : 0;
+}
+#endif
 static void fstep_tick(const win_t *o, int c) {
     static uint64_t prev, t0, v0, fixed_sum, held[FSTEP_MAX + 1]; static int nlog;
     static uint32_t chist[161], ghist[161]; static uint64_t cn, cpw, cps, cgb, cg0;   // this summary window's frame costs and GPU parts (0.05-vsync bins, the last one 8 or more), the pacing
@@ -2164,6 +2183,11 @@ static void fstep_tick(const win_t *o, int c) {
     // A screen whose rate is not a multiple of 60 (144, 165 Hz) shows the link's 1/60 s ticks on their nearest refreshes (nvn_mtl.m link_range), so a frame on time can show for one
     // refresh more than its hold: a cheap 50 ms frame shows 54.5 ms at 165 Hz, which counted as late kept the hold at 20 fps for good
     int hz = front_screen_max_fps(); g_fs.shown_slack = hz > fstep_hz() && hz % fstep_hz() && mtl_link_active() ? (double)fstep_hz() / hz : 0;
+#if DM_ANDROID
+    // DM_FSTEP_NEAR_JUDGE=0 (env.txt; Android): a near probe judged as a probe to kmin, as before (FSTEP_FIT's headroom, the GPU reference against kmin)
+    { static int nj = -1; if (nj < 0) { const char *e = getenv("DM_FSTEP_NEAR_JUDGE"); nj = !(e && *e == '0'); if (!nj) LOG("[nvn] frame step: DM_FSTEP_NEAR_JUDGE=0: a near probe is judged as a probe to kmin"); }
+      g_fg.near_ref = nj; g_fs.near_fit_off = !nj; }   // the GPU reference is held against the near probe's target (nvn_fstep.h nvn_fgpu_slow), as probe_near is set below
+#endif
     int cslow = fstep_cpu_slowed(o->presents), gslow = nvn_fstep_gpu_slowed(&g_fg, gpu, k0 ? k0 : kmin, kmin, pphase) && dm_thermal_now() <= 1 && !dm_low_power_now();   // same gates as the CPU's
     // Present snapshots (nvn_mtl.m snap_take): the game runs up to a frame ahead of the screen, so a frame whose work runs long is absorbed instead of shown late, and its cost is
     // no evidence against the hold (Breath of the Wild in Zora's Domain stepped to 30 at a GPU time of 0.75 vsyncs: the frame's CPU time held its waits on its own GPU work).
@@ -2182,10 +2206,24 @@ static void fstep_tick(const win_t *o, int c) {
     // (Breath of the Wild on an M5 Pro: the probe's 33 frames took the clock 338 → 432 MHz and its GPU time 24.8 → 18.5 ms, then it failed at 22 ms frames; hold 1 needed about 560 MHz)
     g_fs.ramp = mtl_probe_ramp_on();
 #if DM_ANDROID
+    // DM_FSTEP_TRIAL_GRACE=<frames> (env.txt; Android): the long grace of a trial back to a hold the frames held earlier (nvn_fstep.h tgrace), FSTEP_TGRACE by default; 0 = off,
+    // a 30-frame grace as for any trial. A phone's GPU governor keeps the longer hold's low clock through a 30-frame trial (Ocarina of Time on a Galaxy Z Fold 8). The Mac and
+    // the iPhone, whose controllers settle within such a trial or ramp it with FSTEP_RAMP, keep FSTEP_GRACE
+    { static int tgr = -2; if (tgr == -2) { const char *e = getenv("DM_FSTEP_TRIAL_GRACE");
+          tgr = e ? atoi(e) : FSTEP_TGRACE;
+          if (tgr < 0) tgr = 0;
+          if (e) LOG("[nvn] frame step: a trial back to a hold that held gets %d frames of grace (DM_FSTEP_TRIAL_GRACE%s)", tgr, tgr ? "" : "=0: as any trial"); }
+      g_fs.tgrace = tgr; }
+    // DM_FSTEP_TRIAL_GRACE_NEW=0 (env.txt; Android): the long grace only for holds the scene held, not for one it never held that the GPU would fit at its top clock (nvn_fstep.h tnew)
+    { static int tn = -1; if (tn < 0) { const char *e = getenv("DM_FSTEP_TRIAL_GRACE_NEW"); tn = !(e && *e == '0'); if (!tn) LOG("[nvn] frame step: DM_FSTEP_TRIAL_GRACE_NEW=0: the long grace only for holds the scene held"); }
+      g_fs.tnew = tn; }
     g_fs.probe_near = 1;   // a probe goes to the next shorter hold, when the GPU's headroom (g_fs.gpu, below) could fit it (nvn_fstep.h): the GPU governor follows the busy share, not a declared deadline
 #endif
     g_fs.per_vsync = fstep_hz() / 60;
     g_fs.gpu = gpu;   // the soft-late rule and the GPU-fit trial (nvn_fstep.h FSTEP_LATE_SOFT)
+#if DM_ANDROID
+    { double sc = g_fs.tgrace > 0 && gpu > 0 ? fstep_clock_scale() : 0; g_fs.gpu_top = sc > 0 ? gpu * sc : 0; }   // the GPU time at its top clock (nvn_fstep.h tnew, and the long grace under a thermal cap)
+#endif
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     { static int tr = -1; if (tr < 0) { const char *e = getenv("DM_FSTEP_TRACE"); tr = e && atoi(e) > 0; }   // DM_FSTEP_TRACE=1: the controller's inputs every 15th frame (vsyncs)
       if (tr && o->presents % 15 == 0) LOG("[nvn] fstep trace %llu: hold %d shown %.2f wait %.2f cpu %.2f gpu %.2f cost %.2f fit_run %d since %.0f hold-off %.0f trial %d late_run %d screen %d",
@@ -2202,8 +2240,9 @@ static void fstep_tick(const win_t *o, int c) {
         if (gslow) w += snprintf(why + w, sizeof why - w, ", GPU %.2f× its time at hold %d (%.2f)", g_fg.cur / g_fg.ref, kmin, g_fg.ref);
         if (nvn_fstep_same(&g_fs)) snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
         if (g_fs.k > k0 && g_fs.cref > 0) snprintf(held, sizeof held, "; hold %d held at %.2f", kmin, g_fs.cref);   // what a probe compares the longer hold's cost with
+        char trial[64]; snprintf(trial, sizeof trial, "trial%s%s", g_fs.mtrial ? ", a hold that held" : g_fs.gtrial ? ", the GPU fits it" : g_fs.ttrial ? ", the top-clock fit" : "", g_fs.tg ? ", the long grace" : "");
         LOG("[nvn] frame step: hold %d → %d %s at present %llu (%s; cost %.2f, GPU %.2f%s)%s", k0, g_fs.k, fps_high() ? "ticks of 1/120 s" : "vsyncs", (unsigned long long)o->presents,
-            fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? "3 late frames" : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
+            fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? "3 late frames" : g_fs.probes != probes0 ? why : trial, cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
     }
     if (probe0 == 1 && g_fs.probe != 1 && !fixed && nlog < 40)   // whether the controller raised the clock for the shorter deadline
         LOG("[nvn] frame step: the probe %s at present %llu (CPU %d%% on performance cores)%s", g_fs.probe == 2 ? "held" : "failed", (unsigned long long)o->presents, g_fs_pshare, ++nlog == 40 ? "; further changes only counted below" : "");
@@ -2216,11 +2255,11 @@ static void fstep_tick(const win_t *o, int c) {
         double q[4] = {0, 0, 0, 0};   // the window's cost p50 / p95 and GPU part p50 / p95
         for (int h = 0; h < 2; h++) { const uint32_t *hb = h ? ghist : chist; acc = 0;
             for (int b = 0, i = 0; b <= 160 && i < 2; b++) { acc += hb[b]; while (i < 2 && cn && acc * 100 >= cn * (i ? 95 : 50)) q[2 * h + i++] = b / 20.0; } }
-        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials); "
+        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials, %llu with the long grace, %llu of those ended early, %llu started by the top-clock fit, %llu three-failure stops lifted); "
                     "cost p50 %.2f / p95 %.2f vsyncs (GPU part p50 %.2f / p95 %.2f, the larger in %llu frames, none finished in %llu), pacing taken out %.2f ms a frame at the acquire and %.2f in the present",
                     (vs - v0) / 60.0, (t - t0) / 1e9, (vs - v0) / 60.0 / ((t - t0) / 1e9), (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3],
                     (unsigned long long)g_fs.late, (unsigned long long)g_fs.paid, g_fs.dropped, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed,
-                    q[0], q[1], q[2], q[3], (unsigned long long)cgb, (unsigned long long)cg0, cn ? cpw / 1e6 / cn : 0, cn ? cps / 1e6 / cn : 0);
+                    (unsigned long long)g_fs.tgtrials, (unsigned long long)g_fs.tgends, (unsigned long long)g_fs.tnewtrials, (unsigned long long)g_fs.tlifts, q[0], q[1], q[2], q[3], (unsigned long long)cgb, (unsigned long long)cg0, cn ? cpw / 1e6 / cn : 0, cn ? cps / 1e6 / cn : 0);
         t0 = t; v0 = vs; memset(held, 0, sizeof held); memset(chist, 0, sizeof chist); memset(ghist, 0, sizeof ghist); cn = cpw = cps = cgb = cg0 = 0;
     }
 }
