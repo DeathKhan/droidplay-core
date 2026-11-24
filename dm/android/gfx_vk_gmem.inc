@@ -23,9 +23,12 @@
 //   write anywhere until it has learned their pools. Each store also sets its table entry's bit in a write log (DMSH_GMEM_LOG_CB_OFFSET): every draw with stores gets a zeroed
 //   log from the arena, read when its chunk completes, and the pools it names are logged (the Mac's learned pools are the next step). DM_VK_RAW_GMEM_STORE_WAIT=0: not waited for
 // Opt-in per game: DM_VK_RAW_GMEM=1, from env.txt or the game's android_defaults.txt (Frostpunk's), which front_android.c reads before the window's surface, so the device is
-// made with the extensions only for such a game. Off, nothing changes: the device is made as before, no pool is placed and the table binding reads 16 zero bytes. Only
-// Qualcomm's Adreno has run it (its own driver and Turnip), and Samsung's Xclipse (its driver compiles the physical pointers, and the AHardwareBuffer route's pages read
-// cached: Frostpunk's meshes on a Galaxy Z Flip 7). Another GPU stays off unless DM_VK_RAW_GMEM_ANYGPU=1 (Mali would take the AHardwareBuffer route too, not shown there).
+// made with the extensions only for such a game. Off, nothing changes: the device is made as before, no pool is placed and the table binding reads 16 zero bytes. It runs
+// on Qualcomm's Adreno (its own driver and Turnip), Samsung's Xclipse (its driver compiles the physical pointers, and the AHardwareBuffer route's pages read cached:
+// Frostpunk's meshes on a Galaxy Z Flip 7) and Arm's Mali (the AHardwareBuffer route too: Ocarina of Time's Kokiri Forest lit on a Pixel 9 Pro XL's Mali-G715). Mali had
+// it off, and there the off path lost the GPU: the shaders that bind the table read through a pointer the driver faulted on (TRANSLATION_FAULT in the load/store cache)
+// at Kokiri's first frame, so the game stayed black: the driver read the pointer whatever the lookup said. With raw global memory off, modules now go without their
+// physical pointer accesses (spv_nophys.h, gfx_vk_draw.inc spv_fit_nophys), so raw loads read 0 on any GPU. Another GPU stays off unless DM_VK_RAW_GMEM_ANYGPU=1.
 // A driver that refuses OpConvertUToPtr (the Ayn Odin 2's Adreno 740, the Razr's 730) reaches the pieces through a descriptor array instead (gfx_vk_gmem_noptr.inc, spv_noptr.h).
 #ifndef VK_EXT_map_memory_placed   // Vulkan 1.3.290; the NDK r28 headers are 1.3.275
 #define VK_EXT_map_memory_placed 1
@@ -44,7 +47,7 @@ typedef struct { VkStructureType sType; const void *pNext; void *pPlacedAddress;
 #define MADV_POPULATE_READ 22
 #endif
 #include "gmem_table.h"   // the table's layout and the translator's lookup, free of Vulkan (dm/tools/tests/test_gmem_table.py)
-enum { GM_TAB_BYTES = GMEM_TAB_BYTES, GM_LOG_BYTES = DMSH_GMEM_MAP_ENTRIES / 8, GM_SEEN = 256 };
+enum { GM_TAB_BYTES = GMEM_PAGED_BYTES, GM_LOG_BYTES = DMSH_GMEM_MAP_ENTRIES / 8, GM_SEEN = 256 };
 // A piece's buffer is bound in place as whatever the game's buffer at that address is read as (gfx_vk_gmem_inplace.inc; a dispatch's write read as a vertex stream or a buffer
 // texture through fwd_hit), so it takes every buffer usage
 #define GM_USAGE (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | \
@@ -76,9 +79,9 @@ static int gm_env(void) { static int v = -1; if (v < 0) { const char *e = getenv
 static int gm_game(void) { return gm_env(); }   // (the game's own choice, through its android_defaults.txt)
 static int gm_want(const VkExtensionProperties *e, uint32_t n) {
     if (!gm_env()) return 0;
-    { const char *a = getenv("DM_VK_RAW_GMEM_ANYGPU"); uint32_t v = g_vk.props.vendorID;   // 0x5143 Qualcomm, 0x144d Samsung
-      if (v != 0x5143 && v != 0x144d && !(a && *a == '1')) {
-        LOG("[RED] [vk] raw global memory: DM_VK_RAW_GMEM=1, but it has run only on Qualcomm's Adreno and Samsung's Xclipse, and this GPU is vendor %#x: off, raw loads read 0 (DM_VK_RAW_GMEM_ANYGPU=1 tries it)", v); return 0; } }
+    { const char *a = getenv("DM_VK_RAW_GMEM_ANYGPU"); uint32_t v = g_vk.props.vendorID;   // 0x5143 Qualcomm, 0x144d Samsung, 0x13b5 Arm
+      if (v != 0x5143 && v != 0x144d && v != 0x13b5 && !(a && *a == '1')) {
+        LOG("[RED] [vk] raw global memory: DM_VK_RAW_GMEM=1, but it has run only on Qualcomm's Adreno, Samsung's Xclipse and Arm's Mali, and this GPU is vendor %#x: off, raw loads read 0 (DM_VK_RAW_GMEM_ANYGPU=1 tries it)", v); return 0; } }
     g_gm_has_placed = has_ext(e, n, "VK_KHR_map_memory2") && has_ext(e, n, "VK_EXT_map_memory_placed");
     g_gm_has_ahb = has_ext(e, n, "VK_ANDROID_external_memory_android_hardware_buffer") && has_ext(e, n, "VK_EXT_queue_family_foreign");
     int ok = has_ext(e, n, "VK_KHR_buffer_device_address") && (g_gm_has_placed || g_gm_has_ahb);
@@ -464,12 +467,15 @@ static int gm_table(void) {
     pthread_mutex_unlock(&g_gm_mu);
     { int n0 = n; n = gm_sink_ranges(&seg, &cseg, n); if (n > n0) qsort(seg, (size_t)n, sizeof *seg, gm_seg_cmp); }   // DM_VK_RAW_GMEM_SINK (gfx_vk_gmem_lazy.inc)
     n = gmem_table_fill(t.p, (const uint64_t (*)[3])seg, n, &over);
+    int pages = 0, lost = 0; if (gmpage_on()) pages = gmem_table_pages(t.p, n, &lost);   // the page map after it (spv_gmpage.h)
     if (over) RED_ONCE(163, "raw global memory: %d more placed pieces than the %d entries of the pool table: addresses in them are not reached", over, DMSH_GMEM_MAP_ENTRIES - 1);
     if (g_gt.b) { g_gt.seq = C ? C->seq : g_seq;   // the chunk recorded now may read it
         if (g_ngt_free < 8) g_gt_free[g_ngt_free++] = g_gt; else { dead_add(5, (uint64_t)g_gt.b); dead_add(4, (uint64_t)g_gt.m); } }
     g_gt = t; g_gm_tabs++;
     { static int said; if (!said++) { LOG("[vk] raw global memory: pool table of %d placed pieces, built again whenever a pool is placed or given back", n - 1); gm_selftest(); } }
     gm_hint_stat(seg, n - 1);
+    { static int said; int lvl = n - 1 >= 400 ? 4 : n - 1 >= 200 ? 3 : n - 1 >= 100 ? 2 : n - 1 >= 50 ? 1 : 0;
+      if (gmpage_on() && lvl > said) { said = lvl; LOG("[vk] raw global memory: the page map after the table holds %d pages of %d pieces (%.1f MiB) that no chunk hint names; %d pages left to the search, their word taken (spv_gmpage.h)", pages, n - 1, pages / 256.0, lost); } }
     return 1;
 }
 // A raw-memory binding of shader s (cb_offset 0 the table, DMSH_GMEM_LOG_CB_OFFSET the write log): the buffer, offset and range to bind

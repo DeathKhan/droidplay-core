@@ -1,0 +1,4 @@
+# Switches this game gets on Android (build_android_from_nsp.py puts them in the game's defaults.txt; env.txt and the settings screen still win)
+# DM_FPS_TARGET=60: the frame step stubs (patches.py FRAME_STEP) run the game at 60 fps with game time at real time (README.md, 60 fps). Checked on an AYN Odin 3
+# (Adreno 830). The profile's fps_target stays 0, the Switch's 30, for the Mac and iOS, where 60 has not been run
+DM_FPS_TARGET=60

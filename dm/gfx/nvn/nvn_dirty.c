@@ -3,6 +3,7 @@
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
+#include "range_index.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -20,6 +21,15 @@
 // OPEN (nvn_dirty_open): protected, made writable for a moment without counting as written; a host write takes it as it takes a protected page.
 enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2, PG_OPEN = 3 };
 enum { BUSY_WAIT_MS = 2000 };
+// Android tags heap pointers in the top byte (TBI, 0xb4... from Scudo), while the kernel's si->si_addr in SIGSEGV strips the tag.
+// Keep the original tagged pointer in range_t for memory accesses/mprotect, and untag for all address comparisons and page-index math.
+static inline uintptr_t dirty_untag(uintptr_t a) {
+#if defined(__ANDROID__)
+    return a & 0x00ffffffffffffffULL;
+#else
+    return a;
+#endif
+}
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 // The table grows in blocks of 1,024 slots, up to 262,144; a block is never moved or freed, so the signal handler reads it without locks. A pool past the end goes untracked: its textures count
 // as dirty and are re-uploaded at every use. The table was a fixed 256 slots (Zelda has about 300 pools at the title), then a fixed 4,096, and Breath of the Wild reaches 4,006 pools in its first
@@ -65,12 +75,31 @@ static int busy_wait(range_t *r, uintptr_t p) {
     return 1;
 }
 static int live_at(int i) { return atomic_load_explicit(&rg(i)->live, memory_order_acquire); }
+static _Atomic uint64_t g_rgen;   // registrations and retirements (below, with prep_write)
+// The live ranges sorted by base (range_index.h), kept per thread and made again when g_rgen has moved: a host write the remembered sets miss (prep_write) and a span the one-range
+// memo misses (find_span) look their ranges up there instead of walking every one. Ocarina of Time registers about 4,500 ranges; on a Galaxy Z Fold 8 in Kokiri Forest the walks
+// for its completion thread's counter reports and write-backs were about 8 ms of that thread's 10-11 ms a frame. Never made from the fault handler (it allocates): on_fault walks
+static __thread ri_t t_ri;
+static int ri_build(ri_t *x, uint64_t gen) {   // 0: no memory (the caller walks every range)
+    int n = atomic_load(&g_nr);
+    if (!ri_reserve(x, n)) return 0;
+    for (int i = 0; i < n; i++) if (live_at(i)) { range_t *r = rg(i); ri_add(x, dirty_untag(r->base), dirty_untag(r->end), i); }
+    ri_sort(x); x->gen = gen; return 1;
+}
+static ri_t *ri_now(void) { uint64_t gen = atomic_load_explicit(&g_rgen, memory_order_acquire); ri_t *x = &t_ri; return x->gen == gen || ri_build(x, gen) ? x : NULL; }
 // The registered range that holds all of [a, a+len) (used for a texture's tracking / protection / dirty check)
 static _Atomic int g_span_last;   // the last range found: looks come in runs over one pool, and a scan of Mario Kart World's 5,000 pools per look took a quarter of its submit thread's time
 static range_t *find_span(uintptr_t a, size_t len) {
+    a = dirty_untag(a);
     int n = atomic_load(&g_nr), k = atomic_load_explicit(&g_span_last, memory_order_relaxed);
-    if (k < n) { range_t *r = rg(k); if (live_at(k) && a >= r->base && a + len <= r->end) return r; }
-    for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a + len <= r->end) { atomic_store_explicit(&g_span_last, i, memory_order_relaxed); return r; } }
+    if (k < n) { range_t *r = rg(k); if (live_at(k) && a >= dirty_untag(r->base) && a + len <= dirty_untag(r->end)) return r; }
+    const ri_t *x = ri_now();
+    if (x) {   // (a range registered since the index was made holds nothing protected or stamped yet: not finding it reads as untracked, as before its registration)
+        for (int j = ri_first(x, a); j < x->n && x->e[j].lo <= a; j++) { int i = x->e[j].idx; range_t *r = rg(i);
+            if (live_at(i) && a >= dirty_untag(r->base) && a + len <= dirty_untag(r->end)) { atomic_store_explicit(&g_span_last, i, memory_order_relaxed); return r; } }
+        return NULL;
+    }
+    for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= dirty_untag(r->base) && a + len <= dirty_untag(r->end)) { atomic_store_explicit(&g_span_last, i, memory_order_relaxed); return r; } }
     return NULL;
 }
 static void stamp_page(range_t *r, uintptr_t p) {
@@ -102,12 +131,53 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         if (!busy_wait(r, p)) return 0;
     }
 }
+// The fault handler's index: the same sorted ranges, in one of two buffers made under g_slot_mu by protect_in (fi_refresh, which the handler can't do: it allocates and sorts)
+// and published by pointer. A buffer is made again only while it is not the published one; its seq is odd while it is being made, and a handler that read it across a change
+// (seq moved) walks every range instead, as it does when the index is older than g_rgen. Arrays outgrown are not freed, since a handler may still be reading them (as the page
+// tables above): one block per size, grown by half. Made again only after a fault had to walk (g_fi_walks), so registrations in a burst, as at a load, don't make one each.
+// A guest write to a protected page walked about 4,500 ranges in Ocarina of Time: 24 us a fault on a Galaxy Z Fold 8 in Kokiri Forest, where the uniform buffers' stamps
+// (gfx_vk_draw.inc ucopy) protect pages the game writes every frame
+typedef struct { int cap; ri_e *e; uintptr_t *mx; } fi_arr;
+typedef struct { _Atomic uint64_t seq; uint64_t gen; _Atomic int n; _Atomic(fi_arr *) arr; } fi_t;
+static fi_t g_fib[2]; static _Atomic(fi_t *) g_fi; static _Atomic uint64_t g_fi_walks;
+static void fi_refresh(void) {   // g_slot_mu held
+    uint64_t gen = atomic_load_explicit(&g_rgen, memory_order_acquire); fi_t *p = atomic_load_explicit(&g_fi, memory_order_acquire);
+    if ((p && p->gen == gen) || !atomic_load_explicit(&g_fi_walks, memory_order_relaxed)) return;
+    fi_t *q = p == &g_fib[0] ? &g_fib[1] : &g_fib[0]; fi_arr *ar = atomic_load_explicit(&q->arr, memory_order_relaxed); int n = atomic_load(&g_nr);
+    atomic_fetch_add_explicit(&q->seq, 1, memory_order_relaxed); atomic_thread_fence(memory_order_release);   // odd: a handler reading q looks again
+    if (!ar || ar->cap < n) {
+        int c = n + n / 2 + 64; fi_arr *na = malloc(sizeof *na + (size_t)c * (sizeof *na->e + sizeof *na->mx));
+        if (!na) { atomic_thread_fence(memory_order_release); atomic_fetch_add_explicit(&q->seq, 1, memory_order_relaxed); return; }   // (unchanged, still stale: not published)
+        na->cap = c; na->e = (ri_e *)(na + 1); na->mx = (uintptr_t *)(na->e + c); ar = na; atomic_store_explicit(&q->arr, na, memory_order_relaxed);
+    }
+    ri_t t = {gen, 0, ar->cap, ar->e, ar->mx};
+    for (int i = 0; i < n; i++) if (live_at(i)) { range_t *r = rg(i); ri_add(&t, dirty_untag(r->base), dirty_untag(r->end), i); }
+    ri_sort(&t); q->gen = gen; atomic_store_explicit(&q->n, t.n, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release); atomic_fetch_add_explicit(&q->seq, 1, memory_order_relaxed);
+    atomic_store_explicit(&g_fi, q, memory_order_release); atomic_store_explicit(&g_fi_walks, 0, memory_order_relaxed);
+}
+static int fi_find(uintptr_t a, int *idx, int max) {   // the fault handler: the ranges holding a into idx, how many; -1: walk them all
+    fi_t *p = atomic_load_explicit(&g_fi, memory_order_acquire); if (!p) return -1;
+    uint64_t s = atomic_load_explicit(&p->seq, memory_order_acquire);
+    if ((s & 1) || p->gen != atomic_load_explicit(&g_rgen, memory_order_acquire)) return -1;
+    fi_arr *ar = atomic_load_explicit(&p->arr, memory_order_relaxed); int n = atomic_load_explicit(&p->n, memory_order_relaxed), cnt = 0;
+    if (!ar || n > ar->cap) return -1;   // (read across a change: the arrays read are whole either way, never freed)
+    ri_t t = {0, n, ar->cap, ar->e, ar->mx};
+    for (int k = ri_first(&t, a); k < n && ar->e[k].lo <= a; k++) if (ar->e[k].end > a) { if (cnt == max) return -1; idx[cnt++] = ar->e[k].idx; }
+    atomic_thread_fence(memory_order_acquire);
+    return atomic_load_explicit(&p->seq, memory_order_relaxed) == s ? cnt : -1;
+}
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
-    uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
+    uintptr_t a = dirty_untag((uintptr_t)addr); int ours = 0, n = atomic_load(&g_nr), idx[16], nf = fi_find(a, idx, 16);
+    if (nf >= 0) {   // (each checked again against its range: a slot reused since is not ours)
+        for (int k = 0; k < nf; k++) { range_t *r = rg(idx[k]); if (live_at(idx[k])) { uintptr_t ub = dirty_untag(r->base); if (a >= ub && a < dirty_untag(r->end)) ours |= release_page(r, (a - ub) >> g_shift, &g_faults); } }
+        return ours;
+    }
+    atomic_fetch_add_explicit(&g_fi_walks, 1, memory_order_relaxed);
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
-        { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
+        { range_t *r = rg(i); if (live_at(i)) { uintptr_t ub = dirty_untag(r->base); if (a >= ub && a < dirty_untag(r->end)) ours |= release_page(r, (a - ub) >> g_shift, &g_faults); } }
     return ours;
 }
 // Unprotect pages p..q of a range with one mprotect per run of protected pages (a host write over a whole texture, e.g. WriteTexels, used to make one system call per 16 KB page:
@@ -135,18 +205,22 @@ enum { PW_MAX = 4, PW_N = 32 };   // ranges a page can be in (adjacent pools sha
 typedef struct { uint64_t gen; uintptr_t lo, hi; int n, idx[PW_MAX]; } pw_t;
 static __thread pw_t t_pw[PW_N];
 static void prep_write(void *addr, size_t len) {
-    uintptr_t a = (uintptr_t)addr, e = a + len;
+    uintptr_t a = dirty_untag((uintptr_t)addr), e = a + len;
     if (!len) return;
     uintptr_t lo = a & ~(g_pg - 1), hi = (e + g_pg - 1) & ~(g_pg - 1); uint64_t gen = atomic_load_explicit(&g_rgen, memory_order_acquire);
     pw_t *c = &t_pw[(lo >> g_shift) % PW_N];
     int n = atomic_load(&g_nr), cached = c->gen == gen && lo >= c->lo && hi <= c->hi;
     if (!cached) { c->gen = gen; c->lo = lo; c->hi = hi; c->n = 0; }
-    for (int k = 0; k < (cached ? c->n : n); k++) {
-        int i = cached ? c->idx[k] : k; range_t *r = rg(i);
-        if (!live_at(i) || hi <= r->base || lo >= r->end) continue;   // (base and end are page-aligned: the pages overlap when the bytes do)
+    ri_t *x = cached ? NULL : ri_now(); int ix = x != NULL;   // the walk goes through the index, from its first entry that can reach lo
+    for (int k = cached ? 0 : ix ? ri_first(x, lo) : 0; k < (cached ? c->n : ix ? x->n : n); k++) {
+        if (ix && x->e[k].lo >= hi) break;   // (sorted by base: no later entry reaches the write)
+        int i = cached ? c->idx[k] : ix ? x->e[k].idx : k; range_t *r = rg(i);
+        if (!live_at(i)) continue;
+        uintptr_t ub = dirty_untag(r->base), ue = dirty_untag(r->end);
+        if (hi <= ub || lo >= ue) continue;   // (base and end are page-aligned: the pages overlap when the bytes do)
         if (!cached) { if (c->n < PW_MAX) c->idx[c->n++] = i; else c->gen = 0; }
-        uintptr_t l = a > r->base ? a : r->base, h = e < r->end ? e : r->end;
-        release_pages(r, (l - r->base) >> g_shift, (h - 1 - r->base) >> g_shift, &g_preps);
+        uintptr_t l = a > ub ? a : ub, h = e < ue ? e : ue;
+        release_pages(r, (l - ub) >> g_shift, (h - 1 - ub) >> g_shift, &g_preps);
     }
 }
 
@@ -197,7 +271,8 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
 void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = NULL; int n = atomic_load(&g_nr);
-    for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
+    uintptr_t umem = dirty_untag((uintptr_t)mem);
+    for (int i = 0; i < n && !r; i++) if (live_at(i) && dirty_untag(rg(i)->mem) == umem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
     if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); atomic_fetch_add_explicit(&g_rgen, 1, memory_order_release); }
     pthread_mutex_unlock(&g_slot_mu);
 }
@@ -232,11 +307,13 @@ static void open_add(range_t *r, uintptr_t p, uint64_t h) {
 void nvn_dirty_open(const void *addr, size_t len) {
     pthread_mutex_lock(&g_slot_mu);
     g_nopen = 0;
-    uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr);
+    uintptr_t a = dirty_untag((uintptr_t)addr), e = a + len; int n = atomic_load(&g_nr);
     for (int k = 0; len && k < n; k++) {
         range_t *r = rg(k);
-        if (!live_at(k) || e <= r->base || a >= r->end) continue;
-        uintptr_t lo = a > r->base ? a : r->base, hi = e < r->end ? e : r->end, p = (lo - r->base) >> g_shift, q = (hi - 1 - r->base) >> g_shift, run = 0; int open = 0;
+        if (!live_at(k)) continue;
+        uintptr_t ub = dirty_untag(r->base), ue = dirty_untag(r->end);
+        if (e <= ub || a >= ue) continue;
+        uintptr_t lo = a > ub ? a : ub, hi = e < ue ? e : ue, p = (lo - ub) >> g_shift, q = (hi - 1 - ub) >> g_shift, run = 0; int open = 0;
         for (uintptr_t i = p; i <= q + 1; i++) {
             // A protected page is read-only and, with g_slot_mu held, stays protected until someone unprotects it: hashed first, then taken; one unprotected meanwhile is not ours
             uint8_t st = i <= q ? atomic_load(&r->state[i]) : PG_NONE; int took = 0;
@@ -278,13 +355,16 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 // The tracked range holding [addr, addr+len), as a handle a caller keeps (packaged textures: the scan over every range ran twice per texture lookup). NULL = untracked
 const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_span((uintptr_t)addr, len) : NULL; }
 // Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
-void nvn_dirty_protect(const void *addr, size_t len) {
+static void protect_in(const void *span, const void *addr, size_t len) {
     // Keep this descriptor live through the last mprotect. Retirement restores
     // RW under this same mutex; it must not finish between lookup and PG_BUSY.
     pthread_mutex_lock(&g_slot_mu);
-    range_t *r = len ? find_span((uintptr_t)addr, len) : NULL;
+    fi_refresh();   // (the pages about to be protected fault next)
+    range_t *r = (range_t *)span; uintptr_t ua = dirty_untag((uintptr_t)addr);
+    if (!len) r = NULL;
+    else if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || ua < dirty_untag(r->base) || ua + len > dirty_untag(r->end)) r = find_span((uintptr_t)addr, len);
     if (!r) { pthread_mutex_unlock(&g_slot_mu); return; }
-    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    uintptr_t a = dirty_untag((uintptr_t)addr), ub = dirty_untag(r->base), p = (a - ub) >> g_shift, q = (a + len - 1 - ub) >> g_shift;
     // Consecutive pages are merged into one mprotect (per-page calls reach thousands per frame on the first upload of large textures; character select page startup frame 5: 4888 calls).
     // Pages already PROT / BUSY break the consecutive run: do not protect again, and do not touch pages another thread is changing.
     // A BUSY page is waited out (the run so far is protected first, so none of ours is BUSY meanwhile) and looked at again: an unprotect in progress leaves the page writable
@@ -299,6 +379,10 @@ void nvn_dirty_protect(const void *addr, size_t len) {
     }
     pthread_mutex_unlock(&g_slot_mu);
 }
+void nvn_dirty_protect(const void *addr, size_t len) { protect_in(NULL, addr, len); }
+// A caller that keeps its range (nvn_dirty_span) skips the lookup: a uniform buffer stamped again at each rebind after a write (gfx_vk_draw.inc ucopy) looked its pool up among
+// about 4,500 ranges each time, past find_span's one-range memo whenever the buffers bound in turn lie in different pools
+void nvn_dirty_protect_span(const void *span, const void *addr, size_t len) { protect_in(span, addr, len); }
 // As nvn_dirty_protect, for the pages behind a placement sparse tile: a write to one of them moves nvn_dirty_sparse_writes, which nothing else moves, so its textures need no look at their tiles
 // until one is written (the page table's walk per look is what this replaces; nvn_mtl.m sparse_look)
 void nvn_dirty_protect_sparse(const void *addr, size_t len) {
@@ -308,7 +392,7 @@ void nvn_dirty_protect_sparse(const void *addr, size_t len) {
     if (r) {
         _Atomic uint8_t *sp = atomic_load(&r->sparse);
         if (!sp) { sp = calloc(r->cap, 1); atomic_store(&r->sparse, sp); }
-        if (sp) for (uintptr_t i = ((uintptr_t)addr - r->base) >> g_shift, q = ((uintptr_t)addr + len - 1 - r->base) >> g_shift; i <= q; i++) atomic_store(&sp[i], 1);
+        if (sp) { uintptr_t a = dirty_untag((uintptr_t)addr), ub = dirty_untag(r->base); for (uintptr_t i = (a - ub) >> g_shift, q = (a + len - 1 - ub) >> g_shift; i <= q; i++) atomic_store(&sp[i], 1); }
     }
     pthread_mutex_unlock(&g_slot_mu);
 }
@@ -319,11 +403,11 @@ uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
 // physical pages, which mostly lie in one pool, where find_span scans every registered range (about 4,300 in a Mario Kart World race)
 int nvn_dirty_since_cached(const void **span, const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;
-    range_t *r = (range_t *)*span; uintptr_t a = (uintptr_t)addr;
-    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) { r = find_span(a, len); *span = r; }
+    range_t *r = (range_t *)*span; uintptr_t a = dirty_untag((uintptr_t)addr);
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < dirty_untag(r->base) || a + len > dirty_untag(r->end)) { r = find_span(a, len); *span = r; }
     if (!r) return 1;   // When untracked, conservatively treat as dirty: better to upload more than to show stale content
     if (stamp < r->born) return 1;   // checked before this pool was registered over the memory: what was written there in between left no generation (born)
-    uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    uintptr_t ub = dirty_untag(r->base), p = (a - ub) >> g_shift, q = (a + len - 1 - ub) >> g_shift;
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
 }
@@ -333,14 +417,14 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) { return nvn_d
 // judges any other write into them (none can be told from the host's own by the page's generation)
 size_t nvn_dirty_since_except(const void *span, const void *addr, size_t len, uint64_t stamp, const uintptr_t (*ex)[2], int nex, uintptr_t *first) {
     if (!len) return 0;
-    range_t *r = (range_t *)span; uintptr_t a = (uintptr_t)addr;
-    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) r = find_span(a, len);
+    range_t *r = (range_t *)span; uintptr_t a = dirty_untag((uintptr_t)addr);
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < dirty_untag(r->base) || a + len > dirty_untag(r->end)) r = find_span(a, len);
     if (!r) return SIZE_MAX;
-    uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift; size_t n = 0; int before = stamp < r->born;   // every page counts (born)
+    uintptr_t ub = dirty_untag(r->base), p = (a - ub) >> g_shift, q = (a + len - 1 - ub) >> g_shift; size_t n = 0; int before = stamp < r->born;   // every page counts (born)
     for (uintptr_t i = p; i <= q; i++) {
         if (!before && atomic_load(&r->gen[i]) <= stamp) continue;
-        uintptr_t lo = r->base + (i << g_shift), hi = lo + g_pg; int mine = 0;
-        for (int k = 0; k < nex && !mine; k++) mine = ex[k][0] < hi && ex[k][1] > lo;
+        uintptr_t lo = ub + (i << g_shift), hi = lo + g_pg; int mine = 0;
+        for (int k = 0; k < nex && !mine; k++) mine = dirty_untag(ex[k][0]) < hi && dirty_untag(ex[k][1]) > lo;
         if (mine) continue;
         if (!n++ && first) *first = lo < a ? a : lo;
     }

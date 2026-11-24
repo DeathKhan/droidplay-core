@@ -107,7 +107,9 @@ static VkResult memu_cpipe_make(vshader *s, VkPipeline *out, uint64_t *ons) {   
     memu_t *m = s->memu;
     VkComputePipelineCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = m->pl,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main"}};   // its module: lm_pipeline
-    const char *pbk[4] = {s->key, NULL, NULL, NULL}; int pb = pb_begin('c', pbk, 0, 0, 0, 0); uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    const char *pbk[4] = {s->key, NULL, NULL, NULL};
+    pk_guard(); if (pgd_skipped('k', pbk)) { *out = VK_NULL_HANDLE; *ons = 0; return VK_ERROR_INITIALIZATION_FAILED; }   // its build crashed an earlier start (memu_cpipe_done: its draws skipped)
+    int pb = pb_begin('k', pbk, 0, 0, 0, 0); pgd_test_crash('k', pbk); uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     VkResult r = lm_pipeline(NULL, &pc, &pc.stage, &s->mod, 1, out); pb_end(pb);
     uint64_t ns = clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0; atomic_fetch_add(&g_me_kpipe_ns, ns); *ons = ns;
     if (r != VK_SUCCESS) { *out = VK_NULL_HANDLE; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) LOG("[RED] [vk] compute form of task / mesh shader %s: pipeline failed (VkResult %d): its draws are skipped", s->key, r);
@@ -230,8 +232,10 @@ static int memu_draw(memu_t *m, vshader *fs, const prog_t *fpr, int fpst, const 
     if (!rp_start()) { g_drop[5]++; return 0; }
     VkCommandBuffer c = C->cb;
     occl_begin();
+    pp->last = atomic_load(&g_presents); pp->seq = C->seq;   // (gfx_vk_pheavy.inc)
     bf_pipeline(c, pp->p);
     if (pp->alpha) vkCmdPushConstants(c, pp->pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof D.alpha_ref, &D.alpha_ref);   // the alpha test's reference, as vk_draw_
+    if (pp->lbpc) { int32_t b0 = 0; vkCmdPushConstants(c, pp->pl, pp->lbpc, SPV_LBASE_PC, 4, &b0); }   // the layer base: none, as vk_draw_ (spv_fit_lbase)
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, 0, 1, &vset, 0, NULL);
     if (fs) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl, (uint32_t)(fs->set & 3), 1, &fset, fs->ndyn, dyn);
     if (fs && fs->pool && !pool_bind(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pl)) { g_drop[3]++; return 0; }

@@ -20,7 +20,7 @@
 #include <sched.h>
 enum { RQ_SIZE = 8u << 20 };   // about 25,000 records a frame of 30 to 200 bytes: several frames' worth
 enum { R_BEGINQ = 1, R_BEGINRP, R_BINDDS, R_BINDIB, R_BINDP, R_BINDVB, R_BLIT, R_CLRATT, R_CLRCOL, R_CLRDS, R_CPB2I, R_CPI, R_CPI2B, R_DISPATCH, R_DRAW, R_DRAWIDX, R_ENDQ, R_ENDRP,
-       R_BARRIER, R_PUSH, R_RESETQ, R_RESOLVE, R_BLENDC, R_DBIAS, R_SCISSOR, R_SCMASK, R_SREF, R_SWMASK, R_VIEWPORT, R_TS, R_BEGINCB, R_ENDCB, R_SUBMIT, R_WRAP, R_CPB, R_UPDDS, R_DRAWMESH, R_DISPIND, R_DRAWIDXIND };
+       R_BARRIER, R_PUSH, R_RESETQ, R_RESOLVE, R_BLENDC, R_DBIAS, R_SCISSOR, R_SCMASK, R_SREF, R_SWMASK, R_VIEWPORT, R_TS, R_BEGINCB, R_ENDCB, R_SUBMIT, R_WRAP, R_CPB, R_UPDDS, R_DRAWMESH, R_DISPIND, R_DRAWIDXIND, R_FILLB };
 typedef struct { uint32_t fn, n; VkCommandBuffer cb; } rq_hdr;   // n: the record's bytes, header included, a multiple of 16
 static uint8_t *g_rq;
 static _Atomic uint64_t g_rq_w, g_rq_r;   // bytes written / made since the start (the ring offset is the count modulo RQ_SIZE)
@@ -31,6 +31,7 @@ static uint64_t g_rq_records, g_rq_drains, g_rq_direct; static _Atomic uint64_t 
 static void *rq_thread(void *arg);
 static void hint_note(void);   // gfx_vk.c: the recorder is in the frame's performance hint session, with the threads it records for
 static void gpu_fault_log(VkResult r);   // gfx_vk.c: what VK_EXT_device_fault says of a lost device, once
+static VkResult submit_or_fence(VkCommandBuffer cb, VkFence f, const char *who);   // gfx_vk.c: a submission whose fence reaches the queue even when its work is refused
 static int rec_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("DM_VK_RECORDER"); v = e && *e == '1';
@@ -158,6 +159,11 @@ static void rec_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32
     if (!rec_on()) { vkCmdDispatch(cb, x, y, z); return; }
     uint8_t *r = rq_take(R_DISPATCH, cb, sizeof(rq_hdr) + sizeof(a_dispatch)); *(a_dispatch *)(void *)(r + sizeof(rq_hdr)) = (a_dispatch){x, y, z}; rq_push(r);
 }
+typedef struct { VkBuffer b; VkDeviceSize o, n; uint32_t v, pad; } a_fillb;   // a buffer fill on the GPU (gfx_vk_gmem_inplace.inc gm_fill_gpu)
+static void rec_vkCmdFillBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize n, uint32_t v) {
+    if (!rec_on()) { vkCmdFillBuffer(cb, b, o, n, v); return; }
+    uint8_t *r = rq_take(R_FILLB, cb, sizeof(rq_hdr) + sizeof(a_fillb)); *(a_fillb *)(void *)(r + sizeof(rq_hdr)) = (a_fillb){b, o, n, v, 0}; rq_push(r);
+}
 // The indirect forms (a task or mesh draw in compute form, gfx_vk_meshemu.inc): the GPU reads their arguments from the buffer when the command runs, so the record
 // is the buffer and the place in it. Made on the replay thread they went into the command buffer ahead of the binds queued for them, beside the recorder's own calls
 typedef struct { VkBuffer b; VkDeviceSize o; } a_dispind;
@@ -262,10 +268,10 @@ static VkResult rec_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBuff
 // every call queued before, so the queue gets the chunks in the order the replay closed them. The replay does not wait: the completion thread waits for the fence, which
 // signals only once the recorder has submitted it. The front end blits a presented frame on the same queue, so mtl_present drains first (its chunks submitted before it)
 // → the submission's ticket: the completion thread waits for it (rec_wait_submitted) before it waits for the fence, since a fence not yet submitted is not one to wait on
-typedef struct { VkFence f; } a_submit;
+typedef struct { VkFence f; VkResult *res; } a_submit;   // res: the chunk's sub_r, written before g_rq_subs_done counts the submission
 static uint64_t g_rq_subs_queued; static _Atomic uint64_t g_rq_subs_done; static _Atomic int g_rq_swait; static pthread_cond_t g_rq_csub = PTHREAD_COND_INITIALIZER;
-static uint64_t rec_submit(VkCommandBuffer cb, VkFence f) {
-    uint8_t *r = rq_take(R_SUBMIT, cb, sizeof(rq_hdr) + sizeof(a_submit)); *(a_submit *)(void *)(r + sizeof(rq_hdr)) = (a_submit){f}; rq_push(r);
+static uint64_t rec_submit(VkCommandBuffer cb, VkFence f, VkResult *res) {
+    uint8_t *r = rq_take(R_SUBMIT, cb, sizeof(rq_hdr) + sizeof(a_submit)); *(a_submit *)(void *)(r + sizeof(rq_hdr)) = (a_submit){f, res}; rq_push(r);
     return ++g_rq_subs_queued;
 }
 static void rec_wait_submitted(uint64_t ticket) {   // the completion thread: until the recorder has submitted that one
@@ -329,6 +335,7 @@ static void rq_make(const uint8_t *rec) {   // one record's call
         case R_DRAW: { const a_draw *a = (const void *)s; vkCmdDraw(cb, a->vc, a->ic, a->fv, a->fi); break; }
         case R_DRAWIDX: { const a_drawidx *a = (const void *)s; vkCmdDrawIndexed(cb, a->xc, a->ic, a->fx, a->vo, a->fi); break; }
         case R_DRAWIDXIND: { const a_drawidxind *a = (const void *)s; vkCmdDrawIndexedIndirect(cb, a->b, a->o, a->n, a->stride); break; }
+        case R_FILLB: { const a_fillb *a = (const void *)s; vkCmdFillBuffer(cb, a->b, a->o, a->n, a->v); break; }
         case R_DRAWMESH: { const a_drawmesh *a = (const void *)s; g_draw_mesh(cb, a->x, a->y, a->z); break; }
         case R_ENDQ: { const a_endq *a = (const void *)s; vkCmdEndQuery(cb, a->p, a->q); break; }
         case R_ENDRP: vkCmdEndRenderPass(cb); break;
@@ -352,9 +359,7 @@ static void rq_make(const uint8_t *rec) {   // one record's call
         case R_SUBMIT: { const a_submit *a = (const void *)s;
                          // a command buffer that did not end is not submitted: its fence goes alone, so the chunk still completes (its work dropped) and no wait hangs on it
                          if (cb) { VkResult e = vkEndCommandBuffer(cb); if (e != VK_SUCCESS) { RED_ONCE(150, "vkEndCommandBuffer failed on the recorder: %d (the chunk's work dropped)", e); if (e == VK_ERROR_DEVICE_LOST) gpu_fault_log(e); cb = VK_NULL_HANDLE; } }
-                         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = cb ? 1u : 0u, .pCommandBuffers = &cb};
-                         pthread_mutex_lock(&g_vk.qmu); VkResult q = vkQueueSubmit(g_vk.q, 1, &si, a->f); pthread_mutex_unlock(&g_vk.qmu);
-                         if (q != VK_SUCCESS) { RED_ONCE(151, "vkQueueSubmit failed on the recorder: %d", q); if (q == VK_ERROR_DEVICE_LOST) gpu_fault_log(q); }
+                         *a->res = submit_or_fence(cb, a->f, " on the recorder");   // before the count below: the completion thread reads it once the submission is counted
                          atomic_fetch_add(&g_rq_subs_done, 1);
                          if (atomic_load(&g_rq_swait)) { pthread_mutex_lock(&g_rq_mu); pthread_cond_broadcast(&g_rq_csub); pthread_mutex_unlock(&g_rq_mu); }
                          break; }
@@ -399,6 +404,7 @@ static void *rq_thread(void *arg) {
 #define vkCmdDraw rec_vkCmdDraw
 #define vkCmdDrawIndexed rec_vkCmdDrawIndexed
 #define vkCmdDrawIndexedIndirect rec_vkCmdDrawIndexedIndirect
+#define vkCmdFillBuffer rec_vkCmdFillBuffer
 #define vkCmdEndQuery rec_vkCmdEndQuery
 #define vkCmdEndRenderPass rec_vkCmdEndRenderPass
 #define vkCmdPipelineBarrier rec_vkCmdPipelineBarrier

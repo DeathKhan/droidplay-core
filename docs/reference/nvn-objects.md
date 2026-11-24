@@ -126,6 +126,37 @@ A game may tell NVN objects apart by their bytes, without an NVN call. A host re
   84 MB request failed, a 17 MB arena block was mapped inside its destination, the same request failed again 71 s later, and the replay faulted writing the block 15 ms
   after that. On a OnePlus Pad 3 the driver faulted at a submission right after a run of such requests.
 
+### Textures of a sparse pool read through its page table on Android
+
+- **Symptom:** Android only, in a game that streams textures into sparse virtual pools: what those textures feed reads as zero, with `[RED] virtual pool remap … failed: 5` lines (one per batch of mapping requests). Metroid Prime Remastered's arm cannon, and every model lit by its light probes, was dark but for its own glow on a Moto Razr Plus 2023 (Adreno 730), on Qualcomm's driver and on Turnip alike, while the Mac lit it.
+- **Cause:** two gaps, both from Android being unable to alias a physical pool's private memory into a virtual pool's range (`plat_android.c` `vm_remap`; see [A refused virtual pool mapping left a hole in the pool's reservation on Android](#a-refused-virtual-pool-mapping-left-a-hole-in-the-pools-reservation-on-android)):
+  - `vpool_map` (`hle_nvn.c`) failed a request it couldn't alias. `nvnMemoryPoolMapVirtual` then stopped at it, so only the first request of each batch reached the page table, and the game was told its mapping failed.
+  - The Vulkan replay never read a sparse pool's texture through the page table, as Metal's does ([Textures read through a 4 KB page table of a sparse pool](#textures-read-through-a-4-kb-page-table-of-a-sparse-pool)). `tex_storage_ok` leaves virtual pools out, so such a texture was a GPU texture, its image cleared to zero and never filled.
+  - Metroid Prime Remastered streams its light-probe volumes that way: six 512x256x368 3D textures (BC1 and BC6H, one sparse pool each, 64 KB tiles mapped from physical pools). A vertex shader under rasterizer discard (`f7800d296c68645b`) samples them into an 80-byte record per object, which the materials' fragment shaders read from a storage buffer (`c0 + 0x144`) for their ambient and directional light. With zeros every record held a black ambient colour.
+- **Fix:**
+  - `vpool_map` keeps a request it can't alias in the page table and goes on, as it does for one the host page can't align: textures read it, the GPU and buffers can't address it. One `[nvn] virtual pool … could not be aliased` line replaces the red lines.
+  - `gfx_vk.c` takes a sampled texture in a sparse pool (no linear, render-target, compressible or image flags, as `nvn_mtl.m` `tex_from_storage`) from its storage: `vt_upload_` copies its bytes through the page table (`nvn_sparse_copy`, unmapped pages as 0) and deswizzles them. `vt_get_` uploads it again when a mapping in its range or a physical page behind it changed (`nvn_sparse_since`), after `nvn_sparse_protect` took the pages' write protection. Such images are at most `DM_VK_SPARSE_MAX_MB` (256 MB), so an upload takes at most that much again for the copy and the staging. The periodic `[vk] textures of sparse pools through the page table` line counts the uploads, the bytes read, the largest and their time.
+  - `DM_VK_SPARSE_TEX=0` (env.txt) makes them GPU textures again; the page table keeps every request either way.
+- **Check (2026-11-17):** Metroid Prime Remastered on the Razr from a new game, the same frame-keyed route, a screenshot at frame 13,200 and frames 13,200–15,000 timed. One host, `main` 2a376a35 with [the attribute-array fix](rendering.md#a-shaders-attribute-array-its-elements-past-the-first-not-fetched-or-not-linked-android) and this change:
+  - As built: the cannon green with its yellow strips and Samus's brown glove, as on the Mac. The cannon's pass came out at a mean of (138, 156, 132) of 255. The probe volumes were uploaded through the page table (the log names the first four); no red line.
+  - With `DM_VK_SPARSE_TEX=0`: the cannon black but for its strips, a mean of (35, 33, 9), as without the change.
+  - 60.0 fps either way, GPU p50 9.97–10.18 ms and 9.94–10.15 ms.
+  - A diagnostic build logged the records the fragment shaders read before the change: the ambient colour 0 and each directional term at its encoded floor (-0.97, -1.02, -1.0, 1), what zero samples give.
+  - Not run: other GPUs.
+- **Check (2026-11-17, rebased on `main` 4e6105e5), the other games whose Android logs show sparse pools, on the Razr against `DM_VK_SPARSE_TEX=0`:**
+  - Metroid Prime Remastered as above: the cannon lit, a mean of (140, 160, 136) against (34, 30, 9); 6 uploads, 184 MB read, the largest 46 MB, 260 ms in all.
+  - OCTOPATH TRAVELER 1.0.3, from a new game to the traveler selection, whose world map is in sparse pools (three 6-minute runs):
+    - the same picture both ways;
+    - 59.4–59.6 fps, GPU p50 9.14–9.15 ms;
+    - PSS at most 1.69–1.72 GB either way;
+    - 6 uploads through the page table (4 of them after a mapping changed), 4.7 MB in all, the largest 1.4 MB, 3–6 ms.
+  - Mario Kart World 1.8.0 is too big for the Razr's 7 GB either way:
+    - the low-memory killer ended every run: with the change at 190 and 240 s (swap full), without it at 30 s; PSS 3.6–5.1 GB;
+    - one 95.6 MB sparse texture went through the page table at the start (0.2–0.6 s, once), and none after that before the kill;
+    - for that moment the copy and its staging take about twice the texture's size.
+  - Not run: Mario Kart World past its title on a phone with the memory for it.
+- **Found on:** [Metroid Prime Remastered](../../dm/games/010012101468C000/README.md#android) (q356).
+
 ### Textures read through a 4 KB page table of a sparse pool
 
 - **Symptom:** `CRASH sig=10` in `memmove` from `pkg_upload` → `nvn_deswizzle`, at an address 32 GB into a sparse virtual pool; textures with unaliased tails came out magenta.
@@ -227,7 +258,14 @@ A game may tell NVN objects apart by their bytes, without an NVN call. A host re
   retired since (`g_rgen`, bumped by `nvn_dirty_add_range` and `nvn_dirty_remove_range`): a write to the same pages releases those ranges' pages without a scan. A range
   registered after a set was remembered has no protected page yet, so the remembered set is still the right one to release; a span more than `PW_MAX` ranges cover is not
   remembered. 14.8 → 2.5 µs a report on the Fold, the chunk's retirement 434 → 123 µs, the replay's wait for a free chunk 17 → 8 ms a frame.
-- **Check:** `t_dirty_slots`, `t_dirty_race`, `t_dirty_retire_race` (`dm/gfx/tests`).
+- **Fix (2026-11-18):** a write the remembered sets miss still walked every range: about 2.1 million of 8.9 million `prep_write` calls in a Kokiri Forest run on the Fold (the
+  counter reports and write-backs move across many pages and pools), so the walk was still about 8 ms of the completion thread's 10–11 ms a frame. Such a write now looks its
+  ranges up in an index of the live ranges sorted by base, with the largest end so far at each entry (`range_index.h`): a binary search finds the first range that can reach the
+  write, even where ranges overlap or nest, and the walk stops at the first base past it. Each thread keeps its own, made again when `g_rgen` has moved (about 1,750 times
+  over a 4-minute run); the fault handler still walks, since it can't allocate. Turned on and off every 150 presents in one process (22 adjacent pairs): the completion thread
+  10.7 → 2.3 ms of CPU a frame (−8.3 ± 0.3 ms), the process −4.5 ± 2.5 ms.
+- **Check:** `t_dirty_slots`, `t_dirty_race`, `t_dirty_retire_race` (`dm/gfx/tests`); `test_range_index` (`dm/tools/tests`: the index's walk against the full walk, 4,300 random
+  ranges with overlaps and nesting).
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on a Galaxy Z Fold 8 (DroidPlay Core; the raw global memory entry in
   [rendering.md](rendering.md) had noted the walk and prepared its own write-backs once per chunk).
 
@@ -596,6 +634,13 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** the profile key `tex_flush_upload`. Buffer textures stay out of that path: they are views onto the pool buffer, and an upload would have sent them past Metal's 2D size limit.
 - **Found on:** [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md): a 1280×720 R8 and a 640×360 RG8 texture; the buffer texture kept out is a 1,048,576-texel R32F one.
 - **Also found on:** [NieR:Automata The End of YoRHa Edition](../../dm/games/010056B015FE8000/README.md): the title background; the game note records the controlled comparison.
+
+### A flush that waited for the Android replay's lock while holding the flush list's
+
+- **Symptom:** on Android, a game whose profile sets `tex_flush_upload` hangs for good while it loads an area, on the loading screen or a few seconds after the world draws: no more frames, the GPU idle, every thread asleep. A `DM_CTL` `dump` shows one guest thread `running/not waiting` in host code, its backtrace starting just past a `blr` to `nvnMemoryPoolFlushMappedRange`, with threads waiting for the guest mutexes it holds; another thread may wait inside `nvnProgramSetShaders`. Just before, `wake defer: … waited 50 ms for <that thread> to give its core up` lines.
+- **Cause:** a lock order inversion between `g_ft_mu` (`hle_nvn.c`, the list of textures the CPU fills in place) and `g_bk` (`gfx_vk.c`, the Vulkan replay's lock). `ft_flush` held `g_ft_mu` while it marked each texture a flush covers as CPU-written, and on Android that mark (`mtl_tex_cpu_written`) takes `g_bk`. The replay holds `g_bk` from `mtl_sub_begin` to `mtl_sub_commit` and takes `g_ft_mu` under it as each submission starts (`ft_del_drain`, `nvn_ft_poll`). So a flush that met a submission in flight waited for `g_bk` while holding `g_ft_mu`, and the replay, holding `g_bk` and `g_sub_mu`, waited for `g_ft_mu`. Game threads that called NVN next then waited for `g_sub_mu`. On the Mac the mark takes the serial table's locks, which its submit thread doesn't hold while it takes `g_ft_mu`.
+- **Fix:** every game with `tex_flush_upload`. `ft_flush` copies the entries a flush covers under `g_ft_mu`, marks them after releasing it (as `nvn_ft_written` and `nvn_ft_poll` already mark theirs), and then takes them off the list: where it saw them, or by serial if an entry was removed meanwhile. The entries stay on the list while they are marked, so a texture's first use in the meantime still finds its entry.
+- **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) on Android (droidplay-core#457). One player's save (an autosave at Thyphlo Ruins) hung every time, on the reporter's Adreno 735 with Turnip and on a Galaxy S25 Edge (Adreno 830, Qualcomm's driver). The flushing thread was `ModuleSystemWorker1`, in the game's texture defragmentation (`main+0x5bd288`). A host build that recorded each lock's holder showed the cycle: the NVN queue replay thread held `g_bk` (and `g_sub_mu`) from `mtl_sub_begin` and waited for `g_ft_mu` in `ft_del_drain`; `ModuleSystemWorker1` held `g_ft_mu` from `ft_flush` and waited for `g_bk` in `mtl_tex_cpu_written`; `BaseProcCreateAndDeleteThread` waited for `g_sub_mu` in `nvnProgramSetShaders`. The save hung in 3 loads out of 3 before the fix. With it, it loaded and played in 4 out of 4 (one with `DM_WAKE_DEFER=0`), and a new game ran as before.
 
 ### Uncompressed storage the CPU wrote, in a pool the GPU has not written
 
