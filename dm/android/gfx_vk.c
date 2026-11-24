@@ -385,7 +385,7 @@ typedef struct { int st; size_t off, row_bytes, rows, src_pitch, dst_pitch; uint
                  // another kind of draw (a mesh draw, a capture) reads it
                  int og, gsnap, wlok; wl_st wl; } wb_t;
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize n, used; } arena_blk;
-typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; uint64_t q0, q1; } post_op;   // kind 1 event, 2 counter, 3 samples passed (occlusion queries q0..q1)
+typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; uint64_t q0, q1, rseq; } post_op;   // kind 1 event, 2 counter, 3 samples passed (occlusion queries q0..q1), 4 a GPU timestamp; rseq: a report's serial (post)
 typedef struct { int kind; uint64_t h; } dead_t;
 typedef struct { int blk; VkDeviceSize off; const uint8_t *tab; } gm_logref;
 static int gm_store_wait(void); static uint64_t g_gm_store_hits;   // gfx_vk_gmem.inc: a chunk's raw stores count as a GPU write anywhere until it completes (DM_VK_RAW_GMEM_STORE_WAIT)   // a raw store write log in arena block blk, and the pool table its bits index (gfx_vk_gmem.inc gm_bind)
@@ -2439,9 +2439,15 @@ int vkb_fallback(const char *why) {
 #include "gfx_vk_vsync.inc"   // the pacing grid on the display's vsyncs, and each frame's time to be shown (DM_VK_PRESENT_TIMING)
 
 // ---------------- Submission ----------------
+// Report posts' serials: the replay numbers each report it posts (post), and the completion thread publishes the serial of each it has written (post_apply), before the
+// event posts after it wake a CPU writer, so a record rewritten after its report landed is never taken for one in flight. Per report, not per NVN fence: g_done is stored
+// after the whole chunk's posts, events included (chunk_thread), and a fence covers every chunk of a submission
+static uint64_t g_rc_rseq;   // the replay's thread alone (post, rc_note)
+static _Atomic uint64_t g_rc_applied;
 static void post(post_op o) {   // done when the current chunk completes, after its write-backs
     if (!cur()) return;
     if (C->npost == C->cappost) { C->cappost = C->cappost ? 2 * C->cappost : 64; C->post = realloc(C->post, C->cappost * sizeof *C->post); }
+    if (o.kind >= 2) o.rseq = ++g_rc_rseq;   // (rc_note: the render_cond pending list's entries land with it)
     C->post[C->npost++] = o;
 }
 // ---------------- The frame's work, for the performance hint (plat_android.c dm_android_hint_frame) ----------------
@@ -2494,7 +2500,7 @@ static unsigned g_place_cpu[16], g_place_n;   // under g_bk
 // before a signal lost its condition
 static int g_rc_skip;   // a render-enable block evaluated false is active
 static uint64_t g_rc_skipped;   // clears and draws dropped by it (the first is logged)
-static rc_pend g_rc_pend;   // the reports replayed last (rc_pend.h): kind 1 = timestamp (counter 0), 2 = another counter (unknown)
+static rc_pend g_rc_pend;   // timestamp reports replayed whose records have not landed (rc_pend.h): counter 0, or unknown once another counter's report followed to that address
 // Addresses ever written by a non-timestamp report, each with the NVN fence of the submission its last samples-passed report is in (RC_ANY: a counter kind the host does not
 // implement, unknown for good). A samples-passed result is written when its chunk completes (post_apply, before the fence: chunk_thread), so a condition on it reads memory once
 // that fence has completed, and keeps drawing while it is in flight, as the Mac does ([Occlusion conditions read once landed]): every such condition drew before, and Ocarina of
@@ -2527,11 +2533,12 @@ static void rc_occ_add(uint64_t a, uint64_t fence) {
 static int rc_occ_get(uint64_t a, uint64_t *fence) { if (!g_rc_cap || !a) return 0; uint32_t i = rc_occ_slot(g_rc_occ, g_rc_cap, a); if (g_rc_occ[i] != a) return 0; *fence = g_rc_occf[i]; g_rc_occr[i] = 1; return 1; }
 static void rc_note(uint64_t a, int kind) {   // kind 1 a timestamp, 2 a counter kind the host does not implement, 3 samples passed
     if (kind >= 2) rc_occ_add(a, kind == 3 && rc_landed_on() ? atomic_load(&g_fence) + 1 : RC_ANY);   // (the fence this submission completes: mtl_sub_commit)
-    if (kind == 3) kind = 2;   // (in this submission: not landed)
-    rcp_note(&g_rc_pend, a, kind);
+    uint64_t landed = atomic_load_explicit(&g_rc_applied, memory_order_acquire), dropped = g_rc_pend.dropped;
+    rcp_note(&g_rc_pend, a, kind == 1, g_rc_rseq + 1, landed);   // (the serial post gives this report next); another kind only marks a timestamp entry of that address unknown: the address set above holds it
+    if (!dropped && g_rc_pend.dropped) LOG("[vk] conditional rendering: %d timestamp reports in flight, the most kept: the least recently noted half let go (rc_pend.h)", RC_PEND);
 }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at replay
-    int k = rcp_kind(&g_rc_pend, a); if (k) { if (k != 1) return 0; *v = 0; return 1; }   // a report replayed last first: not landed
+    int pk = rcp_find(&g_rc_pend, a, atomic_load_explicit(&g_rc_applied, memory_order_acquire)); if (pk) { if (pk != RCP_TIMESTAMP) return 0; *v = 0; return 1; }   // a timestamp report in flight first
     uint64_t f;
     if (rc_occ_get(a, &f)) {
         if (f == RC_ANY || atomic_load(&g_done) < f) { if (f != RC_ANY) g_rc_flying++; return 0; }
@@ -2695,6 +2702,7 @@ static void post_apply(const post_op *o) {   // the completion thread, when the 
     if (o->kind == 4) { rec[0] = ts ? o->q1 : 0; rec[1] = o->q1; }   // a timestamp the GPU wrote where the report was (gfx_vk.c OP_REPORT_COUNTER)
     if (o->kind == 3) { uint64_t sum = 0, a = o->q1 - o->q0 > QRES ? o->q1 - QRES : o->q0; for (uint64_t q = a; q < o->q1; q++) sum += g_qres[q % QRES]; rec[0] = sum; }
     dm_guest_write_prepare((void *)(uintptr_t)o->addr, sizeof rec); memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
+    atomic_store_explicit(&g_rc_applied, o->rseq, memory_order_release);   // landed: before the events after it in this chunk are published (rc_pend.h)
 }
 static void bound_preserve(void);   // below, with the queue scheduler's hooks
 // A submission's end: its last chunk completes NVN fence f (the completion thread sets g_done); the GPU may still be at it on return
