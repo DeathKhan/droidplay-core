@@ -15,10 +15,14 @@ static int layer_scratch_on(void) {
                  if (v) LOG("[vk] a render pass whose colour targets are layers of one image draws into one-layer scratch images (DM_VK_LAYER_SCRATCH)"); }
     return v;
 }
+// The scratch images are never freed, and LSC_MAX counts images, not bytes: Ocarina of Time's 48 come to well under 1 MB, but a game drawing large array layers
+// this way would keep every one it made for good
 enum { LSC_MAX = 128 };   // (Ocarina of Time: six slots by eight level sizes)
 typedef struct { VkFormat f; uint32_t w, h, slot; } lsc_key;
 typedef struct { vtex *base, *sc; uint32_t lv, ly; } lsc_pend_t;   // a slot drawn into a scratch image: its target's image, level and layer
-static nvn_hmap g_lsc = {.klen = sizeof(lsc_key)};   // the scratch images
+static nvn_hmap g_lsc = {.klen = sizeof(lsc_key)};   // the scratch images, and LSC_NO for a key whose image came out in another held format
+static char g_lsc_no;
+#define LSC_NO ((vtex *)(void *)&g_lsc_no)
 static lsc_pend_t g_lsc_pend[8];   // the prepared pass's slots drawn into scratch images: copied in at each rp_start, back at each rp_end
 static uint64_t g_layer_scratch;   // passes prepared so (cumulative)
 static uint32_t g_lsc_n;
@@ -26,14 +30,16 @@ static uint32_t g_lsc_n;
 static vtex *lsc_scratch(const vtex *b, uint32_t lv, uint32_t j) {
     uint32_t lw = b->w >> lv ? b->w >> lv : 1, lh = b->h >> lv ? b->h >> lv : 1;
     lsc_key k; memset(&k, 0, sizeof k); k.f = b->fmt; k.w = lw; k.h = lh; k.slot = j;
-    vtex *s = nvn_hm_get(&g_lsc, &k); if (s) return s;
+    vtex *s = nvn_hm_get(&g_lsc, &k); if (s) return s == LSC_NO ? NULL : s;
     if (g_lsc_n >= LSC_MAX) { RED_ONCE(187, "colour targets in layers of one image: %d scratch images made, the most kept; such passes of other formats or sizes draw into their targets (layer_scratch_on)", LSC_MAX); return NULL; }
     tex_t t; memset(&t, 0, sizeof t); t.magic = MAGIC('T', 'E', 'X', 0); t.serial = ~0x40000ull - g_lsc_n; t.d.target = NVN_TEXTURE_TARGET_2D; t.d.format = b->desc.format;
     t.d.flags = b->desc.flags & NVN_TEXTURE_FLAGS_IMAGE;   // (as b's: vt_create's choice of a held format follows it)
     t.d.width = lw; t.d.height = lh; t.d.depth = 1; t.d.levels = 1;
     if (!(s = vt_create(&t))) return NULL;
     if (s->fmt != b->fmt || s->conv || (s->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) !=
-        (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { vt_destroy(s); return NULL; }
+        (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        vt_destroy(s); nvn_hm_put(&g_lsc, &k, LSC_NO); return NULL;   // (remembered: the next prepare of such a pass makes no image to destroy again)
+    }
     nvn_hm_put(&g_lsc, &k, s); g_lsc_n++;
     static int nlog; if (nlog++ < 4) LOG("[vk] scratch image for colour targets in layers of one image: slot %u, %ux%u vk%d (layer_scratch_on)", j, lw, lh, (int)b->fmt);
     return s;
